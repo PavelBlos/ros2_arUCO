@@ -1,0 +1,28 @@
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.egg-info/
+dist/
+
+# User-specific configuration and video files
+# Записанные калибровочные и тестовые видео обычно слишком большие для Git
+src/fake_tag_publisher/config/calibration.mp4
+src/fake_tag_publisher/config/robot_drive.mp4
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db

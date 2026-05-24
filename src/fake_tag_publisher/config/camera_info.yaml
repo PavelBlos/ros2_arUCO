@@ -1,0 +1,5 @@
+# Файл калибровки камеры (заполняется автоматически нодой camera_calibrator)
+image_width: 640
+image_height: 480
+camera_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+distortion_coefficients: [0.0, 0.0, 0.0, 0.0, 0.0]
