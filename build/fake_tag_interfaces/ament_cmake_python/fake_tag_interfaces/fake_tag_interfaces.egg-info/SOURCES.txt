@@ -1,9 +1,0 @@
-setup.py
-fake_tag_interfaces/__init__.py
-fake_tag_interfaces.egg-info/PKG-INFO
-fake_tag_interfaces.egg-info/SOURCES.txt
-fake_tag_interfaces.egg-info/dependency_links.txt
-fake_tag_interfaces.egg-info/top_level.txt
-fake_tag_interfaces/msg/__init__.py
-fake_tag_interfaces/msg/_tag_detection.py
-fake_tag_interfaces/msg/_tag_detection_array.py
