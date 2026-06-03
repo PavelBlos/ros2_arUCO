@@ -1,0 +1,188 @@
+[3.564s] DEBUG:colcon:Command line arguments: ['/usr/bin/colcon', 'build']
+[3.564s] DEBUG:colcon:Parsed command line arguments: Namespace(log_base=None, log_level=None, verb_name='build', build_base='build', install_base='install', merge_install=False, symlink_install=False, test_result_base=None, continue_on_error=False, executor='parallel', parallel_workers=2, event_handlers=None, ignore_user_meta=False, metas=['./colcon.meta'], base_paths=['.'], packages_ignore=None, packages_ignore_regex=None, paths=None, packages_up_to=None, packages_up_to_regex=None, packages_above=None, packages_above_and_dependencies=None, packages_above_depth=None, packages_select_by_dep=None, packages_skip_by_dep=None, packages_skip_up_to=None, packages_select_build_failed=False, packages_skip_build_finished=False, packages_select_test_failures=False, packages_skip_test_passed=False, packages_select=None, packages_skip=None, packages_select_regex=None, packages_skip_regex=None, packages_start=None, packages_end=None, cmake_args=None, cmake_target=None, cmake_target_skip_unavailable=False, cmake_clean_cache=False, cmake_clean_first=False, cmake_force_configure=False, ament_cmake_args=None, catkin_cmake_args=None, catkin_skip_building_tests=False, verb_parser=<colcon_defaults.argument_parser.defaults.DefaultArgumentsDecorator object at 0x710037f9c560>, verb_extension=<colcon_core.verb.build.BuildVerb object at 0x710037f9c200>, main=<bound method BuildVerb.main of <colcon_core.verb.build.BuildVerb object at 0x710037f9c200>>)
+[3.841s] Level 1:colcon.colcon_core.package_discovery:discover_packages(colcon_meta) check parameters
+[3.842s] Level 1:colcon.colcon_core.package_discovery:discover_packages(recursive) check parameters
+[3.842s] Level 1:colcon.colcon_core.package_discovery:discover_packages(ignore) check parameters
+[3.842s] Level 1:colcon.colcon_core.package_discovery:discover_packages(path) check parameters
+[3.842s] Level 1:colcon.colcon_core.package_discovery:discover_packages(colcon_meta) discover
+[3.842s] Level 1:colcon.colcon_core.package_discovery:discover_packages(recursive) discover
+[3.842s] INFO:colcon.colcon_core.package_discovery:Crawling recursively for packages in '/home/panik_bel/ros2_ws'
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['ignore', 'ignore_ament_install']
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'ignore'
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'ignore_ament_install'
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['colcon_pkg']
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'colcon_pkg'
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['colcon_meta']
+[3.843s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'colcon_meta'
+[3.844s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['ros']
+[3.844s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'ros'
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['cmake', 'python']
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'cmake'
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'python'
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extensions ['python_setup_py']
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(.) by extension 'python_setup_py'
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(build) by extensions ['ignore', 'ignore_ament_install']
+[3.922s] Level 1:colcon.colcon_core.package_identification:_identify(build) by extension 'ignore'
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(build) ignored
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(install) by extensions ['ignore', 'ignore_ament_install']
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(install) by extension 'ignore'
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(install) ignored
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(log) by extensions ['ignore', 'ignore_ament_install']
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(log) by extension 'ignore'
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(log) ignored
+[3.923s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extensions ['ignore', 'ignore_ament_install']
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'ignore'
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'ignore_ament_install'
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extensions ['colcon_pkg']
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'colcon_pkg'
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extensions ['colcon_meta']
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'colcon_meta'
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extensions ['ros']
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'ros'
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extensions ['cmake', 'python']
+[3.924s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'cmake'
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'python'
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extensions ['python_setup_py']
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src) by extension 'python_setup_py'
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extensions ['ignore', 'ignore_ament_install']
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extension 'ignore'
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extension 'ignore_ament_install'
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extensions ['colcon_pkg']
+[3.925s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extension 'colcon_pkg'
+[3.926s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extensions ['colcon_meta']
+[3.926s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extension 'colcon_meta'
+[3.926s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extensions ['ros']
+[3.926s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_interfaces) by extension 'ros'
+[3.935s] DEBUG:colcon.colcon_core.package_identification:Package 'src/fake_tag_interfaces' with type 'ros.ament_cmake' and name 'fake_tag_interfaces'
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extensions ['ignore', 'ignore_ament_install']
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extension 'ignore'
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extension 'ignore_ament_install'
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extensions ['colcon_pkg']
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extension 'colcon_pkg'
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extensions ['colcon_meta']
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extension 'colcon_meta'
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extensions ['ros']
+[3.936s] Level 1:colcon.colcon_core.package_identification:_identify(src/fake_tag_publisher) by extension 'ros'
+[3.938s] DEBUG:colcon.colcon_core.package_identification:Package 'src/fake_tag_publisher' with type 'ros.ament_python' and name 'fake_tag_publisher'
+[3.938s] Level 1:colcon.colcon_core.package_discovery:discover_packages(recursive) using defaults
+[3.938s] Level 1:colcon.colcon_core.package_discovery:discover_packages(ignore) discover
+[3.938s] Level 1:colcon.colcon_core.package_discovery:discover_packages(ignore) using defaults
+[3.938s] Level 1:colcon.colcon_core.package_discovery:discover_packages(path) discover
+[3.938s] Level 1:colcon.colcon_core.package_discovery:discover_packages(path) using defaults
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'cmake_args' from command line to 'None'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'cmake_target' from command line to 'None'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'cmake_target_skip_unavailable' from command line to 'False'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'cmake_clean_cache' from command line to 'False'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'cmake_clean_first' from command line to 'False'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'cmake_force_configure' from command line to 'False'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'ament_cmake_args' from command line to 'None'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'catkin_cmake_args' from command line to 'None'
+[4.190s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_interfaces' build argument 'catkin_skip_building_tests' from command line to 'False'
+[4.191s] DEBUG:colcon.colcon_core.verb:Building package 'fake_tag_interfaces' with the following arguments: {'ament_cmake_args': None, 'build_base': '/home/panik_bel/ros2_ws/build/fake_tag_interfaces', 'catkin_cmake_args': None, 'catkin_skip_building_tests': False, 'cmake_args': None, 'cmake_clean_cache': False, 'cmake_clean_first': False, 'cmake_force_configure': False, 'cmake_target': None, 'cmake_target_skip_unavailable': False, 'install_base': '/home/panik_bel/ros2_ws/install/fake_tag_interfaces', 'merge_install': False, 'path': '/home/panik_bel/ros2_ws/src/fake_tag_interfaces', 'symlink_install': False, 'test_result_base': None}
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'cmake_args' from command line to 'None'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'cmake_target' from command line to 'None'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'cmake_target_skip_unavailable' from command line to 'False'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'cmake_clean_cache' from command line to 'False'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'cmake_clean_first' from command line to 'False'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'cmake_force_configure' from command line to 'False'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'ament_cmake_args' from command line to 'None'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'catkin_cmake_args' from command line to 'None'
+[4.239s] Level 5:colcon.colcon_core.verb:set package 'fake_tag_publisher' build argument 'catkin_skip_building_tests' from command line to 'False'
+[4.239s] DEBUG:colcon.colcon_core.verb:Building package 'fake_tag_publisher' with the following arguments: {'ament_cmake_args': None, 'build_base': '/home/panik_bel/ros2_ws/build/fake_tag_publisher', 'catkin_cmake_args': None, 'catkin_skip_building_tests': False, 'cmake_args': None, 'cmake_clean_cache': False, 'cmake_clean_first': False, 'cmake_force_configure': False, 'cmake_target': None, 'cmake_target_skip_unavailable': False, 'install_base': '/home/panik_bel/ros2_ws/install/fake_tag_publisher', 'merge_install': False, 'path': '/home/panik_bel/ros2_ws/src/fake_tag_publisher', 'symlink_install': False, 'test_result_base': None}
+[4.285s] INFO:colcon.colcon_core.executor:Executing jobs using 'parallel' executor
+[4.335s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:run_until_complete
+[4.336s] INFO:colcon.colcon_ros.task.ament_cmake.build:Building ROS package in '/home/panik_bel/ros2_ws/src/fake_tag_interfaces' with build type 'ament_cmake'
+[4.336s] INFO:colcon.colcon_cmake.task.cmake.build:Building CMake package in '/home/panik_bel/ros2_ws/src/fake_tag_interfaces'
+[4.410s] INFO:colcon.colcon_core.plugin_system:Skipping extension 'colcon_core.shell.bat': Not used on non-Windows systems
+[4.410s] DEBUG:colcon.colcon_core.shell:Skip shell extension 'dsv' for command environment
+[4.480s] WARNING:colcon.colcon_ros.prefix_path.ament:The path '/home/panik_bel/ros2_ws/install/fake_tag_publisher' in the environment variable AMENT_PREFIX_PATH doesn't exist
+[4.717s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoking command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/panik_bel/.gemini/antigravity/scratch/ros2_ws_AGrep/ros2_ws/install/fake_tag_publisher:/home/panik_bel/ros2_ws/install/fake_tag_publisher:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake /home/panik_bel/ros2_ws/src/fake_tag_interfaces -DCMAKE_INSTALL_PREFIX=/home/panik_bel/ros2_ws/install/fake_tag_interfaces
+[14.902s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoked command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/panik_bel/.gemini/antigravity/scratch/ros2_ws_AGrep/ros2_ws/install/fake_tag_publisher:/home/panik_bel/ros2_ws/install/fake_tag_publisher:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake /home/panik_bel/ros2_ws/src/fake_tag_interfaces -DCMAKE_INSTALL_PREFIX=/home/panik_bel/ros2_ws/install/fake_tag_interfaces
+[14.906s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoking command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/panik_bel/.gemini/antigravity/scratch/ros2_ws_AGrep/ros2_ws/install/fake_tag_publisher:/home/panik_bel/ros2_ws/install/fake_tag_publisher:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --build /home/panik_bel/ros2_ws/build/fake_tag_interfaces -- -j2 -l2
+[37.589s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoked command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/panik_bel/.gemini/antigravity/scratch/ros2_ws_AGrep/ros2_ws/install/fake_tag_publisher:/home/panik_bel/ros2_ws/install/fake_tag_publisher:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --build /home/panik_bel/ros2_ws/build/fake_tag_interfaces -- -j2 -l2
+[37.850s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoking command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/panik_bel/.gemini/antigravity/scratch/ros2_ws_AGrep/ros2_ws/install/fake_tag_publisher:/home/panik_bel/ros2_ws/install/fake_tag_publisher:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --install /home/panik_bel/ros2_ws/build/fake_tag_interfaces
+[38.120s] Level 1:colcon.colcon_core.environment:create_environment_scripts_only(fake_tag_interfaces)
+[38.129s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoked command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/home/panik_bel/.gemini/antigravity/scratch/ros2_ws_AGrep/ros2_ws/install/fake_tag_publisher:/home/panik_bel/ros2_ws/install/fake_tag_publisher:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --install /home/panik_bel/ros2_ws/build/fake_tag_interfaces
+[38.223s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces' for CMake module files
+[38.227s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces' for CMake config files
+[38.228s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_interfaces', 'cmake_prefix_path')
+[38.297s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/cmake_prefix_path.dsv'
+[38.302s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/cmake_prefix_path.sh'
+[38.307s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib'
+[38.308s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_interfaces', 'ld_library_path_lib')
+[38.381s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/ld_library_path_lib.dsv'
+[38.383s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/ld_library_path_lib.sh'
+[38.385s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/bin'
+[38.385s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/pkgconfig/fake_tag_interfaces.pc'
+[38.389s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages'
+[38.390s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_interfaces', 'pythonpath')
+[38.461s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/pythonpath.dsv'
+[38.462s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/pythonpath.sh'
+[38.463s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/bin'
+[38.537s] INFO:colcon.colcon_core.shell:Creating package descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.dsv'
+[38.540s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.sh'
+[38.543s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.bash'
+[38.545s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.zsh'
+[38.547s] Level 1:colcon.colcon_core.environment:create_file_with_runtime_dependencies(/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/colcon-core/packages/fake_tag_interfaces)
+[38.878s] Level 1:colcon.colcon_core.environment:create_environment_scripts_only(fake_tag_interfaces)
+[38.960s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces' for CMake module files
+[38.962s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces' for CMake config files
+[38.962s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_interfaces', 'cmake_prefix_path')
+[39.037s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/cmake_prefix_path.dsv'
+[39.038s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/cmake_prefix_path.sh'
+[39.040s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib'
+[39.040s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_interfaces', 'ld_library_path_lib')
+[39.101s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/ld_library_path_lib.dsv'
+[39.102s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/ld_library_path_lib.sh'
+[39.103s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/bin'
+[39.103s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/pkgconfig/fake_tag_interfaces.pc'
+[39.104s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages'
+[39.104s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_interfaces', 'pythonpath')
+[39.176s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/pythonpath.dsv'
+[39.178s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/hook/pythonpath.sh'
+[39.180s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/bin'
+[39.256s] INFO:colcon.colcon_core.shell:Creating package descriptor '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.dsv'
+[39.257s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.sh'
+[39.259s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.bash'
+[39.260s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.zsh'
+[39.261s] Level 1:colcon.colcon_core.environment:create_file_with_runtime_dependencies(/home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/colcon-core/packages/fake_tag_interfaces)
+[39.262s] INFO:colcon.colcon_ros.task.ament_python.build:Building ROS package in '/home/panik_bel/ros2_ws/src/fake_tag_publisher' with build type 'ament_python'
+[39.262s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_publisher', 'ament_prefix_path')
+[39.355s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/hook/ament_prefix_path.dsv'
+[39.356s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/hook/ament_prefix_path.sh'
+[39.419s] DEBUG:colcon.colcon_core.shell:Skip shell extension 'dsv' for command environment
+[40.498s] INFO:colcon.colcon_core.task.python.build:Building Python package in '/home/panik_bel/ros2_ws/src/fake_tag_publisher'
+[40.579s] DEBUG:colcon.colcon_core.shell:Skip shell extension 'dsv' for command environment
+[43.010s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoking command in '/home/panik_bel/ros2_ws/src/fake_tag_publisher': AMENT_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${AMENT_PREFIX_PATH} CMAKE_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${CMAKE_PREFIX_PATH} DEBUGINFOD_URLS=https://debuginfod.ubuntu.com LD_LIBRARY_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib:${LD_LIBRARY_PATH} PYTHONPATH=/home/panik_bel/ros2_ws/build/fake_tag_publisher/prefix_override:/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages:/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 setup.py egg_info --egg-base ../../build/fake_tag_publisher build --build-base /home/panik_bel/ros2_ws/build/fake_tag_publisher/build install --record /home/panik_bel/ros2_ws/build/fake_tag_publisher/install.log --single-version-externally-managed
+[44.781s] DEBUG:colcon.colcon_core.event_handler.log_command:Invoked command in '/home/panik_bel/ros2_ws/src/fake_tag_publisher' returned '0': AMENT_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${AMENT_PREFIX_PATH} CMAKE_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${CMAKE_PREFIX_PATH} DEBUGINFOD_URLS=https://debuginfod.ubuntu.com LD_LIBRARY_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib:${LD_LIBRARY_PATH} PYTHONPATH=/home/panik_bel/ros2_ws/build/fake_tag_publisher/prefix_override:/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages:/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 setup.py egg_info --egg-base ../../build/fake_tag_publisher build --build-base /home/panik_bel/ros2_ws/build/fake_tag_publisher/build install --record /home/panik_bel/ros2_ws/build/fake_tag_publisher/install.log --single-version-externally-managed
+[44.850s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher' for CMake module files
+[44.851s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher' for CMake config files
+[44.852s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib'
+[44.853s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher/bin'
+[44.853s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/pkgconfig/fake_tag_publisher.pc'
+[44.853s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages'
+[44.854s] Level 1:colcon.colcon_core.shell:create_environment_hook('fake_tag_publisher', 'pythonpath')
+[44.920s] INFO:colcon.colcon_core.shell:Creating environment descriptor '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/hook/pythonpath.dsv'
+[44.921s] INFO:colcon.colcon_core.shell:Creating environment hook '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/hook/pythonpath.sh'
+[44.923s] Level 1:colcon.colcon_core.environment:checking '/home/panik_bel/ros2_ws/install/fake_tag_publisher/bin'
+[44.923s] Level 1:colcon.colcon_core.environment:create_environment_scripts_only(fake_tag_publisher)
+[44.985s] INFO:colcon.colcon_core.shell:Creating package descriptor '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/package.dsv'
+[44.986s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/package.sh'
+[44.987s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/package.bash'
+[44.988s] INFO:colcon.colcon_core.shell:Creating package script '/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/package.zsh'
+[44.989s] Level 1:colcon.colcon_core.environment:create_file_with_runtime_dependencies(/home/panik_bel/ros2_ws/install/fake_tag_publisher/share/colcon-core/packages/fake_tag_publisher)
+[44.990s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:closing loop
+[44.991s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:loop closed
+[44.991s] DEBUG:colcon.colcon_parallel_executor.executor.parallel:run_until_complete finished with '0'
+[44.991s] DEBUG:colcon.colcon_core.event_reactor:joining thread
+[45.082s] INFO:colcon.colcon_core.plugin_system:Skipping extension 'colcon_notification.desktop_notification.terminal_notifier': Not used on non-Darwin systems
+[45.082s] INFO:colcon.colcon_core.plugin_system:Skipping extension 'colcon_notification.desktop_notification.win32': Not used on non-Windows systems
+[45.082s] INFO:colcon.colcon_notification.desktop_notification:Sending desktop notification using 'notify2'
+[45.132s] DEBUG:colcon.colcon_core.event_reactor:joined thread
+[45.226s] INFO:colcon.colcon_core.shell:Creating prefix script '/home/panik_bel/ros2_ws/install/local_setup.sh'
+[45.228s] INFO:colcon.colcon_core.shell:Creating prefix util module '/home/panik_bel/ros2_ws/install/_local_setup_util_sh.py'
+[45.232s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/home/panik_bel/ros2_ws/install/setup.sh'
+[45.307s] INFO:colcon.colcon_core.shell:Creating prefix script '/home/panik_bel/ros2_ws/install/local_setup.bash'
+[45.308s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/home/panik_bel/ros2_ws/install/setup.bash'
+[45.378s] INFO:colcon.colcon_core.shell:Creating prefix script '/home/panik_bel/ros2_ws/install/local_setup.zsh'
+[45.379s] INFO:colcon.colcon_core.shell:Creating prefix chain script '/home/panik_bel/ros2_ws/install/setup.zsh'

@@ -1,0 +1,62 @@
+[8.813s] Invoking command in '/home/panik_bel/ros2_ws/src/fake_tag_publisher': AMENT_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${AMENT_PREFIX_PATH} CMAKE_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${CMAKE_PREFIX_PATH} DEBUGINFOD_URLS=https://debuginfod.ubuntu.com LD_LIBRARY_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib:${LD_LIBRARY_PATH} PYTHONPATH=/home/panik_bel/ros2_ws/build/fake_tag_publisher/prefix_override:/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages:/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 setup.py egg_info --egg-base ../../build/fake_tag_publisher build --build-base /home/panik_bel/ros2_ws/build/fake_tag_publisher/build install --record /home/panik_bel/ros2_ws/build/fake_tag_publisher/install.log --single-version-externally-managed
+[11.582s] running egg_info
+[11.744s] writing ../../build/fake_tag_publisher/fake_tag_publisher.egg-info/PKG-INFO
+[11.747s] writing dependency_links to ../../build/fake_tag_publisher/fake_tag_publisher.egg-info/dependency_links.txt
+[11.747s] writing entry points to ../../build/fake_tag_publisher/fake_tag_publisher.egg-info/entry_points.txt
+[11.751s] writing requirements to ../../build/fake_tag_publisher/fake_tag_publisher.egg-info/requires.txt
+[11.751s] writing top-level names to ../../build/fake_tag_publisher/fake_tag_publisher.egg-info/top_level.txt
+[12.096s] reading manifest file '../../build/fake_tag_publisher/fake_tag_publisher.egg-info/SOURCES.txt'
+[12.100s] writing manifest file '../../build/fake_tag_publisher/fake_tag_publisher.egg-info/SOURCES.txt'
+[12.101s] running build
+[12.103s] running build_py
+[12.108s] copying fake_tag_publisher/__init__.py -> /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher
+[12.108s] copying fake_tag_publisher/static_tf_node.py -> /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher
+[12.111s] copying fake_tag_publisher/video_tag_detector.py -> /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher
+[12.111s] copying fake_tag_publisher/fake_tag_node.py -> /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher
+[12.116s] copying fake_tag_publisher/localization_node.py -> /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher
+[12.122s] copying fake_tag_publisher/camera_calibrator.py -> /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher
+[12.122s] running install
+[12.126s] /usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py:66: SetuptoolsDeprecationWarning: setup.py install is deprecated.
+[12.126s] !!
+[12.126s] 
+[12.128s]         ********************************************************************************
+[12.131s]         Please avoid running ``setup.py`` directly.
+[12.131s]         Instead, use pypa/build, pypa/installer or other
+[12.131s]         standards-based tools.
+[12.132s] 
+[12.132s]         See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.
+[12.132s]         ********************************************************************************
+[12.132s] 
+[12.133s] !!
+[12.133s]   self.initialize_options()
+[12.159s] running install_lib
+[12.328s] copying /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher/__init__.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher
+[12.330s] copying /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher/static_tf_node.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher
+[12.332s] copying /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher/video_tag_detector.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher
+[12.336s] copying /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher/fake_tag_node.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher
+[12.340s] copying /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher/localization_node.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher
+[12.343s] copying /home/panik_bel/ros2_ws/build/fake_tag_publisher/build/lib/fake_tag_publisher/camera_calibrator.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher
+[12.347s] byte-compiling /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher/__init__.py to __init__.cpython-312.pyc
+[12.348s] byte-compiling /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher/static_tf_node.py to static_tf_node.cpython-312.pyc
+[12.352s] byte-compiling /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher/video_tag_detector.py to video_tag_detector.cpython-312.pyc
+[12.364s] byte-compiling /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher/fake_tag_node.py to fake_tag_node.cpython-312.pyc
+[12.374s] byte-compiling /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher/localization_node.py to localization_node.cpython-312.pyc
+[12.391s] byte-compiling /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher/camera_calibrator.py to camera_calibrator.cpython-312.pyc
+[12.398s] running install_data
+[12.610s] copying resource/fake_tag_publisher -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/ament_index/resource_index/packages
+[12.610s] copying package.xml -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher
+[12.611s] copying launch/test_localization.launch.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/launch
+[12.615s] copying launch/run_localization_video.launch.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/launch
+[12.615s] copying config/camera_info.yaml -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config
+[12.623s] copying config/tags_config.yaml -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config
+[12.623s] running install_egg_info
+[12.862s] removing '/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher-0.0.0-py3.12.egg-info' (and everything under it)
+[12.865s] Copying ../../build/fake_tag_publisher/fake_tag_publisher.egg-info to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake_tag_publisher-0.0.0-py3.12.egg-info
+[12.876s] running install_scripts
+[14.021s] Installing camera_calibrator script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+[14.022s] Installing fake_tag_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+[14.025s] Installing localization_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+[14.030s] Installing static_tf_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+[14.032s] Installing video_tag_detector script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+[14.037s] writing list of installed files to '/home/panik_bel/ros2_ws/build/fake_tag_publisher/install.log'
+[14.232s] Invoked command in '/home/panik_bel/ros2_ws/src/fake_tag_publisher' returned '0': AMENT_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${AMENT_PREFIX_PATH} CMAKE_PREFIX_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces:${CMAKE_PREFIX_PATH} DEBUGINFOD_URLS=https://debuginfod.ubuntu.com LD_LIBRARY_PATH=/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib:${LD_LIBRARY_PATH} PYTHONPATH=/home/panik_bel/ros2_ws/build/fake_tag_publisher/prefix_override:/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages:/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 setup.py egg_info --egg-base ../../build/fake_tag_publisher build --build-base /home/panik_bel/ros2_ws/build/fake_tag_publisher/build install --record /home/panik_bel/ros2_ws/build/fake_tag_publisher/install.log --single-version-externally-managed

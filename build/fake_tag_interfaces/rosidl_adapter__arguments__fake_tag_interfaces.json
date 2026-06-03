@@ -1,0 +1,7 @@
+{
+  "package_name": "fake_tag_interfaces",
+  "non_idl_tuples": [
+    "/home/panik_bel/ros2_ws/src/fake_tag_interfaces:msg/TagDetection.msg",
+    "/home/panik_bel/ros2_ws/src/fake_tag_interfaces:msg/TagDetectionArray.msg"
+  ]
+}

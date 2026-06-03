@@ -1,0 +1,197 @@
+[0.776s] Invoking command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --build /home/panik_bel/ros2_ws/build/fake_tag_interfaces -- -j2 -l2
+[0.994s] -- Found ament_cmake: 2.5.6 (/opt/ros/jazzy/share/ament_cmake/cmake)
+[1.889s] -- Found rosidl_default_generators: 1.6.0 (/opt/ros/jazzy/share/rosidl_default_generators/cmake)
+[1.931s] -- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+[2.400s] -- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+[2.820s] -- Found rosidl_adapter: 4.6.7 (/opt/ros/jazzy/share/rosidl_adapter/cmake)
+[2.837s] -- Found std_msgs: 5.3.7 (/opt/ros/jazzy/share/std_msgs/cmake)
+[3.112s] -- Found geometry_msgs: 5.3.7 (/opt/ros/jazzy/share/geometry_msgs/cmake)
+[5.276s] -- Found ament_cmake_ros: 0.12.0 (/opt/ros/jazzy/share/ament_cmake_ros/cmake)
+[7.085s] -- Using all available rosidl_typesupport_c: rosidl_typesupport_fastrtps_c;rosidl_typesupport_introspection_c
+[8.401s] -- Using all available rosidl_typesupport_cpp: rosidl_typesupport_fastrtps_cpp;rosidl_typesupport_introspection_cpp
+[8.404s] -- Found python_cmake_module: 0.11.1 (/opt/ros/jazzy/share/python_cmake_module/cmake)
+[10.429s] -- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter Development NumPy Development.Module Development.Embed 
+[11.070s] -- Found Python3: /usr/bin/python3 (found version "3.12.3") found components: Interpreter 
+[11.130s] -- Configuring done (10.2s)
+[11.420s] -- Generating done (0.3s)
+[11.448s] -- Build files have been written to: /home/panik_bel/ros2_ws/build/fake_tag_interfaces
+[11.629s] [  2%] Built target fake_tag_interfaces__rosidl_generator_type_description
+[11.764s] [  4%] Built target fake_tag_interfaces__rs
+[11.900s] [  4%] Built target ament_cmake_python_copy_fake_tag_interfaces
+[11.972s] [  6%] Built target fake_tag_interfaces__cpp
+[12.203s] [ 24%] Built target fake_tag_interfaces__rosidl_generator_c
+[14.720s] running egg_info
+[14.911s] writing fake_tag_interfaces.egg-info/PKG-INFO
+[14.912s] writing dependency_links to fake_tag_interfaces.egg-info/dependency_links.txt
+[14.920s] writing top-level names to fake_tag_interfaces.egg-info/top_level.txt
+[15.482s] reading manifest file 'fake_tag_interfaces.egg-info/SOURCES.txt'
+[15.482s] writing manifest file 'fake_tag_interfaces.egg-info/SOURCES.txt'
+[15.677s] [ 24%] Built target ament_cmake_python_build_fake_tag_interfaces_egg
+[15.815s] [ 33%] Built target fake_tag_interfaces__rosidl_typesupport_cpp
+[15.933s] [ 42%] Built target fake_tag_interfaces__rosidl_typesupport_fastrtps_c
+[16.047s] [ 51%] Built target fake_tag_interfaces__rosidl_typesupport_introspection_c
+[16.141s] [ 60%] Built target fake_tag_interfaces__rosidl_typesupport_c
+[16.240s] [ 68%] Built target fake_tag_interfaces__rosidl_typesupport_fastrtps_cpp
+[16.328s] [ 77%] Built target fake_tag_interfaces__rosidl_typesupport_introspection_cpp
+[16.407s] [ 77%] Built target fake_tag_interfaces
+[16.487s] [ 80%] Built target fake_tag_interfaces__py
+[16.585s] [ 86%] Built target fake_tag_interfaces__rosidl_generator_py
+[16.687s] [ 91%] Built target fake_tag_interfaces_s__rosidl_typesupport_fastrtps_c
+[16.777s] [ 95%] Built target fake_tag_interfaces_s__rosidl_typesupport_introspection_c
+[16.989s] [100%] Built target fake_tag_interfaces_s__rosidl_typesupport_c
+[17.100s] Invoked command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --build /home/panik_bel/ros2_ws/build/fake_tag_interfaces -- -j2 -l2
+[18.037s] Invoking command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --install /home/panik_bel/ros2_ws/build/fake_tag_interfaces
+[18.095s] -- Install configuration: ""
+[18.103s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/ament_index/resource_index/rosidl_interfaces/fake_tag_interfaces
+[18.118s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/msg/TagDetection.json
+[18.123s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/msg/TagDetectionArray.json
+[18.124s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces
+[18.124s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg
+[18.130s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/rosidl_generator_c__visibility_control.h
+[18.131s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail
+[18.132s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__description.c
+[18.133s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__functions.c
+[18.134s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__functions.h
+[18.137s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__type_support.h
+[18.138s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__type_support.h
+[18.139s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__struct.h
+[18.140s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__functions.c
+[18.144s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__type_support.c
+[18.144s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__type_support.c
+[18.145s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__struct.h
+[18.145s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__description.c
+[18.145s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__functions.h
+[18.153s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/tag_detection_array.h
+[18.154s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/tag_detection.h
+[18.161s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/library_path.sh
+[18.164s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/library_path.dsv
+[18.164s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_generator_c.so
+[18.164s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces
+[18.167s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg
+[18.172s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/rosidl_typesupport_fastrtps_c__visibility_control.h
+[18.173s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail
+[18.173s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__rosidl_typesupport_fastrtps_c.h
+[18.178s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__rosidl_typesupport_fastrtps_c.h
+[18.178s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_typesupport_fastrtps_c.so
+[18.182s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces
+[18.184s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg
+[18.188s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail
+[18.189s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__rosidl_typesupport_introspection_c.h
+[18.189s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__type_support.c
+[18.189s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__type_support.c
+[18.190s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__rosidl_typesupport_introspection_c.h
+[18.190s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/rosidl_typesupport_introspection_c__visibility_control.h
+[18.190s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_typesupport_introspection_c.so
+[18.196s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_typesupport_c.so
+[18.199s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces
+[18.199s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg
+[18.199s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/tag_detection.hpp
+[18.199s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail
+[18.200s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__builder.hpp
+[18.200s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__type_support.hpp
+[18.200s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__builder.hpp
+[18.200s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__traits.hpp
+[18.206s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__type_support.hpp
+[18.211s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__struct.hpp
+[18.215s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__traits.hpp
+[18.215s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__struct.hpp
+[18.215s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/rosidl_generator_cpp__visibility_control.hpp
+[18.221s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/tag_detection_array.hpp
+[18.224s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces
+[18.224s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg
+[18.224s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail
+[18.228s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/dds_fastrtps
+[18.231s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__rosidl_typesupport_fastrtps_cpp.hpp
+[18.231s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__rosidl_typesupport_fastrtps_cpp.hpp
+[18.232s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/rosidl_typesupport_fastrtps_cpp__visibility_control.h
+[18.232s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_typesupport_fastrtps_cpp.so
+[18.232s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces
+[18.238s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg
+[18.239s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail
+[18.239s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__type_support.cpp
+[18.239s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__type_support.cpp
+[18.239s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection_array__rosidl_typesupport_introspection_cpp.hpp
+[18.244s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/include/fake_tag_interfaces/fake_tag_interfaces/msg/detail/tag_detection__rosidl_typesupport_introspection_cpp.hpp
+[18.245s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_typesupport_introspection_cpp.so
+[18.245s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_typesupport_cpp.so
+[18.248s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/pythonpath.sh
+[18.248s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/pythonpath.dsv
+[18.248s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces-0.0.0-py3.12.egg-info
+[18.255s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces-0.0.0-py3.12.egg-info/PKG-INFO
+[18.255s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces-0.0.0-py3.12.egg-info/dependency_links.txt
+[18.255s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces-0.0.0-py3.12.egg-info/SOURCES.txt
+[18.256s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces-0.0.0-py3.12.egg-info/top_level.txt
+[18.256s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces
+[18.256s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/__init__.py
+[18.266s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_fastrtps_c.so
+[18.267s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_c.so
+[18.267s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/_fake_tag_interfaces_s.ep.rosidl_typesupport_introspection_c.c
+[18.267s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg
+[18.271s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg/__init__.py
+[18.272s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg/_tag_detection_s.c
+[18.272s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg/_tag_detection.py
+[18.274s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg/_tag_detection_array_s.c
+[18.274s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg/_tag_detection_array.py
+[18.280s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_introspection_c.so
+[18.280s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/_fake_tag_interfaces_s.ep.rosidl_typesupport_fastrtps_c.c
+[18.280s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/_fake_tag_interfaces_s.ep.rosidl_typesupport_c.c
+[18.461s] Listing '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces'...
+[18.461s] Compiling '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/__init__.py'...
+[18.461s] Listing '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/msg'...
+[18.495s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_fastrtps_c.so
+[18.495s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_introspection_c.so
+[18.497s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_c.so
+[18.497s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/libfake_tag_interfaces__rosidl_generator_py.so
+[18.501s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/ament_index/resource_index/rust_packages/fake_tag_interfaces
+[18.504s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust
+[18.504s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/Cargo.toml
+[18.513s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/build.rs
+[18.514s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/src
+[18.515s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/src/lib.rs
+[18.515s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/src/msg
+[18.516s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/src/msg/rmw.rs
+[18.516s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/rust/src/msg.rs
+[18.520s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/msg/TagDetection.idl
+[18.528s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/msg/TagDetectionArray.idl
+[18.532s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/msg/TagDetection.msg
+[18.534s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/msg/TagDetectionArray.msg
+[18.536s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/ament_index/resource_index/package_run_dependencies/fake_tag_interfaces
+[18.537s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/ament_index/resource_index/parent_prefix_path/fake_tag_interfaces
+[18.538s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/ament_prefix_path.sh
+[18.545s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/ament_prefix_path.dsv
+[18.545s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/path.sh
+[18.546s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/environment/path.dsv
+[18.546s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/local_setup.bash
+[18.546s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/local_setup.sh
+[18.547s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/local_setup.zsh
+[18.548s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/local_setup.dsv
+[18.548s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.dsv
+[18.548s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/ament_index/resource_index/packages/fake_tag_interfaces
+[18.549s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_generator_cExport.cmake
+[18.549s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_generator_cExport-noconfig.cmake
+[18.549s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_typesupport_fastrtps_cExport.cmake
+[18.550s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_typesupport_fastrtps_cExport-noconfig.cmake
+[18.550s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_introspection_cExport.cmake
+[18.551s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_introspection_cExport-noconfig.cmake
+[18.555s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_cExport.cmake
+[18.559s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_cExport-noconfig.cmake
+[18.559s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_generator_cppExport.cmake
+[18.559s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_typesupport_fastrtps_cppExport.cmake
+[18.563s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_typesupport_fastrtps_cppExport-noconfig.cmake
+[18.564s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_introspection_cppExport.cmake
+[18.564s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_introspection_cppExport-noconfig.cmake
+[18.566s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_cppExport.cmake
+[18.566s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfaces__rosidl_typesupport_cppExport-noconfig.cmake
+[18.569s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_generator_pyExport.cmake
+[18.569s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/export_fake_tag_interfaces__rosidl_generator_pyExport-noconfig.cmake
+[18.570s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/rosidl_cmake-extras.cmake
+[18.570s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/ament_cmake_export_dependencies-extras.cmake
+[18.570s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/ament_cmake_export_include_directories-extras.cmake
+[18.571s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/ament_cmake_export_libraries-extras.cmake
+[18.572s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/ament_cmake_export_targets-extras.cmake
+[18.572s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/rosidl_cmake_export_typesupport_targets-extras.cmake
+[18.572s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/rosidl_cmake_export_typesupport_libraries-extras.cmake
+[18.574s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfacesConfig.cmake
+[18.574s] -- Up-to-date: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/cmake/fake_tag_interfacesConfig-version.cmake
+[18.577s] -- Installing: /home/panik_bel/ros2_ws/install/fake_tag_interfaces/share/fake_tag_interfaces/package.xml
+[18.580s] Invoked command in '/home/panik_bel/ros2_ws/build/fake_tag_interfaces' returned '0': CMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}:/opt/ros/jazzy DEBUGINFOD_URLS=https://debuginfod.ubuntu.com /usr/bin/cmake --install /home/panik_bel/ros2_ws/build/fake_tag_interfaces

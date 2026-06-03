@@ -1,0 +1,6 @@
+[console_scripts]
+camera_calibrator = fake_tag_publisher.camera_calibrator:main
+fake_tag_node = fake_tag_publisher.fake_tag_node:main
+localization_node = fake_tag_publisher.localization_node:main
+static_tf_node = fake_tag_publisher.static_tf_node:main
+video_tag_detector = fake_tag_publisher.video_tag_detector:main

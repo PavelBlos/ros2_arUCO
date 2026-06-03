@@ -1,0 +1,23 @@
+running develop
+running egg_info
+writing fake_tag_publisher.egg-info/PKG-INFO
+writing dependency_links to fake_tag_publisher.egg-info/dependency_links.txt
+writing entry points to fake_tag_publisher.egg-info/entry_points.txt
+writing requirements to fake_tag_publisher.egg-info/requires.txt
+writing top-level names to fake_tag_publisher.egg-info/top_level.txt
+reading manifest file 'fake_tag_publisher.egg-info/SOURCES.txt'
+writing manifest file 'fake_tag_publisher.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake-tag-publisher.egg-link (link to .)
+Installing camera_calibrator script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+Installing fake_tag_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+Installing localization_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+Installing static_tf_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+Installing video_tag_detector script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher
+
+Installed /home/panik_bel/ros2_ws/build/fake_tag_publisher
+running install_data
+copying launch/run_localization_video.launch.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/launch
+copying config/tags_config.yaml -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config
+copying config/calibration.mp4 -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config
+copying config/robot_drive.mp4 -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config

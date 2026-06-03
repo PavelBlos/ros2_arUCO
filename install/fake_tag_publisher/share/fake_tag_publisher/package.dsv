@@ -1,0 +1,6 @@
+source;share/fake_tag_publisher/hook/pythonpath.dsv
+source;share/fake_tag_publisher/hook/pythonpath.sh
+source;share/fake_tag_publisher/hook/ament_prefix_path.dsv
+source;share/fake_tag_publisher/hook/ament_prefix_path.sh
+source;../../build/fake_tag_publisher/share/fake_tag_publisher/hook/pythonpath_develop.dsv
+source;../../build/fake_tag_publisher/share/fake_tag_publisher/hook/pythonpath_develop.sh

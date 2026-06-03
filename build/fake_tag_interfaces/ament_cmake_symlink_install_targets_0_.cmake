@@ -1,0 +1,1 @@
+ament_cmake_symlink_install_targets("TARGET_FILES" "/home/panik_bel/ros2_ws/build/fake_tag_interfaces/rosidl_generator_py/fake_tag_interfaces/fake_tag_interfaces_s__rosidl_typesupport_fastrtps_c.so" "TARGETS" "fake_tag_interfaces_s__rosidl_typesupport_fastrtps_c" "DESTINATION" "lib/python3.12/site-packages/fake_tag_interfaces")

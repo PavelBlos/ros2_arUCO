@@ -1,0 +1,190 @@
+[0.000000] (-) TimerEvent: {}
+[0.000417] (-) JobUnselected: {'identifier': 'fake_tag_interfaces'}
+[0.000524] (fake_tag_publisher) JobQueued: {'identifier': 'fake_tag_publisher', 'dependencies': OrderedDict({'fake_tag_interfaces': '/home/panik_bel/ros2_ws/install/fake_tag_interfaces'})}
+[0.007547] (fake_tag_publisher) JobStarted: {'identifier': 'fake_tag_publisher'}
+[0.099627] (-) TimerEvent: {}
+[0.201737] (-) TimerEvent: {}
+[0.308608] (-) TimerEvent: {}
+[0.409316] (-) TimerEvent: {}
+[0.510739] (-) TimerEvent: {}
+[0.615135] (-) TimerEvent: {}
+[0.716195] (-) TimerEvent: {}
+[0.818812] (-) TimerEvent: {}
+[0.920866] (-) TimerEvent: {}
+[1.021315] (-) TimerEvent: {}
+[1.122559] (-) TimerEvent: {}
+[1.225128] (-) TimerEvent: {}
+[1.328155] (-) TimerEvent: {}
+[1.429745] (-) TimerEvent: {}
+[1.530181] (-) TimerEvent: {}
+[1.631753] (-) TimerEvent: {}
+[1.732561] (-) TimerEvent: {}
+[1.835328] (-) TimerEvent: {}
+[1.937451] (-) TimerEvent: {}
+[2.038428] (-) TimerEvent: {}
+[2.142692] (-) TimerEvent: {}
+[2.247778] (-) TimerEvent: {}
+[2.353705] (-) TimerEvent: {}
+[2.456213] (-) TimerEvent: {}
+[2.562955] (-) TimerEvent: {}
+[2.664370] (-) TimerEvent: {}
+[2.764989] (-) TimerEvent: {}
+[2.867226] (-) TimerEvent: {}
+[2.970215] (-) TimerEvent: {}
+[3.070702] (-) TimerEvent: {}
+[3.171375] (-) TimerEvent: {}
+[3.272361] (-) TimerEvent: {}
+[3.376128] (-) TimerEvent: {}
+[3.479872] (-) TimerEvent: {}
+[3.580952] (-) TimerEvent: {}
+[3.681507] (-) TimerEvent: {}
+[3.788850] (-) TimerEvent: {}
+[3.891954] (-) TimerEvent: {}
+[3.996123] (-) TimerEvent: {}
+[4.098931] (-) TimerEvent: {}
+[4.200200] (-) TimerEvent: {}
+[4.304292] (-) TimerEvent: {}
+[4.405433] (-) TimerEvent: {}
+[4.506774] (-) TimerEvent: {}
+[4.609156] (-) TimerEvent: {}
+[4.711958] (-) TimerEvent: {}
+[4.814712] (-) TimerEvent: {}
+[4.915100] (-) TimerEvent: {}
+[5.016971] (-) TimerEvent: {}
+[5.122483] (-) TimerEvent: {}
+[5.227147] (-) TimerEvent: {}
+[5.327599] (-) TimerEvent: {}
+[5.428480] (-) TimerEvent: {}
+[5.529719] (-) TimerEvent: {}
+[5.630504] (-) TimerEvent: {}
+[5.732314] (-) TimerEvent: {}
+[5.833789] (-) TimerEvent: {}
+[5.936720] (-) TimerEvent: {}
+[6.037683] (-) TimerEvent: {}
+[6.138072] (-) TimerEvent: {}
+[6.239775] (-) TimerEvent: {}
+[6.344981] (-) TimerEvent: {}
+[6.447143] (-) TimerEvent: {}
+[6.549188] (-) TimerEvent: {}
+[6.649901] (-) TimerEvent: {}
+[6.751765] (-) TimerEvent: {}
+[6.853612] (-) TimerEvent: {}
+[6.956327] (-) TimerEvent: {}
+[7.017319] (fake_tag_publisher) Command: {'cmd': ['/usr/bin/python3', 'setup.py', 'develop', '--editable', '--build-directory', '/home/panik_bel/ros2_ws/build/fake_tag_publisher/build', '--no-deps', 'install_data'], 'cwd': '/home/panik_bel/ros2_ws/build/fake_tag_publisher', 'env': {'LESSOPEN': '| /usr/bin/lesspipe %s', 'CHROME_DEVTOOLS_MCP_JS': '/opt/antigravity/resources/app.asar.unpacked/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js', 'LANGUAGE': 'ru_RU:en', 'USER': 'panik_bel', 'ANTIGRAVITY_SOURCE_METADATA': '{"tool":{"conversationId":"33b0274d-9f9d-4fbd-8ff8-7ca2c0f7dc1d", "stepIndex":740, "toolCall":{"id":"nh7pwuf5", "name":"run_command", "argumentsJson":"{\\"CommandLine\\":\\"colcon build --symlink-install --packages-select fake_tag_publisher\\",\\"Cwd\\":\\"/home/panik_bel/ros2_ws\\",\\"WaitMsBeforeAsync\\":5000,\\"toolAction\\":\\"Building fake_tag_publisher package in user workspace\\",\\"toolSummary\\":\\"Run colcon build command\\"}", "thinkingSignature":"Eu0CCuoCAQw51sdLMkBY97dd6AmcQfQ0NtcaZ7VawU5mMaKz2gwM4vuh3fF2hJPldlM5jiHw9x6NUnc87DlIoVqIgb0KOzCs+MfiS5FgzulHyAaro/z7aDChvvw40lTJLXdOZ8fjlICXpUVurjsGsH7NZNYOxRl9Exd4q4oJ5xOeE8nGhuE/GVVT/QkDsN+hp4g1LK6gzPF0lU7qcdLL7ZpqRHOa4nI6/+UA2nGUyL4icsLbnoSS40TN/wFrbLRP5XNj9po8PtN/nJELw4+36uiVps1ivrIBy3AZaGzNPcMmRI1uPjtF+XglF8GlBbqbNT+lnlxJWRIgMThhvt0T7Jf08b4ybtaRoU5rVgwaayw4hXXQPPv6nAnSEhuFn23lh44MeQ79Kho/v+/R8Mr6X9MijdgxAuKJ1V3G5VMu1KGbEynVHbh5vwvcTvOMALFj8m8iR4WnK1hYZr0Kfya/t9183g23kGcuQLq7fT5EuDo=", "originalName":"run_command"}}}', 'LC_TIME': 'ru_RU.UTF-8', 'XDG_SESSION_TYPE': 'wayland', 'SHLVL': '2', 'LD_LIBRARY_PATH': '/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib:/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib', 'HOME': '/home/panik_bel', 'CHROME_DESKTOP': 'antigravity.desktop', 'DISABLE_AUTO_UPDATE': 'true', 'DESKTOP_SESSION': 'ubuntu', 'ROS_PYTHON_VERSION': '3', 'GNOME_SHELL_SESSION_MODE': 'ubuntu', 'GTK_MODULES': 'gail:atk-bridge', 'PAGER': 'cat', 'LC_MONETARY': 'ru_RU.UTF-8', 'SYSTEMD_EXEC_PID': '2069', 'IM_CONFIG_CHECK_ENV': '1', 'GSM_SKIP_SSH_AGENT_WORKAROUND': 'true', 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/1000/bus', 'COLORTERM': 'truecolor', 'ANTIGRAVITY_AGENT': '1', 'GNOME_KEYRING_CONTROL': '/run/user/1000/keyring', 'AGY_BROWSER_ACTIVE_PORT_FILE': '/home/panik_bel/.config/Antigravity/DevToolsActivePort', 'DEBUGINFOD_URLS': 'https://debuginfod.ubuntu.com', 'IM_CONFIG_PHASE': '1', 'WAYLAND_DISPLAY': 'wayland-0', 'ROS_DISTRO': 'jazzy', 'ZSH_TMUX_AUTOSTARTED': 'true', 'LOGNAME': 'panik_bel', 'AGY_BROWSER_WS_URL': 'ws://127.0.0.1:44187/devtools/browser/a24e35d9-d898-4b72-b11d-8fc9a510c287', '_': '/usr/bin/colcon', 'ROS_VERSION': '2', 'MEMORY_PRESSURE_WATCH': '/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.SettingsDaemon.MediaKeys.service/memory.pressure', 'XDG_SESSION_CLASS': 'user', 'USERNAME': 'panik_bel', 'TERM': 'dumb', 'GNOME_DESKTOP_SESSION_ID': 'this-is-deprecated', 'FC_FONTATIONS': '1', 'PATH': '/home/panik_bel/.gemini/antigravity/bin:/home/panik_bel/.config/Antigravity/bin:/home/panik_bel/.local/bin:/home/panik_bel/.npm-global/bin:/home/panik_bel/.npm-global/bin:/opt/ros/jazzy/bin:/home/panik_bel/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/bin:/home/panik_bel/.local/bin:/home/panik_bel/.local/bin:/home/panik_bel/.local/bin:/home/panik_bel/.local/bin', 'SESSION_MANAGER': 'local/HPbel:@/tmp/.ICE-unix/1810,unix/HPbel:/tmp/.ICE-unix/1810', 'PAPERSIZE': 'a4', 'XDG_MENU_PREFIX': 'gnome-', 'LC_ADDRESS': 'ru_RU.UTF-8', 'GNOME_TERMINAL_SCREEN': '/org/gnome/Terminal/screen/9122762a_1382_43e6_a5d4_817760d832c3', 'GNOME_SETUP_DISPLAY': ':1', 'XDG_RUNTIME_DIR': '/run/user/1000', 'GDK_BACKEND': 'wayland', 'DISPLAY': ':0', 'LANG': 'ru_RU.UTF-8', 'XDG_CURRENT_DESKTOP': 'ubuntu:GNOME', 'LC_TELEPHONE': 'ru_RU.UTF-8', 'XMODIFIERS': '@im=ibus', 'XDG_SESSION_DESKTOP': 'ubuntu', 'XAUTHORITY': '/run/user/1000/.mutter-Xwaylandauth.CCPYP3', 'LS_COLORS': 'rs=0:di=01;34:ln=01;36:mh=00:pi=40;33:so=01;35:do=01;35:bd=40;33;01:cd=40;33;01:or=40;31;01:mi=00:su=37;41:sg=30;43:ca=00:tw=30;42:ow=34;42:st=37;44:ex=01;32:*.tar=01;31:*.tgz=01;31:*.arc=01;31:*.arj=01;31:*.taz=01;31:*.lha=01;31:*.lz4=01;31:*.lzh=01;31:*.lzma=01;31:*.tlz=01;31:*.txz=01;31:*.tzo=01;31:*.t7z=01;31:*.zip=01;31:*.z=01;31:*.dz=01;31:*.gz=01;31:*.lrz=01;31:*.lz=01;31:*.lzo=01;31:*.xz=01;31:*.zst=01;31:*.tzst=01;31:*.bz2=01;31:*.bz=01;31:*.tbz=01;31:*.tbz2=01;31:*.tz=01;31:*.deb=01;31:*.rpm=01;31:*.jar=01;31:*.war=01;31:*.ear=01;31:*.sar=01;31:*.rar=01;31:*.alz=01;31:*.ace=01;31:*.zoo=01;31:*.cpio=01;31:*.7z=01;31:*.rz=01;31:*.cab=01;31:*.wim=01;31:*.swm=01;31:*.dwm=01;31:*.esd=01;31:*.avif=01;35:*.jpg=01;35:*.jpeg=01;35:*.mjpg=01;35:*.mjpeg=01;35:*.gif=01;35:*.bmp=01;35:*.pbm=01;35:*.pgm=01;35:*.ppm=01;35:*.tga=01;35:*.xbm=01;35:*.xpm=01;35:*.tif=01;35:*.tiff=01;35:*.png=01;35:*.svg=01;35:*.svgz=01;35:*.mng=01;35:*.pcx=01;35:*.mov=01;35:*.mpg=01;35:*.mpeg=01;35:*.m2v=01;35:*.mkv=01;35:*.webm=01;35:*.webp=01;35:*.ogm=01;35:*.mp4=01;35:*.m4v=01;35:*.mp4v=01;35:*.vob=01;35:*.qt=01;35:*.nuv=01;35:*.wmv=01;35:*.asf=01;35:*.rm=01;35:*.rmvb=01;35:*.flc=01;35:*.avi=01;35:*.fli=01;35:*.flv=01;35:*.gl=01;35:*.dl=01;35:*.xcf=01;35:*.xwd=01;35:*.yuv=01;35:*.cgm=01;35:*.emf=01;35:*.ogv=01;35:*.ogx=01;35:*.aac=00;36:*.au=00;36:*.flac=00;36:*.m4a=00;36:*.mid=00;36:*.midi=00;36:*.mka=00;36:*.mp3=00;36:*.mpc=00;36:*.ogg=00;36:*.ra=00;36:*.wav=00;36:*.oga=00;36:*.opus=00;36:*.spx=00;36:*.xspf=00;36:*~=00;90:*#=00;90:*.bak=00;90:*.crdownload=00;90:*.dpkg-dist=00;90:*.dpkg-new=00;90:*.dpkg-old=00;90:*.dpkg-tmp=00;90:*.old=00;90:*.orig=00;90:*.part=00;90:*.rej=00;90:*.rpmnew=00;90:*.rpmorig=00;90:*.rpmsave=00;90:*.swp=00;90:*.tmp=00;90:*.ucf-dist=00;90:*.ucf-new=00;90:*.ucf-old=00;90:', 'SBX_CHROME_API_RQ': '1', 'GNOME_TERMINAL_SERVICE': ':1.139', 'SSH_AUTH_SOCK': '/run/user/1000/keyring/ssh', 'AMENT_PREFIX_PATH': '/home/panik_bel/ros2_ws/install/fake_tag_interfaces:/opt/ros/jazzy', 'SHELL': '/bin/bash', 'ANTIGRAVITY_LS_ADDRESS': 'localhost:44145', 'LC_NAME': 'ru_RU.UTF-8', 'QT_ACCESSIBILITY': '1', 'NO_AT_BRIDGE': '1', 'GDMSESSION': 'ubuntu', 'LESSCLOSE': '/usr/bin/lesspipe %s %s', 'LC_MEASUREMENT': 'ru_RU.UTF-8', 'LC_IDENTIFICATION': 'ru_RU.UTF-8', 'ROS_AUTOMATIC_DISCOVERY_RANGE': 'SUBNET', 'QT_IM_MODULE': 'ibus', 'ANTIGRAVITY_TRAJECTORY_ID': '4399e76b-baa5-441d-a8d9-a1bd39a43a2b', 'PWD': '/home/panik_bel/ros2_ws/build/fake_tag_publisher', 'LC_ALL': 'en_US.UTF-8', 'XDG_CONFIG_DIRS': '/etc/xdg/xdg-ubuntu:/etc/xdg', 'ZSH_TMUX_AUTOSTART': 'false', 'XDG_DATA_DIRS': '/usr/share/ubuntu:/usr/share/gnome:/home/panik_bel/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/:/var/lib/snapd/desktop', 'PYTHONPATH': '/home/panik_bel/ros2_ws/build/fake_tag_publisher/prefix_override:/home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages:/home/panik_bel/ros2_ws/install/fake_tag_interfaces/lib/python3.12/site-packages:/opt/ros/jazzy/lib/python3.12/site-packages', 'LC_NUMERIC': 'ru_RU.UTF-8', 'LC_PAPER': 'ru_RU.UTF-8', 'COLCON': '1', 'MEMORY_PRESSURE_WRITE': 'c29tZSAyMDAwMDAgMjAwMDAwMAA=', 'VTE_VERSION': '7600', 'ANTIGRAVITY_CSRF_TOKEN': '81001654-6363-409d-b6eb-88b8557d0ebf', 'SANDBOX_LD_LIBRARY_PATH': '/opt/ros/jazzy/opt/rviz_ogre_vendor/lib:/opt/ros/jazzy/lib/x86_64-linux-gnu:/opt/ros/jazzy/opt/gz_math_vendor/lib:/opt/ros/jazzy/opt/gz_utils_vendor/lib:/opt/ros/jazzy/opt/gz_cmake_vendor/lib:/opt/ros/jazzy/lib', 'CMAKE_PREFIX_PATH': '/home/panik_bel/ros2_ws/install/fake_tag_interfaces:/opt/ros/jazzy/opt/gz_math_vendor:/opt/ros/jazzy/opt/gz_utils_vendor:/opt/ros/jazzy/opt/gz_cmake_vendor'}, 'shell': False}
+[7.060496] (-) TimerEvent: {}
+[7.167330] (-) TimerEvent: {}
+[7.271830] (-) TimerEvent: {}
+[7.375258] (-) TimerEvent: {}
+[7.477841] (-) TimerEvent: {}
+[7.582890] (-) TimerEvent: {}
+[7.683341] (-) TimerEvent: {}
+[7.785459] (-) TimerEvent: {}
+[7.887896] (-) TimerEvent: {}
+[7.995455] (-) TimerEvent: {}
+[8.099485] (-) TimerEvent: {}
+[8.200294] (-) TimerEvent: {}
+[8.302417] (-) TimerEvent: {}
+[8.403978] (-) TimerEvent: {}
+[8.505988] (-) TimerEvent: {}
+[8.606457] (-) TimerEvent: {}
+[8.709751] (-) TimerEvent: {}
+[8.810272] (-) TimerEvent: {}
+[8.912279] (-) TimerEvent: {}
+[9.012744] (-) TimerEvent: {}
+[9.113702] (-) TimerEvent: {}
+[9.214309] (-) TimerEvent: {}
+[9.317918] (-) TimerEvent: {}
+[9.418862] (-) TimerEvent: {}
+[9.523230] (-) TimerEvent: {}
+[9.624835] (-) TimerEvent: {}
+[9.725300] (-) TimerEvent: {}
+[9.825766] (-) TimerEvent: {}
+[9.891987] (fake_tag_publisher) StdoutLine: {'line': b'running develop\n'}
+[9.892434] (fake_tag_publisher) StderrLine: {'line': b'/usr/lib/python3/dist-packages/setuptools/command/develop.py:40: EasyInstallDeprecationWarning: easy_install command is deprecated.\n'}
+[9.892753] (fake_tag_publisher) StderrLine: {'line': b'!!\n'}
+[9.892996] (fake_tag_publisher) StderrLine: {'line': b'\n'}
+[9.893211] (fake_tag_publisher) StderrLine: {'line': b'        ********************************************************************************\n'}
+[9.893419] (fake_tag_publisher) StderrLine: {'line': b'        Please avoid running ``setup.py`` and ``easy_install``.\n'}
+[9.893626] (fake_tag_publisher) StderrLine: {'line': b'        Instead, use pypa/build, pypa/installer or other\n'}
+[9.897375] (fake_tag_publisher) StderrLine: {'line': b'        standards-based tools.\n'}
+[9.897601] (fake_tag_publisher) StderrLine: {'line': b'\n'}
+[9.897864] (fake_tag_publisher) StderrLine: {'line': b'        See https://github.com/pypa/setuptools/issues/917 for details.\n'}
+[9.904820] (fake_tag_publisher) StderrLine: {'line': b'        ********************************************************************************\n'}
+[9.908173] (fake_tag_publisher) StderrLine: {'line': b'\n'}
+[9.909721] (fake_tag_publisher) StderrLine: {'line': b'!!\n'}
+[9.910093] (fake_tag_publisher) StderrLine: {'line': b'  easy_install.initialize_options(self)\n'}
+[9.926444] (-) TimerEvent: {}
+[10.028574] (-) TimerEvent: {}
+[10.134084] (-) TimerEvent: {}
+[10.236701] (-) TimerEvent: {}
+[10.267463] (fake_tag_publisher) StderrLine: {'line': b'/usr/lib/python3/dist-packages/setuptools/_distutils/cmd.py:66: SetuptoolsDeprecationWarning: setup.py install is deprecated.\n'}
+[10.270235] (fake_tag_publisher) StderrLine: {'line': b'!!\n'}
+[10.271035] (fake_tag_publisher) StderrLine: {'line': b'\n'}
+[10.271320] (fake_tag_publisher) StderrLine: {'line': b'        ********************************************************************************\n'}
+[10.271508] (fake_tag_publisher) StderrLine: {'line': b'        Please avoid running ``setup.py`` directly.\n'}
+[10.271722] (fake_tag_publisher) StderrLine: {'line': b'        Instead, use pypa/build, pypa/installer or other\n'}
+[10.271910] (fake_tag_publisher) StderrLine: {'line': b'        standards-based tools.\n'}
+[10.276299] (fake_tag_publisher) StderrLine: {'line': b'\n'}
+[10.276527] (fake_tag_publisher) StderrLine: {'line': b'        See https://blog.ganssle.io/articles/2021/10/setup-py-deprecated.html for details.\n'}
+[10.276774] (fake_tag_publisher) StderrLine: {'line': b'        ********************************************************************************\n'}
+[10.276982] (fake_tag_publisher) StderrLine: {'line': b'\n'}
+[10.277174] (fake_tag_publisher) StderrLine: {'line': b'!!\n'}
+[10.277369] (fake_tag_publisher) StderrLine: {'line': b'  self.initialize_options()\n'}
+[10.337933] (-) TimerEvent: {}
+[10.440668] (-) TimerEvent: {}
+[10.542371] (-) TimerEvent: {}
+[10.645140] (-) TimerEvent: {}
+[10.745604] (-) TimerEvent: {}
+[10.852073] (-) TimerEvent: {}
+[10.953109] (-) TimerEvent: {}
+[11.055727] (-) TimerEvent: {}
+[11.157307] (-) TimerEvent: {}
+[11.163670] (fake_tag_publisher) StderrLine: {'line': b'/usr/lib/python3/dist-packages/setuptools/command/easy_install.py:363: UserWarning: Unbuilt egg for pytest-repeat [unknown version] (/usr/lib/python3/dist-packages)\n'}
+[11.164096] (fake_tag_publisher) StderrLine: {'line': b'  self.local_index = Environment(self.shadow_path + sys.path)\n'}
+[11.259075] (-) TimerEvent: {}
+[11.364060] (-) TimerEvent: {}
+[11.466772] (-) TimerEvent: {}
+[11.571505] (-) TimerEvent: {}
+[11.668263] (fake_tag_publisher) StdoutLine: {'line': b'running egg_info\n'}
+[11.674594] (-) TimerEvent: {}
+[11.775747] (-) TimerEvent: {}
+[11.878891] (-) TimerEvent: {}
+[11.948531] (fake_tag_publisher) StdoutLine: {'line': b'writing fake_tag_publisher.egg-info/PKG-INFO\n'}
+[11.950940] (fake_tag_publisher) StdoutLine: {'line': b'writing dependency_links to fake_tag_publisher.egg-info/dependency_links.txt\n'}
+[11.956757] (fake_tag_publisher) StdoutLine: {'line': b'writing entry points to fake_tag_publisher.egg-info/entry_points.txt\n'}
+[11.958543] (fake_tag_publisher) StdoutLine: {'line': b'writing requirements to fake_tag_publisher.egg-info/requires.txt\n'}
+[11.959933] (fake_tag_publisher) StdoutLine: {'line': b'writing top-level names to fake_tag_publisher.egg-info/top_level.txt\n'}
+[11.980095] (-) TimerEvent: {}
+[12.082188] (-) TimerEvent: {}
+[12.182907] (-) TimerEvent: {}
+[12.280229] (fake_tag_publisher) StdoutLine: {'line': b"reading manifest file 'fake_tag_publisher.egg-info/SOURCES.txt'\n"}
+[12.281544] (fake_tag_publisher) StdoutLine: {'line': b"writing manifest file 'fake_tag_publisher.egg-info/SOURCES.txt'\n"}
+[12.283018] (-) TimerEvent: {}
+[12.383416] (-) TimerEvent: {}
+[12.455634] (fake_tag_publisher) StdoutLine: {'line': b'running build_ext\n'}
+[12.456808] (fake_tag_publisher) StdoutLine: {'line': b'Creating /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/python3.12/site-packages/fake-tag-publisher.egg-link (link to .)\n'}
+[12.460534] (fake_tag_publisher) StdoutLine: {'line': b'Installing camera_calibrator script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher\n'}
+[12.464962] (fake_tag_publisher) StdoutLine: {'line': b'Installing fake_tag_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher\n'}
+[12.468244] (fake_tag_publisher) StdoutLine: {'line': b'Installing localization_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher\n'}
+[12.471838] (fake_tag_publisher) StdoutLine: {'line': b'Installing static_tf_node script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher\n'}
+[12.472211] (fake_tag_publisher) StdoutLine: {'line': b'Installing video_tag_detector script to /home/panik_bel/ros2_ws/install/fake_tag_publisher/lib/fake_tag_publisher\n'}
+[12.474073] (fake_tag_publisher) StdoutLine: {'line': b'\n'}
+[12.475409] (fake_tag_publisher) StdoutLine: {'line': b'Installed /home/panik_bel/ros2_ws/build/fake_tag_publisher\n'}
+[12.477200] (fake_tag_publisher) StdoutLine: {'line': b'running install_data\n'}
+[12.477793] (fake_tag_publisher) StdoutLine: {'line': b'copying launch/run_localization_video.launch.py -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/launch\n'}
+[12.478106] (fake_tag_publisher) StdoutLine: {'line': b'copying config/tags_config.yaml -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config\n'}
+[12.478372] (fake_tag_publisher) StdoutLine: {'line': b'copying config/calibration.mp4 -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config\n'}
+[12.483796] (fake_tag_publisher) StdoutLine: {'line': b'copying config/robot_drive.mp4 -> /home/panik_bel/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config\n'}
+[12.484210] (-) TimerEvent: {}
+[12.589423] (-) TimerEvent: {}
+[12.691263] (-) TimerEvent: {}
+[12.709918] (fake_tag_publisher) CommandEnded: {'returncode': 0}
+[12.796624] (-) TimerEvent: {}
+[12.905803] (-) TimerEvent: {}
+[13.008095] (-) TimerEvent: {}
+[13.108787] (-) TimerEvent: {}
+[13.211343] (-) TimerEvent: {}
+[13.313345] (-) TimerEvent: {}
+[13.424847] (-) TimerEvent: {}
+[13.442266] (fake_tag_publisher) JobEnded: {'identifier': 'fake_tag_publisher', 'rc': 0}
+[13.450695] (-) EventReactorShutdown: {}
