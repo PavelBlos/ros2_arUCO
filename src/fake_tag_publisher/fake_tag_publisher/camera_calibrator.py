@@ -10,18 +10,40 @@ class CameraCalibrator(Node):
     def __init__(self):
         super().__init__('camera_calibrator')
         
-        # Декларируем ROS2 параметры
-        self.declare_parameter('video_path', 'config/calibration.mp4')
-        self.declare_parameter('square_size', 0.025) # Размер квадрата в метрах (по умолчанию 25мм)
-        self.declare_parameter('board_width', 8)     # Количество внутренних углов по ширине (9 квадратов -> 8 углов)
-        self.declare_parameter('board_height', 6)    # Количество внутренних углов по высоте (7 квадратов -> 6 углов)
-        self.declare_parameter('frame_step', 15)      # Шаг проверки кадров (по умолчанию 15)
+        # Декларируем ROS2 параметры с поддержкой динамического типа
+        from rcl_interfaces.msg import ParameterDescriptor
+        self.declare_parameter('video_path', 'config/calibration.mp4', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('square_size', 0.025, ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('board_width', 8, ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('board_height', 6, ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('frame_step', 15, ParameterDescriptor(dynamic_typing=True))
         
-        self.video_path = self.get_parameter('video_path').get_parameter_value().string_value
-        self.square_size = self.get_parameter('square_size').get_parameter_value().double_value
-        self.board_width = self.get_parameter('board_width').get_parameter_value().integer_value
-        self.board_height = self.get_parameter('board_height').get_parameter_value().integer_value
-        self.frame_step = self.get_parameter('frame_step').get_parameter_value().integer_value
+        video_param = self.get_parameter('video_path')
+        self.video_path = str(video_param.value) if video_param.value is not None else 'config/calibration.mp4'
+
+        square_param = self.get_parameter('square_size')
+        try:
+            self.square_size = float(square_param.value)
+        except (TypeError, ValueError):
+            self.square_size = 0.025
+
+        width_param = self.get_parameter('board_width')
+        try:
+            self.board_width = int(width_param.value)
+        except (TypeError, ValueError):
+            self.board_width = 8
+
+        height_param = self.get_parameter('board_height')
+        try:
+            self.board_height = int(height_param.value)
+        except (TypeError, ValueError):
+            self.board_height = 6
+
+        step_param = self.get_parameter('frame_step')
+        try:
+            self.frame_step = int(step_param.value)
+        except (TypeError, ValueError):
+            self.frame_step = 15
 
         self.get_logger().info(f"Calibration node started.")
         self.get_logger().info(f"Parameters: video={self.video_path}, square={self.square_size}m, grid={self.board_width}x{self.board_height}, step={self.frame_step}")

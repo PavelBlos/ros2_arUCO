@@ -13,24 +13,43 @@ class VideoTagDetector(Node):
     def __init__(self):
         super().__init__('video_tag_detector')
         
-        # Декларируем ROS2 параметры
-        self.declare_parameter('video_path', 'config/robot_drive.mp4')
-        self.declare_parameter('calibration_path', 'config/camera_info.yaml')
-        self.declare_parameter('marker_length', 0.15) # Реальный размер маркера в метрах (например, 15см)
-        self.declare_parameter('detection_rate', 30.0) # Частота обработки кадров (30 Гц)
-        self.declare_parameter('aruco_dictionary', 'DICT_4X4_100') # Семейство ArUco маркеров
-        self.declare_parameter('loop_video', True) # Циклический повтор видео
+        # Декларируем ROS2 параметры с поддержкой динамического типа
+        from rcl_interfaces.msg import ParameterDescriptor
+        self.declare_parameter('video_path', 'config/robot_drive.mp4', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('calibration_path', 'config/camera_info.yaml', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('marker_length', 0.15, ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('detection_rate', 30.0, ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('aruco_dictionary', 'DICT_4X4_100', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('loop_video', True, ParameterDescriptor(dynamic_typing=True))
 
-        self.video_path = self.get_parameter('video_path').get_parameter_value().string_value
-        self.calibration_path = self.get_parameter('calibration_path').get_parameter_value().string_value
-        self.marker_length = self.get_parameter('marker_length').get_parameter_value().double_value
-        self.detection_rate = self.get_parameter('detection_rate').get_parameter_value().double_value
-        self.aruco_dict_name = self.get_parameter('aruco_dictionary').get_parameter_value().string_value
+        video_param = self.get_parameter('video_path')
+        self.video_path = str(video_param.value) if video_param.value is not None else 'config/robot_drive.mp4'
+
+        calib_param = self.get_parameter('calibration_path')
+        self.calibration_path = str(calib_param.value) if calib_param.value is not None else 'config/camera_info.yaml'
+
+        marker_param = self.get_parameter('marker_length')
+        try:
+            self.marker_length = float(marker_param.value)
+        except (TypeError, ValueError):
+            self.marker_length = 0.15
+
+        rate_param = self.get_parameter('detection_rate')
+        try:
+            self.detection_rate = float(rate_param.value)
+        except (TypeError, ValueError):
+            self.detection_rate = 30.0
+
+        aruco_dict_param = self.get_parameter('aruco_dictionary')
+        self.aruco_dict_name = str(aruco_dict_param.value) if aruco_dict_param.value is not None else 'DICT_4X4_100'
+
         loop_param = self.get_parameter('loop_video')
         if loop_param.type_ == rclpy.Parameter.Type.STRING:
             self.loop_video = loop_param.value.lower() in ['true', '1', 'yes']
-        else:
+        elif loop_param.value is not None:
             self.loop_video = bool(loop_param.value)
+        else:
+            self.loop_video = True
 
         # Разрешаем относительный путь к видеофайлу через share-директорию пакета
         if not os.path.isabs(self.video_path):
@@ -53,13 +72,30 @@ class VideoTagDetector(Node):
         # 2. Инициализация OpenCV детектора ArUco (словарь DICT_4X4_50)
         self.init_aruco_detector()
 
-        # 3. Открываем видеофайл
-        self.cap = cv2.VideoCapture(self.video_path)
-        if not self.cap.isOpened():
-            self.get_logger().error(f"Failed to open video file: {self.video_path}")
-            return
-        
-        self.get_logger().info(f"Successfully opened video file: {self.video_path}")
+        # 3. Открываем видеофайл или камеру
+        import re
+        match_dev = re.match(r'^/dev/video(\d+)$', self.video_path)
+
+        if self.video_path.isdigit():
+            cam_idx = int(self.video_path)
+            self.cap = cv2.VideoCapture(cam_idx)
+            if not self.cap.isOpened():
+                self.get_logger().error(f"Failed to open live camera with index: {cam_idx}")
+                return
+            self.get_logger().info(f"Successfully opened live camera with index: {cam_idx}")
+        elif match_dev:
+            cam_idx = int(match_dev.group(1))
+            self.cap = cv2.VideoCapture(cam_idx)
+            if not self.cap.isOpened():
+                self.get_logger().error(f"Failed to open live camera via device path: {self.video_path} (parsed index: {cam_idx})")
+                return
+            self.get_logger().info(f"Successfully opened live camera via device path: {self.video_path} (parsed index: {cam_idx})")
+        else:
+            self.cap = cv2.VideoCapture(self.video_path)
+            if not self.cap.isOpened():
+                self.get_logger().error(f"Failed to open video file: {self.video_path}")
+                return
+            self.get_logger().info(f"Successfully opened video file: {self.video_path}")
 
         # 4. Создаем публикататор и таймер обработки кадров
         self.publisher_ = self.create_publisher(TagDetectionArray, '/fake_tag', 10)
@@ -117,8 +153,12 @@ class VideoTagDetector(Node):
         # Считываем следующий кадр
         ret, frame = self.cap.read()
         
-        # Если видео закончилось
+        # Если кадр не считался (видео закончилось или сбой камеры)
         if not ret:
+            if self.video_path.isdigit():
+                self.get_logger().warn("Failed to grab frame from live camera. Retrying...")
+                return
+            
             if self.loop_video:
                 self.get_logger().info("Video finished. Looping back to the beginning.")
                 self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -218,7 +258,7 @@ class VideoTagDetector(Node):
             self.get_logger().info(f"Video frame processed. Detected tags: {detected_ids}")
 
     def __del__(self):
-        if self.cap.isOpened():
+        if hasattr(self, 'cap') and self.cap is not None and self.cap.isOpened():
             self.cap.release()
 
 def main(args=None):
