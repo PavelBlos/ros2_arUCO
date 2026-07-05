@@ -42,6 +42,8 @@ setup(
             'static_tf_node = fake_tag_publisher.static_tf_node:main',
             'camera_calibrator = fake_tag_publisher.camera_calibrator:main',
             'video_tag_detector = fake_tag_publisher.video_tag_detector:main',
+            'esp32_bridge = fake_tag_publisher.esp32_bridge:main',
+            'path_follower = fake_tag_publisher.path_follower:main',
         ],
     },
 )

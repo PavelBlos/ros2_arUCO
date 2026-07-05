@@ -1,7 +1,11 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, TransformStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
+from nav_msgs.msg import Odometry, Path
 from fake_tag_interfaces.msg import TagDetectionArray
+from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
+from rcl_interfaces.srv import SetParameters
+from std_msgs.msg import String, Empty
 import tf2_ros
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -36,6 +40,34 @@ class LocalizationNode(Node):
         # Публикатор оцененного положения робота в топик /estimated_pose
         self.pose_pub = self.create_publisher(
             PoseStamped, '/estimated_pose', 10)
+
+        # Публикатор cmd_vel для тестового движения и переменные калибровки
+        self.cmd_vel_pub = self.create_publisher(
+            Twist, '/cmd_vel', 10)
+        self.test_drive_thread = None
+        self.test_drive_active = False
+
+        # Публикатор траектории маршрута (план)
+        self.plan_pub = self.create_publisher(Path, '/plan', 10)
+        self.start_work_pub = self.create_publisher(Empty, '/start_work', 10)
+        self.status_sub = self.create_subscription(String, '/follower_status', self.status_callback, 10)
+        self.follower_status = "idle"
+
+        # Клиент для динамического изменения параметров автопилота
+        self.param_client = self.create_client(SetParameters, '/path_follower/set_parameters')
+
+        # Состояние слияния одометрии и меток (Комплементарный фильтр)
+        self.fused_x = 0.0
+        self.fused_y = 0.0
+        self.fused_z = 0.0
+        self.fused_yaw = 0.0
+        self.fused_initialized = False
+        self.last_odom_msg_time = None
+        self.last_detected_tags = []
+
+        # Подписка на колесную одометрию
+        self.odom_sub = self.create_subscription(
+            Odometry, '/wheel_odom', self.odom_callback, 10)
 
         # Буферы для записи траекторий (сырая и отфильтрованная)
         self.raw_trajectory_x = []
@@ -182,117 +214,48 @@ class LocalizationNode(Node):
                     self.get_logger().error(f"Rotation averaging failed: {str(rot_mean_err)}")
                     avg_rot = rotations[0]
 
-            # 4. Применяем фильтрацию Exponential Moving Average (EMA) и Slerp
-            if self.last_pos is None:
-                self.last_pos = avg_pos
-                self.last_rot = avg_rot
-                filtered_pos = avg_pos
-                filtered_rot = avg_rot
+            # 4. Применяем слияние датчиков (Комплементарный фильтр)
+            avg_yaw = self.quaternion_to_yaw_from_quat(avg_rot)
+            
+            if not self.fused_initialized:
+                self.fused_x = avg_pos[0]
+                self.fused_y = avg_pos[1]
+                self.fused_z = avg_pos[2]
+                self.fused_yaw = avg_yaw
+                self.fused_initialized = True
             else:
-                alpha = self.filter_alpha
-                filtered_pos = alpha * avg_pos + (1.0 - alpha) * self.last_pos
+                # Коэффициент доверия к визуальной метке (filter_alpha)
+                K = self.filter_alpha
+                self.fused_x += K * (avg_pos[0] - self.fused_x)
+                self.fused_y += K * (avg_pos[1] - self.fused_y)
+                self.fused_z += K * (avg_pos[2] - self.fused_z)
                 
-                # Slerp интерполяция для сглаживания кватернионов поворота
-                try:
-                    q1 = self.last_rot / np.linalg.norm(self.last_rot)
-                    q2 = avg_rot / np.linalg.norm(avg_rot)
-                    key_rots = R.from_quat([q1, q2])
-                    slerp = Slerp([0.0, 1.0], key_rots)
-                    filtered_rot = slerp(alpha).as_quat()
-                except Exception as slerp_err:
-                    self.get_logger().debug(f"Slerp failed, using raw rotation: {str(slerp_err)}")
-                    filtered_rot = avg_rot
-                
-                self.last_pos = filtered_pos
-                self.last_rot = filtered_rot
+                yaw_diff = avg_yaw - self.fused_yaw
+                yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
+                self.fused_yaw += K * yaw_diff
+                self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
 
-            # 5. Публикуем финальную ОТФИЛЬТРОВАННУЮ позу робота в PoseStamped
-            robot_pose = PoseStamped()
-            robot_pose.header.stamp = msg.header.stamp
-            robot_pose.header.frame_id = 'map'
-            
-            robot_pose.pose.position.x = filtered_pos[0]
-            robot_pose.pose.position.y = filtered_pos[1]
-            robot_pose.pose.position.z = filtered_pos[2]
-            
-            robot_pose.pose.orientation.x = filtered_rot[0]
-            robot_pose.pose.orientation.y = filtered_rot[1]
-            robot_pose.pose.orientation.z = filtered_rot[2]
-            robot_pose.pose.orientation.w = filtered_rot[3]
-            
-            self.pose_pub.publish(robot_pose)
-
-            # 6. Транслируем динамическое TF-преобразование map -> base_link (отфильтрованное)
-            t_msg = TransformStamped()
-            t_msg.header.stamp = msg.header.stamp
-            t_msg.header.frame_id = 'map'
-            t_msg.child_frame_id = 'base_link'
-            
-            t_msg.transform.translation.x = filtered_pos[0]
-            t_msg.transform.translation.y = filtered_pos[1]
-            t_msg.transform.translation.z = filtered_pos[2]
-            
-            t_msg.transform.rotation.x = filtered_rot[0]
-            t_msg.transform.rotation.y = filtered_rot[1]
-            t_msg.transform.rotation.z = filtered_rot[2]
-            t_msg.transform.rotation.w = filtered_rot[3]
-            
-            self.tf_broadcaster.sendTransform(t_msg)
-
-            tag_ids = [d.tag_id for d in detections]
-            self.get_logger().info(
-                f"Localized by tags {tag_ids}: X={filtered_pos[0]:.2f}, Y={filtered_pos[1]:.2f}, Z={filtered_pos[2]:.2f}"
-            )
-
-            # Обновляем длину пути в реальном времени
+            # Обновляем длину сырого пути
             if len(self.raw_trajectory_x) > 0:
                 dx = avg_pos[0] - self.raw_trajectory_x[-1]
                 dy = avg_pos[1] - self.raw_trajectory_y[-1]
                 dz = avg_pos[2] - self.raw_trajectory_z[-1]
                 self.raw_path_length += np.sqrt(dx*dx + dy*dy + dz*dz)
 
-            if len(self.filtered_trajectory_x) > 0:
-                dx = filtered_pos[0] - self.filtered_trajectory_x[-1]
-                dy = filtered_pos[1] - self.filtered_trajectory_y[-1]
-                dz = filtered_pos[2] - self.filtered_trajectory_z[-1]
-                self.filtered_path_length += np.sqrt(dx*dx + dy*dy + dz*dz)
-
-            # Сохраняем точки траектории (сырую и отфильтрованную)
             self.raw_trajectory_x.append(avg_pos[0])
             self.raw_trajectory_y.append(avg_pos[1])
             self.raw_trajectory_z.append(avg_pos[2])
 
-            self.filtered_trajectory_x.append(filtered_pos[0])
-            self.filtered_trajectory_y.append(filtered_pos[1])
-            self.filtered_trajectory_z.append(filtered_pos[2])
-
             stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
             self.trajectory_timestamps.append(stamp_sec)
 
-            # Извлекаем Yaw (угол поворота вокруг оси Z)
-            try:
-                yaw_deg = R.from_quat(filtered_rot).as_euler('zyx', degrees=True)[0]
-            except Exception:
-                yaw_deg = 0.0
+            # Вызываем публикацию отфильтрованной позы и TF
+            self.last_detected_tags = [d.tag_id for d in detections]
+            self.publish_fused_pose(msg.header.stamp)
 
-            # Отправляем обновление на веб-клиенты
-            web_data = {
-                "type": "pose",
-                "x": float(filtered_pos[0]),
-                "y": float(filtered_pos[1]),
-                "z": float(filtered_pos[2]),
-                "yaw": float(yaw_deg),
-                "raw_x": float(avg_pos[0]),
-                "raw_y": float(avg_pos[1]),
-                "raw_z": float(avg_pos[2]),
-                "distance_raw": float(self.raw_path_length),
-                "distance_filtered": float(self.filtered_path_length),
-                "timestamp": float(stamp_sec),
-                "detected_tags": tag_ids
-            }
-            with sse_clients_lock:
-                for q in sse_clients:
-                    q.put(web_data)
+            self.get_logger().info(
+                f"Fused update by tags {self.last_detected_tags}: X={self.fused_x:.2f}, Y={self.fused_y:.2f}, Z={self.fused_z:.2f}"
+            )
 
         except Exception as e:
             self.get_logger().error(f"Error in tag_callback: {str(e)}")
@@ -315,6 +278,240 @@ class LocalizationNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"Error closing web server: {str(e)}")
         super().destroy_node()
+
+    def set_bridge_parameters(self, wheel_mult, base_mult):
+        from rcl_interfaces.srv import SetParameters
+        from rcl_interfaces.msg import Parameter, ParameterValue
+
+        self.get_logger().info(f"Setting bridge parameters: wheel_mult={wheel_mult}, base_mult={base_mult}")
+        
+        client = self.create_client(SetParameters, '/esp32_bridge/set_parameters')
+        if not client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error("esp32_bridge parameter service not available!")
+            return False
+            
+        req = SetParameters.Request()
+        
+        val_wheel = ParameterValue(type=2, double_value=float(wheel_mult))
+        req.parameters.append(Parameter(name='wheel_radius_multiplier', value=val_wheel))
+        
+        val_base = ParameterValue(type=2, double_value=float(base_mult))
+        req.parameters.append(Parameter(name='base_radius_multiplier', value=val_base))
+        
+        client.call_async(req)
+        return True
+
+    def run_test_drive(self, drive_type):
+        self.get_logger().info(f"Triggering test drive: {drive_type}")
+        
+        self.test_drive_active = False
+        if self.test_drive_thread and self.test_drive_thread.is_alive():
+            self.test_drive_thread.join()
+            
+        if drive_type == 'stop':
+            msg = Twist()
+            self.cmd_vel_pub.publish(msg)
+            return True
+            
+        self.test_drive_active = True
+        import time as pytime
+        self.test_drive_thread = threading.Thread(target=self.test_drive_loop, args=(drive_type,), daemon=True)
+        self.test_drive_thread.start()
+        return True
+
+    def test_drive_loop(self, drive_type):
+        import time as pytime
+        start_time = pytime.time()
+        
+        if drive_type == 'forward':
+            duration = 1.0 / 0.15 # 6.67 seconds to drive 1m
+            vx = 0.15
+            w = 0.0
+        elif drive_type == 'rotate':
+            duration = (2.0 * np.pi) / 0.5 # 12.57 seconds to rotate 360 degrees
+            vx = 0.0
+            w = 0.5
+        else:
+            return
+            
+        self.get_logger().info(f"Starting test motion '{drive_type}' for {duration:.2f} seconds")
+        
+        while self.test_drive_active and (pytime.time() - start_time < duration):
+            msg = Twist()
+            msg.linear.x = vx
+            msg.angular.z = w
+            self.cmd_vel_pub.publish(msg)
+            pytime.sleep(0.05)
+            
+        msg = Twist()
+        self.cmd_vel_pub.publish(msg)
+        self.test_drive_active = False
+        self.get_logger().info("Test motion finished, robot stopped.")
+
+    def odom_callback(self, msg):
+        """Интеграция одометрии шаговых двигателей для экстраполяции позы"""
+        now = self.get_clock().now()
+        if self.last_odom_msg_time is None:
+            self.last_odom_msg_time = now
+            return
+            
+        dt = (now - self.last_odom_msg_time).nanoseconds / 1e9
+        self.last_odom_msg_time = now
+        
+        if dt <= 0 or dt > 0.5:
+            dt = 0.04
+            
+        if not self.fused_initialized:
+            self.fused_x = msg.pose.pose.position.x
+            self.fused_y = msg.pose.pose.position.y
+            self.fused_z = msg.pose.pose.position.z
+            
+            q = msg.pose.pose.orientation
+            q_arr = [q.x, q.y, q.z, q.w]
+            self.fused_yaw = self.quaternion_to_yaw_from_quat(q_arr)
+            self.fused_initialized = True
+            return
+
+        vx_local = msg.twist.twist.linear.x
+        vy_local = msg.twist.twist.linear.y
+        w = msg.twist.twist.angular.z
+
+        self.fused_yaw += w * dt
+        self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
+
+        dx_local = vx_local * dt
+        dy_local = vy_local * dt
+
+        dx_global = dx_local * np.cos(self.fused_yaw) - dy_local * np.sin(self.fused_yaw)
+        dy_global = dx_local * np.sin(self.fused_yaw) + dy_local * np.cos(self.fused_yaw)
+
+        self.fused_x += dx_global
+        self.fused_y += dy_global
+
+        self.publish_fused_pose(now.to_msg())
+
+    def publish_fused_pose(self, stamp):
+        if not self.fused_initialized:
+            return
+            
+        robot_pose = PoseStamped()
+        robot_pose.header.stamp = stamp
+        robot_pose.header.frame_id = 'map'
+        
+        robot_pose.pose.position.x = self.fused_x
+        robot_pose.pose.position.y = self.fused_y
+        robot_pose.pose.position.z = self.fused_z
+        
+        q_arr = self.yaw_to_quaternion_as_array(self.fused_yaw)
+        robot_pose.pose.orientation.x = q_arr[0]
+        robot_pose.pose.orientation.y = q_arr[1]
+        robot_pose.pose.orientation.z = q_arr[2]
+        robot_pose.pose.orientation.w = q_arr[3]
+        
+        self.pose_pub.publish(robot_pose)
+
+        t_msg = TransformStamped()
+        t_msg.header.stamp = stamp
+        t_msg.header.frame_id = 'map'
+        t_msg.child_frame_id = 'base_link'
+        
+        t_msg.transform.translation.x = self.fused_x
+        t_msg.transform.translation.y = self.fused_y
+        t_msg.transform.translation.z = self.fused_z
+        t_msg.transform.rotation.x = q_arr[0]
+        t_msg.transform.rotation.y = q_arr[1]
+        t_msg.transform.rotation.z = q_arr[2]
+        t_msg.transform.rotation.w = q_arr[3]
+        
+        self.tf_broadcaster.sendTransform(t_msg)
+
+        if len(self.filtered_trajectory_x) > 0:
+            dx = self.fused_x - self.filtered_trajectory_x[-1]
+            dy = self.fused_y - self.filtered_trajectory_y[-1]
+            dz = self.fused_z - self.filtered_trajectory_z[-1]
+            self.filtered_path_length += np.sqrt(dx*dx + dy*dy + dz*dz)
+
+        self.filtered_trajectory_x.append(self.fused_x)
+        self.filtered_trajectory_y.append(self.fused_y)
+        self.filtered_trajectory_z.append(self.fused_z)
+
+        # Отправляем обновление позы на веб-интерфейс (SSE)
+        stamp_sec = stamp.sec + stamp.nanosec * 1e-9
+        web_data = {
+            "type": "pose",
+            "x": float(self.fused_x),
+            "y": float(self.fused_y),
+            "z": float(self.fused_z),
+            "yaw": float(np.degrees(self.fused_yaw)),
+            "raw_x": float(self.raw_trajectory_x[-1]) if len(self.raw_trajectory_x) > 0 else float(self.fused_x),
+            "raw_y": float(self.raw_trajectory_y[-1]) if len(self.raw_trajectory_y) > 0 else float(self.fused_y),
+            "distance_raw": float(self.raw_path_length),
+            "distance_filtered": float(self.filtered_path_length),
+            "timestamp": float(stamp_sec),
+            "detected_tags": self.last_detected_tags,
+            "follower_status": self.follower_status
+        }
+        with sse_clients_lock:
+            for q in sse_clients:
+                q.put(web_data)
+
+    def publish_plan(self, points):
+        self.get_logger().info(f"Publishing new path plan with {len(points)} waypoints")
+        path_msg = Path()
+        path_msg.header.stamp = self.get_clock().now().to_msg()
+        path_msg.header.frame_id = 'map'
+        
+        for pt in points:
+            pose = PoseStamped()
+            pose.header.stamp = path_msg.header.stamp
+            pose.header.frame_id = 'map'
+            pose.pose.position.x = float(pt[0])
+            pose.pose.position.y = float(pt[1])
+            path_msg.poses.append(pose)
+            
+        self.plan_pub.publish(path_msg)
+
+    def status_callback(self, msg):
+        self.follower_status = msg.data
+
+    def trigger_start_work(self):
+        self.get_logger().info("Triggering start work signal for path follower.")
+        self.start_work_pub.publish(Empty())
+
+    def set_follower_parameters(self, look_ahead, max_lin, max_ang, kp_lin, kp_ang, goal_tol, decel_dist, min_lin, yaw_deadzone, wp_tol, turn_decel):
+        """Отправка запроса на изменение параметров в ноду path_follower"""
+        if not self.param_client.service_is_ready():
+            self.get_logger().warn("Path follower parameter service not ready.")
+            return False
+            
+        req = SetParameters.Request()
+        req.parameters.append(Parameter(name='look_ahead_distance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(look_ahead))))
+        req.parameters.append(Parameter(name='max_linear_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(max_lin))))
+        req.parameters.append(Parameter(name='max_angular_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(max_ang))))
+        req.parameters.append(Parameter(name='kp_linear', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(kp_lin))))
+        req.parameters.append(Parameter(name='kp_angular', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(kp_ang))))
+        req.parameters.append(Parameter(name='goal_tolerance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(goal_tol))))
+        req.parameters.append(Parameter(name='decel_dist', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(decel_dist))))
+        req.parameters.append(Parameter(name='min_linear_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(min_lin))))
+        req.parameters.append(Parameter(name='yaw_deadzone_dist', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(yaw_deadzone))))
+        req.parameters.append(Parameter(name='waypoint_tolerance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(wp_tol))))
+        req.parameters.append(Parameter(name='kp_turn_decel', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(turn_decel))))
+        
+        self.param_client.call_async(req)
+        self.get_logger().info("Sent parameter update request to path_follower.")
+        return True
+
+    def quaternion_to_yaw_from_quat(self, q):
+        siny_cosp = 2 * (q[3] * q[2] + q[0] * q[1])
+        cosy_cosp = 1 - 2 * (q[1] * q[1] + q[2] * q[2])
+        return np.arctan2(siny_cosp, cosy_cosp)
+
+    def yaw_to_quaternion_as_array(self, yaw):
+        qw = np.cos(yaw / 2.0)
+        qx = 0.0
+        qy = 0.0
+        qz = np.sin(yaw / 2.0)
+        return np.array([qx, qy, qz, qw])
 
     def save_trajectory_and_shutdown(self):
         if not self.raw_trajectory_x:
@@ -441,6 +638,9 @@ class WebServerHandler(SimpleHTTPRequestHandler):
         if self.path == '/':
             self.send_response(200)
             self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
         elif self.path == '/config':
@@ -485,6 +685,112 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 with sse_clients_lock:
                     if q in sse_clients:
                         sse_clients.remove(q)
+        elif self.path.startswith('/set_calib'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            
+            wheel_mult = float(query.get('wheel_mult', [1.0])[0])
+            base_mult = float(query.get('base_mult', [1.0])[0])
+            
+            self.server.node.set_bridge_parameters(wheel_mult, base_mult)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            
+        elif self.path.startswith('/test_drive'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            
+            drive_type = query.get('type', ['stop'])[0]
+            self.server.node.run_test_drive(drive_type)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success", "type": drive_type}).encode('utf-8'))
+            
+        elif self.path.startswith('/set_path'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            
+            points_str = query.get('points', [''])[0]
+            points = []
+            if points_str:
+                for pt_str in points_str.split(';'):
+                    if ',' in pt_str:
+                        coords = pt_str.split(',')
+                        points.append([float(coords[0]), float(coords[1])])
+            
+            self.server.node.publish_plan(points)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            
+        elif self.path.startswith('/set_follower_params'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            
+            look_ahead = float(query.get('look_ahead', [0.10])[0])
+            max_lin = float(query.get('max_lin', [0.18])[0])
+            max_ang = float(query.get('max_ang', [0.8])[0])
+            kp_lin = float(query.get('kp_lin', [0.8])[0])
+            kp_ang = float(query.get('kp_ang', [1.5])[0])
+            goal_tol = float(query.get('goal_tol', [0.02])[0])
+            decel_dist = float(query.get('decel_dist', [0.30])[0])
+            min_lin = float(query.get('min_lin', [0.04])[0])
+            yaw_deadzone = float(query.get('yaw_deadzone', [0.08])[0])
+            wp_tol = float(query.get('wp_tol', [0.0])[0])
+            turn_decel = float(query.get('turn_decel', [0.4])[0])
+            
+            self.server.node.set_follower_parameters(
+                look_ahead, max_lin, max_ang, kp_lin, kp_ang, goal_tol, decel_dist, min_lin, yaw_deadzone, wp_tol, turn_decel
+            )
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            
+        elif self.path.startswith('/start_work'):
+            self.server.node.trigger_start_work()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            
+        elif self.path.startswith('/drive'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            
+            vx = float(query.get('vx', [0.0])[0])
+            vy = float(query.get('vy', [0.0])[0])
+            w = float(query.get('w', [0.0])[0])
+            
+            msg = Twist()
+            msg.linear.x = vx
+            msg.linear.y = vy
+            msg.angular.z = w
+            self.server.node.cmd_vel_pub.publish(msg)
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
         else:
             self.send_error(404, "File not found")
 
@@ -526,6 +832,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             z-index: 10;
             box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
             flex-shrink: 0;
+            overflow-y: auto;
+            max-height: 100vh;
+        }
+        #sidebar::-webkit-scrollbar {
+            width: 6px;
+        }
+        #sidebar::-webkit-scrollbar-track {
+            background: rgba(0, 0, 0, 0.1);
+        }
+        #sidebar::-webkit-scrollbar-thumb {
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 3px;
+        }
+        #sidebar::-webkit-scrollbar-thumb:hover {
+            background: rgba(102, 252, 241, 0.4);
         }
         #map-container {
             flex: 1;
@@ -535,6 +856,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             align-items: center;
             justify-content: center;
             overflow: hidden;
+        }
+        @media (max-width: 768px) {
+            body {
+                flex-direction: column;
+                height: 100vh;
+                overflow: hidden;
+            }
+            #map-container {
+                height: 40vh;
+                width: 100%;
+                flex-shrink: 0;
+            }
+            #sidebar {
+                width: 100%;
+                height: 60vh;
+                border-right: none;
+                border-top: 1px solid rgba(255, 255, 255, 0.08);
+                padding: 16px;
+                overflow-y: auto;
+                max-height: none;
+            }
         }
         canvas {
             display: block;
@@ -731,6 +1073,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: #0b0c10;
             border-color: #66fcf1;
         }
+        .calib-container {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        .calib-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 8px;
+        }
+        .calib-input {
+            width: 80px;
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #fff;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-family: inherit;
+            text-align: right;
+        }
+        .calib-input:focus {
+            outline: none;
+            border-color: #66fcf1;
+        }
+        .control-box {
+            background: rgba(255, 255, 255, 0.02);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .joystick-zone {
+            width: 160px;
+            height: 160px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+        }
+        #joystick-base {
+            width: 120px;
+            height: 120px;
+            background: rgba(255, 255, 255, 0.03);
+            border: 2px solid rgba(255, 255, 255, 0.1);
+            border-radius: 50%;
+            position: relative;
+            touch-action: none;
+        }
+        #joystick-handle {
+            width: 40px;
+            height: 40px;
+            background: #66fcf1;
+            border-radius: 50%;
+            position: absolute;
+            top: 38px;
+            left: 38px;
+            box-shadow: 0 0 15px rgba(102, 252, 241, 0.6);
+            cursor: pointer;
+            transition: transform 0.05s ease;
+        }
         #terminal-log {
             margin-top: auto;
             background: rgba(0, 0, 0, 0.3);
@@ -804,6 +1212,108 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <button class="btn" id="btn-autocenter">Автоцентрирование: ВКЛ</button>
         <button class="btn btn-secondary" id="btn-reset">Сбросить Траекторию & Вид</button>
+
+        <div class="section-title" style="margin-top: 20px;">Калибровка моторов</div>
+        <div class="calib-container">
+            <div class="calib-row">
+                <span class="stat-label">Колеса (Wheel Mult):</span>
+                <input type="number" id="input-wheel-mult" class="calib-input" value="1.000" step="0.005" min="0.5" max="1.5">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label">База (Base Mult):</span>
+                <input type="number" id="input-base-mult" class="calib-input" value="1.000" step="0.005" min="0.5" max="1.5">
+            </div>
+            <button class="btn" id="btn-set-calib" style="margin-top: 8px; font-size: 13px;">Применить коэффициенты</button>
+        </div>
+
+        <div class="section-title">Тестовые движения</div>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+            <button class="btn btn-secondary" id="btn-test-forward" style="flex: 1; font-size: 12px; padding: 10px 4px;">1м Вперед</button>
+            <button class="btn btn-secondary" id="btn-test-rotate" style="flex: 1; font-size: 12px; padding: 10px 4px;">Поворот 360°</button>
+        </div>
+        <button class="btn" id="btn-test-stop" style="background-color: #ff4d4d; color: white; box-shadow: 0 0 10px rgba(255, 77, 77, 0.3); border-color: #ff4d4d; margin-bottom: 12px; font-size: 13px;">ЭКСТРЕННЫЙ СТОП</button>
+
+        <div class="section-title" style="margin-top: 15px;">Автопилот (Маршруты)</div>
+        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px;">
+            <button class="btn btn-secondary" id="btn-draw-mode" style="margin-bottom: 0; font-size: 13px;">Режим рисования: ВЫКЛ</button>
+            <div style="display: flex; gap: 8px;">
+                <button class="btn" id="btn-start-plan" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0; background-color: #3498db; color: white; box-shadow: 0 0 10px rgba(52, 152, 219, 0.2); border-color: #3498db;">Приехать на старт</button>
+                <button class="btn btn-secondary" id="btn-clear-plan" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0;">Очистить</button>
+            </div>
+            <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 4px;">
+                <div class="calib-row" style="margin-bottom: 8px;">
+                    <span class="stat-label" style="font-size: 11px;">Шаг точек (м):</span>
+                    <input type="number" id="input-gen-spacing" class="calib-input" value="0.05" step="0.01" min="0.01" max="0.50" style="font-size: 11px; padding: 1px 4px; width: 60px;">
+                </div>
+                <div style="display: flex; gap: 6px;">
+                    <button class="btn btn-secondary" id="btn-gen-square" style="flex: 1; font-size: 11px; padding: 6px 2px; margin-bottom: 0;">Квадрат 1м</button>
+                    <button class="btn btn-secondary" id="btn-gen-circle" style="flex: 1; font-size: 11px; padding: 6px 2px; margin-bottom: 0;">Круг R=1м</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="section-title">Настройки автопилота</div>
+        <div class="calib-container">
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Look-ahead (м):</span>
+                <input type="number" id="input-look-ahead" class="calib-input" value="0.001" step="0.001" min="0.001" max="1.50" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Макс. линейная (м/с):</span>
+                <input type="number" id="input-max-lin" class="calib-input" value="0.18" step="0.01" min="0.05" max="0.50" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Макс. угловая (рад/с):</span>
+                <input type="number" id="input-max-ang" class="calib-input" value="0.80" step="0.01" min="0.10" max="3.00" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Kp Линейный:</span>
+                <input type="number" id="input-kp-lin" class="calib-input" value="0.80" step="0.01" min="0.10" max="5.00" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Kp Угловой:</span>
+                <input type="number" id="input-kp-ang" class="calib-input" value="1.50" step="0.01" min="0.10" max="5.00" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Точность финиша (м):</span>
+                <input type="number" id="input-goal-tol" class="calib-input" value="0.01" step="0.01" min="0.01" max="0.50" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Торможение (м):</span>
+                <input type="number" id="input-decel-dist" class="calib-input" value="0.30" step="0.01" min="0.05" max="1.50" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Мин. линейная (м/с):</span>
+                <input type="number" id="input-min-lin" class="calib-input" value="0.04" step="0.01" min="0.01" max="0.20" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Мертвая зона Yaw (м):</span>
+                <input type="number" id="input-yaw-deadzone" class="calib-input" value="0.02" step="0.01" min="0.01" max="0.30" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Точность точек (м):</span>
+                <input type="number" id="input-wp-tol" class="calib-input" value="0.01" step="0.01" min="0.00" max="0.50" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <div class="calib-row">
+                <span class="stat-label" style="font-size: 12px;">Торможение в повороте:</span>
+                <input type="number" id="input-turn-decel" class="calib-input" value="0.20" step="0.01" min="0.00" max="1.50" style="font-size: 12px; padding: 2px 6px;">
+            </div>
+            <button class="btn btn-secondary" id="btn-set-follower-params" style="margin-top: 8px; font-size: 12px; padding: 8px 4px;">Применить параметры</button>
+        </div>
+
+        <div class="section-title" style="margin-top: 10px;">Ручное управление</div>
+        <div class="control-box">
+            <div style="display: flex; gap: 8px; margin-bottom: 12px; width: 100%;">
+                <button class="btn btn-secondary" id="btn-rot-ccw" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0;">↺ Влево</button>
+                <button class="btn btn-secondary" id="btn-rot-cw" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0;">Вправо ↻</button>
+            </div>
+            
+            <div class="joystick-zone">
+                <div id="joystick-base">
+                    <div id="joystick-handle"></div>
+                </div>
+            </div>
+        </div>
 
         <div id="terminal-log">
             <div class="log-entry"><span class="log-time">Система</span>Веб-интерфейс готов к получению данных.</div>
@@ -882,41 +1392,93 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             // Отрисовка сетки
             if (showGrid) {
-                const step = 0.5; // Шаг в метрах
-                const gridLimit = 15;
+                let step = 1.0;
+                let labelInterval = 1;
+                
+                if (zoom < 35) {
+                    step = 2.0;
+                    labelInterval = 1;
+                } else if (zoom < 85) {
+                    step = 1.0;
+                    labelInterval = 1;
+                } else if (zoom < 185) {
+                    step = 0.5;
+                    labelInterval = 2; // каждые 1.0м
+                } else if (zoom < 450) {
+                    step = 0.2;
+                    labelInterval = 5; // каждые 1.0м
+                } else if (zoom < 1000) {
+                    step = 0.1;
+                    labelInterval = 5; // каждые 0.5м
+                } else if (zoom < 2000) {
+                    step = 0.05;
+                    labelInterval = 4; // каждые 0.2м
+                } else {
+                    step = 0.02;
+                    labelInterval = 5; // каждые 0.1м
+                }
+
                 ctx.lineWidth = 1;
 
+                const minX = (0 - panX) / zoom;
+                const maxX = (canvas.width - panX) / zoom;
+                const minY = (panY - canvas.height) / zoom;
+                const maxY = (panY) / zoom;
+
+                const startValX = Math.floor(minX / step);
+                const endValX = Math.ceil(maxX / step);
+                const startValY = Math.floor(minY / step);
+                const endValY = Math.ceil(maxY / step);
+
                 // Вертикальные линии
-                for (let x = -gridLimit; x <= gridLimit; x += step) {
-                    ctx.strokeStyle = x === 0 ? 'rgba(102, 252, 241, 0.25)' : 'rgba(255, 255, 255, 0.03)';
+                for (let i = startValX; i <= endValX; i++) {
+                    const x = i * step;
+                    ctx.strokeStyle = Math.abs(x) < 0.001 ? 'rgba(102, 252, 241, 0.25)' : 'rgba(255, 255, 255, 0.03)';
                     ctx.beginPath();
                     const px = panX + x * zoom;
                     ctx.moveTo(px, 0);
                     ctx.lineTo(px, canvas.height);
                     ctx.stroke();
 
-                    if (Math.abs(x) % 1 === 0) {
+                    if (i % labelInterval === 0) {
                         ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
                         ctx.font = '10px monospace';
                         ctx.textAlign = 'center';
-                        ctx.fillText(x + 'm', px, canvas.height - 10);
+                        
+                        let labelText = x.toFixed(2);
+                        if (step >= 0.1) {
+                            labelText = x.toFixed(1);
+                        }
+                        if (Math.abs(x) % 1 === 0) {
+                            labelText = Math.round(x).toString();
+                        }
+                        ctx.fillText(labelText + 'm', px, canvas.height - 10);
                     }
                 }
 
                 // Горизонтальные линии
-                for (let y = -gridLimit; y <= gridLimit; y += step) {
-                    ctx.strokeStyle = y === 0 ? 'rgba(255, 77, 77, 0.25)' : 'rgba(255, 255, 255, 0.03)';
+                for (let i = startValY; i <= endValY; i++) {
+                    const y = i * step;
+                    ctx.strokeStyle = Math.abs(y) < 0.001 ? 'rgba(255, 77, 77, 0.25)' : 'rgba(255, 255, 255, 0.03)';
                     ctx.beginPath();
                     const py = panY - y * zoom;
                     ctx.moveTo(0, py);
                     ctx.lineTo(canvas.width, py);
                     ctx.stroke();
 
-                    if (Math.abs(y) % 1 === 0) {
+                    if (i % labelInterval === 0) {
                         ctx.fillStyle = 'rgba(255, 255, 255, 0.2)';
                         ctx.font = '10px monospace';
                         ctx.textAlign = 'left';
-                        ctx.fillText(y + 'm', 10, py - 4);
+                        
+                        let labelText = y.toFixed(2);
+                        if (step >= 0.1) {
+                            labelText = y.toFixed(1);
+                        }
+                        if (Math.abs(y) % 1 === 0) {
+                            labelText = Math.round(y).toString();
+                        }
+                        ctx.fillText(labelText + 'm', 10, py - 4);
                     }
                 }
             }
@@ -973,6 +1535,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 ctx.shadowBlur = 0;
             }
 
+            // Отрисовка нарисованного маршрута автопилота
+            if (plannedPath.length > 0) {
+                ctx.strokeStyle = 'rgba(168, 85, 247, 0.8)';
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.moveTo(panX + plannedPath[0].x * zoom, panY - plannedPath[0].y * zoom);
+                for (let i = 1; i < plannedPath.length; i++) {
+                    ctx.lineTo(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom);
+                }
+                ctx.stroke();
+                
+                for (let i = 0; i < plannedPath.length; i++) {
+                    ctx.fillStyle = i === 0 ? '#2ecc71' : (i === plannedPath.length - 1 ? '#ff4d4d' : '#a855f7');
+                    ctx.beginPath();
+                    ctx.arc(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom, 5, 0, 2 * Math.PI);
+                    ctx.fill();
+                    ctx.strokeStyle = '#fff';
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+                    
+                    ctx.fillStyle = '#fff';
+                    ctx.font = '10px monospace';
+                    ctx.fillText(i + 1, panX + plannedPath[i].x * zoom + 8, panY - plannedPath[i].y * zoom - 4);
+                }
+            }
+
             // Отрисовка текущего положения робота
             const rpx = panX + robotPos.x * zoom;
             const rpy = panY - robotPos.y * zoom;
@@ -1013,6 +1601,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         // Panning (Перетаскивание)
         canvas.addEventListener('mousedown', (e) => {
+            if (drawMode) {
+                dragStartX = e.clientX;
+                dragStartY = e.clientY;
+            }
             isDragging = true;
             startX = e.clientX - panX;
             startY = e.clientY - panY;
@@ -1032,6 +1624,78 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         canvas.addEventListener('mouseup', () => isDragging = false);
         canvas.addEventListener('mouseleave', () => isDragging = false);
 
+        // Поддержка Touch-событий для мобильных устройств (перетаскивание и pinch-to-zoom)
+        let isTouching = false;
+        let startTouchX = 0;
+        let startTouchY = 0;
+        let initialTouchDist = 0;
+        let initialZoom = 0;
+        
+        canvas.addEventListener('touchstart', (e) => {
+            if (e.touches.length === 1) {
+                isTouching = true;
+                startTouchX = e.touches[0].clientX - panX;
+                startTouchY = e.touches[0].clientY - panY;
+                autoCenter = false;
+                document.getElementById('btn-autocenter').className = 'btn btn-secondary';
+                document.getElementById('btn-autocenter').textContent = 'Автоцентрирование: ВЫКЛ';
+                
+                if (drawMode) {
+                    dragStartX = e.touches[0].clientX;
+                    dragStartY = e.touches[0].clientY;
+                }
+            } else if (e.touches.length === 2) {
+                isTouching = false;
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                initialTouchDist = Math.sqrt(dx * dx + dy * dy);
+                initialZoom = zoom;
+            }
+        });
+        
+        canvas.addEventListener('touchmove', (e) => {
+            if (isTouching && e.touches.length === 1) {
+                panX = e.touches[0].clientX - startTouchX;
+                panY = e.touches[0].clientY - startTouchY;
+                draw();
+            } else if (e.touches.length === 2 && initialTouchDist > 0) {
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                
+                const zoomFactor = dist / initialTouchDist;
+                zoom = Math.min(Math.max(initialZoom * zoomFactor, 15), 3000);
+                draw();
+            }
+        });
+        
+        canvas.addEventListener('touchend', (e) => {
+            if (isTouching) {
+                isTouching = false;
+                
+                if (drawMode && e.changedTouches.length > 0) {
+                    const endX = e.changedTouches[0].clientX;
+                    const endY = e.changedTouches[0].clientY;
+                    const dist = Math.sqrt((endX - dragStartX)**2 + (endY - dragStartY)**2);
+                    if (dist < 5) {
+                        const rect = canvas.getBoundingClientRect();
+                        const mouseX = endX - rect.left;
+                        const mouseY = endY - rect.top;
+                        
+                        const x = (mouseX - panX) / zoom;
+                        const y = (panY - mouseY) / zoom;
+                        
+                        plannedPath.push({ x, y });
+                        addLog(`Точка маршрута: X=${x.toFixed(2)}, Y=${y.toFixed(2)}`);
+                        draw();
+                    }
+                }
+            }
+            if (e.touches.length < 2) {
+                initialTouchDist = 0;
+            }
+        });
+
         // Zoom (Масштабирование)
         canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
@@ -1042,7 +1706,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const xMeters = (mouseX - panX) / zoom;
             const yMeters = (panY - mouseY) / zoom;
 
-            zoom = Math.min(Math.max(zoom * zoomFactor, 15), 1000);
+            zoom = Math.min(Math.max(zoom * zoomFactor, 15), 3000);
 
             panX = mouseX - xMeters * zoom;
             panY = mouseY + yMeters * zoom;
@@ -1154,6 +1818,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     activeTags = data.detected_tags || [];
                     updateActiveTagsUI();
 
+                    // Обновляем состояние кнопки запуска автопилота
+                    updateAutopilotButton(data.follower_status);
+
                     if (autoCenter) {
                         centerMap();
                     }
@@ -1161,6 +1828,412 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
             };
         }
+
+        function updateAutopilotButton(status) {
+            const btn = document.getElementById('btn-start-plan');
+            if (!btn) return;
+            
+            if (status === 'pre_positioning') {
+                btn.textContent = "Еду на старт...";
+                btn.disabled = true;
+                btn.style.backgroundColor = "#e67e22";
+                btn.style.borderColor = "#e67e22";
+                btn.style.boxShadow = "0 0 10px rgba(230, 126, 34, 0.2)";
+            } else if (status === 'ready_to_work') {
+                btn.textContent = "Начать работу";
+                btn.disabled = false;
+                btn.style.backgroundColor = "#2ecc71";
+                btn.style.borderColor = "#2ecc71";
+                btn.style.boxShadow = "0 0 10px rgba(46, 204, 113, 0.2)";
+            } else if (status === 'tracking') {
+                btn.textContent = "Выполняется...";
+                btn.disabled = true;
+                btn.style.backgroundColor = "#9b59b6";
+                btn.style.borderColor = "#9b59b6";
+                btn.style.boxShadow = "0 0 10px rgba(155, 89, 182, 0.2)";
+            } else {
+                btn.textContent = "Приехать на старт";
+                btn.disabled = false;
+                btn.style.backgroundColor = "#3498db";
+                btn.style.borderColor = "#3498db";
+                btn.style.boxShadow = "0 0 10px rgba(52, 152, 219, 0.2)";
+            }
+        }
+
+        // Обработчики калибровки и тестов
+        const inputWheelMult = document.getElementById('input-wheel-mult');
+        const inputBaseMult = document.getElementById('input-base-mult');
+        const btnSetCalib = document.getElementById('btn-set-calib');
+        const btnTestForward = document.getElementById('btn-test-forward');
+        const btnTestRotate = document.getElementById('btn-test-rotate');
+        const btnTestStop = document.getElementById('btn-test-stop');
+
+        btnSetCalib.addEventListener('click', () => {
+            const wMult = parseFloat(inputWheelMult.value);
+            const bMult = parseFloat(inputBaseMult.value);
+            
+            fetch(`/set_calib?wheel_mult=${wMult}&base_mult=${bMult}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        addLog(`Успех: Коэффициенты отправлены (Wheel=${wMult.toFixed(3)}, Base=${bMult.toFixed(3)})`);
+                    } else {
+                        addLog("Ошибка применения коэффициентов.");
+                    }
+                })
+                .catch(err => {
+                    addLog("Сеть: Ошибка калибровки.");
+                });
+        });
+
+        const triggerTestDrive = (type, label) => {
+            fetch(`/test_drive?type=${type}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        addLog(`Робот: ${label}`);
+                    }
+                })
+                .catch(err => {
+                    addLog(`Сеть: Ошибка запуска ${label}`);
+                });
+        };
+
+        btnTestForward.addEventListener('click', () => triggerTestDrive('forward', 'Тест движения: 1 метр вперед'));
+        btnTestRotate.addEventListener('click', () => triggerTestDrive('rotate', 'Тест движения: поворот на 360°'));
+        btnTestStop.addEventListener('click', () => triggerTestDrive('stop', 'ЭКСТРЕННАЯ ОСТАНОВКА'));
+
+        // Переменные автопилота
+        let drawMode = false;
+        let plannedPath = [];
+        let dragStartX = 0;
+        let dragStartY = 0;
+        
+        const btnDrawMode = document.getElementById('btn-draw-mode');
+        const btnStartPlan = document.getElementById('btn-start-plan');
+        const btnClearPlan = document.getElementById('btn-clear-plan');
+        
+        btnDrawMode.addEventListener('click', () => {
+            drawMode = !drawMode;
+            btnDrawMode.textContent = drawMode ? "Режим рисования: ВКЛ" : "Режим рисования: ВЫКЛ";
+            btnDrawMode.style.borderColor = drawMode ? "#66fcf1" : "rgba(255, 255, 255, 0.1)";
+            btnDrawMode.style.color = drawMode ? "#66fcf1" : "#c5c6c7";
+            if (drawMode) {
+                canvas.style.cursor = 'crosshair';
+                addLog("Режим рисования включен. Кликайте на карту для расстановки точек.");
+            } else {
+                canvas.style.cursor = 'grab';
+            }
+        });
+
+        canvas.addEventListener('click', (e) => {
+            if (!drawMode) return;
+            const dist = Math.sqrt((e.clientX - dragStartX)**2 + (e.clientY - dragStartY)**2);
+            if (dist > 5) return; // это было перетаскивание карты
+            
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            
+            const x = (mouseX - panX) / zoom;
+            const y = (panY - mouseY) / zoom;
+            
+            plannedPath.push({ x, y });
+            addLog(`Точка маршрута: X=${x.toFixed(2)}, Y=${y.toFixed(2)}`);
+            draw();
+        });
+
+        btnStartPlan.addEventListener('click', () => {
+            if (plannedPath.length === 0) {
+                addLog("Ошибка: Сначала нарисуйте маршрут!");
+                return;
+            }
+            
+            if (btnStartPlan.textContent === "Начать работу") {
+                fetch(`/start_work`)
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.status === 'success') {
+                            addLog("Автопилот: Работа начата!");
+                        } else {
+                            addLog("Ошибка начала работы.");
+                        }
+                    })
+                    .catch(err => {
+                        addLog("Сеть: Ошибка отправки сигнала старта.");
+                    });
+                return;
+            }
+            
+            // Автоматически отправляем текущие параметры из полей ввода перед стартом
+            const lookAhead = parseFloat(inputLookAhead.value);
+            const maxLin = parseFloat(inputMaxLin.value);
+            const maxAng = parseFloat(inputMaxAng.value);
+            const kpLin = parseFloat(inputKpLin.value);
+            const kpAng = parseFloat(inputKpAng.value);
+            const goalTol = parseFloat(inputGoalTol.value);
+            const decelDist = parseFloat(inputDecelDist.value);
+            const minLin = parseFloat(inputMinLin.value);
+            const yawDeadzone = parseFloat(inputYawDeadzone.value);
+            const wpTol = parseFloat(inputWpTol.value);
+            const turnDecel = parseFloat(inputTurnDecel.value);
+            
+            fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        addLog("Автопилот: Параметры синхронизированы.");
+                    }
+                })
+                .catch(err => {
+                    console.error("Ошибка авто-синхронизации параметров:", err);
+                });
+            
+            const ptsStr = plannedPath.map(pt => `${pt.x.toFixed(3)},${pt.y.toFixed(3)}`).join(';');
+            fetch(`/set_path?points=${ptsStr}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        addLog("Автопилот: Маршрут отправлен, едем на старт!");
+                    } else {
+                        addLog("Ошибка отправки маршрута.");
+                    }
+                })
+                .catch(err => {
+                    addLog("Сеть: Ошибка отправки маршрута.");
+                });
+        });
+        
+        btnClearPlan.addEventListener('click', () => {
+            plannedPath = [];
+            fetch(`/set_path?points=`)
+                .then(res => res.json())
+                .then(data => {
+                    addLog("Автопилот: Маршрут очищен.");
+                    draw();
+                })
+                .catch(err => {
+                    addLog("Сеть: Ошибка очистки маршрута.");
+                    draw();
+                });
+        });
+
+        // Генерация тестовых контуров
+        const btnGenSquare = document.getElementById('btn-gen-square');
+        const btnGenCircle = document.getElementById('btn-gen-circle');
+        const inputGenSpacing = document.getElementById('input-gen-spacing');
+        
+        btnGenSquare.addEventListener('click', () => {
+            const spacing = parseFloat(inputGenSpacing.value) || 0.05;
+            const cx = robotPos.x;
+            const cy = robotPos.y;
+            const side = 1.0;
+            const half = side / 2;
+            
+            plannedPath = [];
+            const corners = [
+                {x: cx - half, y: cy - half},
+                {x: cx + half, y: cy - half},
+                {x: cx + half, y: cy + half},
+                {x: cx - half, y: cy + half},
+                {x: cx - half, y: cy - half}
+            ];
+            for (let i = 0; i < 4; i++) {
+                const p1 = corners[i];
+                const p2 = corners[i+1];
+                const dx = p2.x - p1.x;
+                const dy = p2.y - p1.y;
+                const len = Math.sqrt(dx * dx + dy * dy);
+                const numSteps = Math.ceil(len / spacing);
+                for (let j = 0; j < numSteps; j++) {
+                    const t = j / numSteps;
+                    plannedPath.push({
+                        x: p1.x + dx * t,
+                        y: p1.y + dy * t
+                    });
+                }
+            }
+            plannedPath.push(corners[4]); // Замыкающая точка
+            
+            addLog(`Квадрат (1м) сгенерирован (шаг ${spacing}м, ${plannedPath.length} точек). Нажмите "Запустить" для старта.`);
+            draw();
+        });
+        
+        btnGenCircle.addEventListener('click', () => {
+            const spacing = parseFloat(inputGenSpacing.value) || 0.05;
+            const cx = robotPos.x;
+            const cy = robotPos.y;
+            const radius = 1.0;
+            
+            plannedPath = [];
+            const circumference = 2 * Math.PI * radius;
+            const numPoints = Math.ceil(circumference / spacing);
+            for (let i = 0; i <= numPoints; i++) {
+                const theta = (i / numPoints) * 2 * Math.PI;
+                plannedPath.push({
+                    x: cx + radius * Math.cos(theta),
+                    y: cy + radius * Math.sin(theta)
+                });
+            }
+            
+            addLog(`Круг (R=1м) сгенерирован (шаг ${spacing}м, ${plannedPath.length} точек). Нажмите "Запустить" для старта.`);
+            draw();
+        });
+
+        // Настройка параметров автопилота
+        const inputLookAhead = document.getElementById('input-look-ahead');
+        const inputMaxLin = document.getElementById('input-max-lin');
+        const inputMaxAng = document.getElementById('input-max-ang');
+        const inputKpLin = document.getElementById('input-kp-lin');
+        const inputKpAng = document.getElementById('input-kp-ang');
+        const inputGoalTol = document.getElementById('input-goal-tol');
+        const inputDecelDist = document.getElementById('input-decel-dist');
+        const inputMinLin = document.getElementById('input-min-lin');
+        const inputYawDeadzone = document.getElementById('input-yaw-deadzone');
+        const inputWpTol = document.getElementById('input-wp-tol');
+        const inputTurnDecel = document.getElementById('input-turn-decel');
+        const btnSetFollowerParams = document.getElementById('btn-set-follower-params');
+        
+        btnSetFollowerParams.addEventListener('click', () => {
+            const lookAhead = parseFloat(inputLookAhead.value);
+            const maxLin = parseFloat(inputMaxLin.value);
+            const maxAng = parseFloat(inputMaxAng.value);
+            const kpLin = parseFloat(inputKpLin.value);
+            const kpAng = parseFloat(inputKpAng.value);
+            const goalTol = parseFloat(inputGoalTol.value);
+            const decelDist = parseFloat(inputDecelDist.value);
+            const minLin = parseFloat(inputMinLin.value);
+            const yawDeadzone = parseFloat(inputYawDeadzone.value);
+            const wpTol = parseFloat(inputWpTol.value);
+            const turnDecel = parseFloat(inputTurnDecel.value);
+            
+            fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        addLog(`Успех: Параметры автопилота обновлены.`);
+                    } else {
+                        addLog("Ошибка применения параметров автопилота.");
+                    }
+                })
+                .catch(err => {
+                    addLog("Сеть: Ошибка настройки автопилота.");
+                });
+        });
+
+        // Логика джойстика и ручного вращения
+        const jBase = document.getElementById('joystick-base');
+        const jHandle = document.getElementById('joystick-handle');
+        const btnRotCCW = document.getElementById('btn-rot-ccw');
+        const btnRotCW = document.getElementById('btn-rot-cw');
+        
+        let jActive = false;
+        const jMaxDist = 38; // px
+        
+        let targetVx = 0;
+        let targetVy = 0;
+        let targetW = 0;
+        
+        const updateJoystick = (clientX, clientY) => {
+            const rect = jBase.getBoundingClientRect();
+            const centerX = rect.left + rect.width / 2;
+            const centerY = rect.top + rect.height / 2;
+            
+            let dx = clientX - centerX;
+            let dy = clientY - centerY;
+            
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            
+            if (dist > jMaxDist) {
+                dx = (dx / dist) * jMaxDist;
+                dy = (dy / dist) * jMaxDist;
+            }
+            
+            jHandle.style.transform = `translate(${dx}px, ${dy}px)`;
+            
+            // Y-axis drag corresponds to Vx (forward/backward)
+            // X-axis drag corresponds to Vy (sideways)
+            targetVx = -(dy / jMaxDist) * 0.20; // max speed 0.20 m/s
+            targetVy = -(dx / jMaxDist) * 0.20; // right is negative Vy
+        };
+        
+        const resetJoystick = () => {
+            jActive = false;
+            jHandle.style.transform = 'translate(0px, 0px)';
+            targetVx = 0;
+            targetVy = 0;
+            sendDriveCommand();
+        };
+        
+        jBase.addEventListener('mousedown', (e) => {
+            jActive = true;
+            updateJoystick(e.clientX, e.clientY);
+        });
+        
+        window.addEventListener('mousemove', (e) => {
+            if (jActive) {
+                updateJoystick(e.clientX, e.clientY);
+            }
+        });
+        
+        window.addEventListener('mouseup', () => {
+            if (jActive) {
+                resetJoystick();
+            }
+        });
+        
+        jBase.addEventListener('touchstart', (e) => {
+            jActive = true;
+            updateJoystick(e.touches[0].clientX, e.touches[0].clientY);
+        });
+        
+        window.addEventListener('touchmove', (e) => {
+            if (jActive) {
+                updateJoystick(e.touches[0].clientX, e.touches[0].clientY);
+            }
+        });
+        
+        window.addEventListener('touchend', () => {
+            if (jActive) {
+                resetJoystick();
+            }
+        });
+
+        const startRotate = (dir) => {
+            targetW = dir * 0.7; // rad/s
+            sendDriveCommand();
+        };
+        
+        const stopRotate = () => {
+            targetW = 0.0;
+            sendDriveCommand();
+        };
+        
+        btnRotCCW.addEventListener('mousedown', () => startRotate(1.0));
+        btnRotCCW.addEventListener('mouseup', stopRotate);
+        btnRotCCW.addEventListener('mouseleave', stopRotate);
+        
+        btnRotCW.addEventListener('mousedown', () => startRotate(-1.0));
+        btnRotCW.addEventListener('mouseup', stopRotate);
+        btnRotCW.addEventListener('mouseleave', stopRotate);
+        
+        btnRotCCW.addEventListener('touchstart', (e) => { e.preventDefault(); startRotate(1.0); });
+        btnRotCCW.addEventListener('touchend', stopRotate);
+        
+        btnRotCW.addEventListener('touchstart', (e) => { e.preventDefault(); startRotate(-1.0); });
+        btnRotCW.addEventListener('touchend', stopRotate);
+
+        const sendDriveCommand = () => {
+            fetch(`/drive?vx=${targetVx.toFixed(3)}&vy=${targetVy.toFixed(3)}&w=${targetW.toFixed(3)}`)
+                .catch(err => console.error("Error sending drive command", err));
+        };
+        
+        // Цикл отправки команд ручного управления на частоте 10 Гц
+        setInterval(() => {
+            if (jActive || targetW !== 0) {
+                sendDriveCommand();
+            }
+        }, 100);
 
         // Старт
         resizeCanvas();

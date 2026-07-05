@@ -148,7 +148,7 @@ libcamerify ros2 launch fake_tag_publisher run_localization_video.launch.py \
    ```
 2. Откройте веб-браузер на вашем ПК и перейдите по адресу:
    ```text
-   http://192.168.31.215:8080/
+   http://192.168.31.213:8080/
    ```
    *(Или `http://raspberry.local:8080/`)*
 
@@ -234,7 +234,7 @@ rsync -avz \
   --exclude "*.h264" \
   --exclude "camera_info.yaml" \
   --exclude "trajectory_plot.png" \
-  /home/panik_bel/ros2_ws/ raspberry@192.168.31.215:~/ros2_ws/
+  /home/panik_bel/ros2_ws/ raspberry@192.168.31.213:~/ros2_ws/
 ```
 
 ### Что исключает эта команда:
@@ -249,8 +249,8 @@ rsync -avz \
 Если вы хотите скопировать файл калибровки или график поездки с робота обратно на ваш ПК для анализа или бэкапа, выполните **на вашем ПК**:
 ```bash
 # Скопировать файл калибровки
-scp raspberry@192.168.31.215:~/ros2_ws/src/fake_tag_publisher/config/camera_info.yaml /home/panik_bel/ros2_ws/src/fake_tag_publisher/config/
+scp raspberry@192.168.31.213:~/ros2_ws/src/fake_tag_publisher/config/camera_info.yaml /home/panik_bel/ros2_ws/src/fake_tag_publisher/config/
 
 # Скопировать график траектории
-scp raspberry@192.168.31.215:~/ros2_ws/src/fake_tag_publisher/config/trajectory_plot.png /home/panik_bel/ros2_ws/src/fake_tag_publisher/config/
+scp raspberry@192.168.31.213:~/ros2_ws/src/fake_tag_publisher/config/trajectory_plot.png /home/panik_bel/ros2_ws/src/fake_tag_publisher/config/
 ```
