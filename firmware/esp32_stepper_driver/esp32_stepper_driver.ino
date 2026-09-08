@@ -1,329 +1,164 @@
-/*
-  ESP32 Stepper Driver - 3-Wheel Omni Robot with AUTO-SLEEP (Zero Hissing)
-  ========================================================================
-  Подключение всех 3 моторов:
-  
-  Мотор 1 (Передний F):
-    - CLK+ (STEP) -> D33
-    - CW+  (DIR)  -> D32
-    - EN+  (ENA)  -> D25  (ВАЖНО: пин 25 прямо рядом с 33, полноценный выход!)
+/* Termit Omni hardware stepping, protocol v2.
+ * Build: esp32:esp32:esp32 core 3.3.11, FastAccelStepper 1.2.7.
+ * F STEP33 DIR32; R STEP23 DIR22; L STEP19 DIR18.
+ * F/R shared EN21, L EN17; LOW = powered.
+ * s F R L: ramped steps/s; c N: steps/s^2; k: heartbeat; v: version.
+ * stop/x: emergency stop; e 0/1: power on/off; a 0/1: hold/auto-sleep.
+ * w ms: watchdog; r: zero odom when stationary.
+ */
+#include <FastAccelStepper.h>
+constexpr uint8_t STEP_PINS[] = {33, 23, 19};
+constexpr uint8_t DIR_PINS[] = {32, 22, 18};
+constexpr uint8_t EN_PINS[] = {21, 17};
+constexpr long MAX_SPEED = 8000;
+constexpr char VERSION[] = "TERMIT_FASTACCEL_V2";
+FastAccelStepperEngine engine;
+FastAccelStepper* motors[3] = {};
+long targets[3] = {};
+char inputBuf[96];
+size_t bufIdx = 0;
+bool overflowLine = false, driversActive = false, autoSleepEnabled = true;
+bool ready = false, timedTest = false, watchdogArmed = false;
+uint32_t testEnd = 0, lastCmd = 0, lastMotion = 0, lastOdom = 0;
+uint32_t watchdogMs = 500;
 
-  Мотор 2 (Правый R):
-    - CLK+ (STEP) -> D23
-    - CW+  (DIR)  -> D22
-    - EN+  (ENA)  -> D21
-
-  Мотор 3 (Левый L):
-    - CLK+ (STEP) -> D19
-    - CW+  (DIR)  -> D18 (спаян с D5)
-    - EN+  (ENA)  -> D17
-
-  Светодиод статуса: GPIO 2
-*/
-
-#include <AccelStepper.h>
-
-// Мотор 1 (F)
-#define M1_STEP_PIN 33
-#define M1_DIR_PIN  32
-#define M1_EN_PIN   21  // Соединен вместе с Мотором 2 на пин 21 (так как пин 34 только вход)
-
-// Мотор 2 (R)
-#define M2_STEP_PIN 23
-#define M2_DIR_PIN  22
-#define M2_EN_PIN   21
-
-// Мотор 3 (L)
-#define M3_STEP_PIN 19
-#define M3_DIR_PIN  18
-#define M3_EN_PIN   17
-
-#define LED_PIN 2
-
-#define MAX_SPEED_LIMIT 8000.0
-#define MIN_PULSE_WIDTH 4 // 4 мкс для быстрого и плавного шагания
-
-AccelStepper stepperF(AccelStepper::DRIVER, M1_STEP_PIN, M1_DIR_PIN);
-AccelStepper stepperR(AccelStepper::DRIVER, M2_STEP_PIN, M2_DIR_PIN);
-AccelStepper stepperL(AccelStepper::DRIVER, M3_STEP_PIN, M3_DIR_PIN);
-
-const int MAX_BUF = 64;
-char inputBuf[MAX_BUF];
-int bufIdx = 0;
-
-unsigned long lastCmdTime = 0;
-unsigned long watchdogTimeoutMs = 500; // Настраиваемый Watchdog (по умолчанию 500 мс)
-bool motorsStopped = true;
-
-unsigned long testEndTime = 0;
-int activeTestMotor = -1;
-
-unsigned long lastBlinkTime = 0;
-bool ledState = false;
-
-// Одометрия: периодическая отправка шагов
-unsigned long lastOdomTime = 0;
-const unsigned long ODOM_INTERVAL_MS = 50; // 20 Гц (каждые 50 мс)
-
-// =========================================================================
-// АВТОМАТИЧЕСКИЙ РЕЖИМ СНА (ПОЛНАЯ ТИШИНА В ПРОСТОЕ)
-// =========================================================================
-bool driversActive = false;
-bool autoSleepEnabled = true; // true = авто-сон (тишина), false = постоянное удержание (жесткий вал)
-unsigned long lastMotionTime = 0;
-const unsigned long AUTO_SLEEP_DELAY_MS = 1500; // Через 1.5 сек после остановки -> выключаем ток
-
-void enableDrivers() {
-  if (!driversActive) {
-    // LOW включает питание обмоток (для драйверов с общим катодом)
-    digitalWrite(M1_EN_PIN, LOW);
-    digitalWrite(M2_EN_PIN, LOW);
-    digitalWrite(M3_EN_PIN, LOW);
-    driversActive = true;
-    delayMicroseconds(50); // Мгновенное включение ключей
+bool moving() {
+  for (auto* m : motors) if (m && m->isRunning()) return true;
+  return false;
+}
+void power(bool on) {
+  if (on == driversActive) return;
+  for (auto pin : EN_PINS) digitalWrite(pin, on ? LOW : HIGH);
+  driversActive = on;
+  if (on) delayMicroseconds(1000);
+  lastMotion = millis();
+}
+void halt(bool emergency) {
+  for (int i = 0; i < 3; ++i) {
+    targets[i] = 0;
+    if (!motors[i]) continue;
+    // Emergency abort may lose the last in-flight step in odometry.
+    if (emergency) motors[i]->forceStopAndNewPosition(motors[i]->getCurrentPosition());
+    else motors[i]->stopMove();
+  }
+  timedTest = watchdogArmed = false;
+  lastMotion = millis();
+}
+void setTargets(long f, long r, long l) {
+  long requested[] = {f, r, l};
+  if (f || r || l) power(true);
+  for (int i = 0; i < 3; ++i) {
+    long value = constrain(requested[i], -MAX_SPEED, MAX_SPEED);
+    // A zero target must also cancel an active finite move.
+    if (value == targets[i] && (value || !motors[i]->isRunning())) continue;
+    targets[i] = value;
+    if (!value) motors[i]->stopMove();
+    else {
+      motors[i]->setSpeedInHz(abs(value));
+      // FastAccelStepper decelerates before reversing the direction pin.
+      if (value > 0) motors[i]->runForward();
+      else motors[i]->runBackward();
+    }
+  }
+  lastCmd = millis();
+  watchdogArmed = true;
+  timedTest = false;
+}
+void parseCommand(const char* cmd) {
+  char extra;
+  long f, r, l, val;
+  int idx, dir;
+  if (!strcmp(cmd, "v")) { if (ready) Serial.println(VERSION); return; }
+  if (!strcmp(cmd, "stop") || !strcmp(cmd, "x")) { halt(true); return; }
+  if (!ready) return;
+  if (!strcmp(cmd, "q")) {
+    Serial.printf("q %d %d %lu\n", driversActive, moving(), (unsigned long)watchdogMs);
+    return;
+  }
+  if (!strcmp(cmd, "k")) { lastCmd = millis(); return; }
+  if (sscanf(cmd, "s %ld %ld %ld %c", &f, &r, &l, &extra) == 3) {
+    setTargets(f, r, l);
+  } else if (sscanf(cmd, "c %ld %c", &val, &extra) == 1) {
+    if (val >= 100 && val <= 20000)
+      for (auto* m : motors) { m->setAcceleration(val); m->applySpeedAcceleration(); }
+  } else if (sscanf(cmd, "e %ld %c", &val, &extra) == 1 && (val == 0 || val == 1)) {
+    if (val == 1) halt(true);
+    power(val == 0);
+  } else if (sscanf(cmd, "a %ld %c", &val, &extra) == 1 && (val == 0 || val == 1)) {
+    autoSleepEnabled = (val == 1);
+    if (!autoSleepEnabled) power(true);
+  } else if (sscanf(cmd, "w %ld %c", &val, &extra) == 1) {
+    if (val >= 100 && val <= 10000) watchdogMs = val;
+  } else if (!strcmp(cmd, "r")) {
+    if (!moving()) for (auto* m : motors) m->setCurrentPosition(0);
+  } else if (sscanf(cmd, "t %d %ld %ld %c", &idx, &val, &f, &extra) == 3) {
+    if (idx < 0 || idx > 2 || f < 1 || f > 10000) return;
+    halt(true);
+    long speeds[] = {0, 0, 0};
+    speeds[idx] = constrain(val, -MAX_SPEED, MAX_SPEED);
+    setTargets(speeds[0], speeds[1], speeds[2]);
+    timedTest = true;
+    testEnd = millis() + f;
+  } else if (sscanf(cmd, "m %d %ld %c", &idx, &val, &extra) == 2) {
+    if (idx < 0 || idx > 2 || val < -80000 || val > 80000 || moving()) return;
+    power(true);
+    motors[idx]->setSpeedInHz(1000);
+    motors[idx]->move(val);
+    lastCmd = millis();
+    watchdogArmed = true;
+  } else if (sscanf(cmd, "h %d %d %ld %c", &idx, &dir, &val, &extra) == 3) {
+    if (idx < 0 || idx > 2 || (dir != 0 && dir != 1) || val < 0 || val > 80000 || moving()) return;
+    power(true);
+    motors[idx]->setSpeedInHz(1000);
+    motors[idx]->move(dir ? val : -val);
+    lastCmd = millis();
+    watchdogArmed = true;
   }
 }
-
-void sleepDrivers() {
-  if (driversActive) {
-    // HIGH отключает питание обмоток (тишина 0 дБ, моторы не шипят и холодные)
-    digitalWrite(M1_EN_PIN, HIGH);
-    digitalWrite(M2_EN_PIN, HIGH);
-    digitalWrite(M3_EN_PIN, HIGH);
-    driversActive = false;
-  }
-}
-
-void stopMotors() {
-  stepperF.setSpeed(0);
-  stepperR.setSpeed(0);
-  stepperL.setSpeed(0);
-  motorsStopped = true;
-  activeTestMotor = -1;
-  lastMotionTime = millis();
-}
-
-// Прямой аппаратный тест генерации шагов
-void hardwareStep(int motorIdx, int dir, int steps, int speedDelayUs) {
-  enableDrivers();
-  int stepPin = M1_STEP_PIN;
-  int dirPin = M1_DIR_PIN;
-  if (motorIdx == 1) { stepPin = M2_STEP_PIN; dirPin = M2_DIR_PIN; }
-  else if (motorIdx == 2) { stepPin = M3_STEP_PIN; dirPin = M3_DIR_PIN; }
-
-  digitalWrite(dirPin, dir ? HIGH : LOW);
-  delayMicroseconds(50);
-  for (int i = 0; i < steps; i++) {
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(speedDelayUs);
-    digitalWrite(stepPin, LOW);
-    delayMicroseconds(speedDelayUs);
-  }
-  lastMotionTime = millis();
-}
-
 void setup() {
+  for (auto pin : EN_PINS) { digitalWrite(pin, HIGH); pinMode(pin, OUTPUT); }
+  pinMode(2, OUTPUT);
   Serial.begin(115200);
-  
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
-
-  // Настройка пинов Enable
-  pinMode(M1_EN_PIN, OUTPUT);
-  pinMode(M2_EN_PIN, OUTPUT);
-  pinMode(M3_EN_PIN, OUTPUT);
-
-  // Стартуем сразу в режиме ТИШИНЫ (сон)
-  driversActive = true;
-  sleepDrivers();
-
-  // Настройка пинов шаговиков
-  pinMode(M1_STEP_PIN, OUTPUT);
-  pinMode(M1_DIR_PIN,  OUTPUT);
-  pinMode(M2_STEP_PIN, OUTPUT);
-  pinMode(M2_DIR_PIN,  OUTPUT);
-  pinMode(M3_STEP_PIN, OUTPUT);
-  pinMode(M3_DIR_PIN,  OUTPUT);
-
-  digitalWrite(M1_STEP_PIN, LOW);
-  digitalWrite(M1_DIR_PIN,  LOW);
-  digitalWrite(M2_STEP_PIN, LOW);
-  digitalWrite(M2_DIR_PIN,  LOW);
-  digitalWrite(M3_STEP_PIN, LOW);
-  digitalWrite(M3_DIR_PIN,  LOW);
-
-  // Настройка AccelStepper
-  stepperF.setMinPulseWidth(MIN_PULSE_WIDTH);
-  stepperR.setMinPulseWidth(MIN_PULSE_WIDTH);
-  stepperL.setMinPulseWidth(MIN_PULSE_WIDTH);
-
-  stepperF.setMaxSpeed(MAX_SPEED_LIMIT);
-  stepperR.setMaxSpeed(MAX_SPEED_LIMIT);
-  stepperL.setMaxSpeed(MAX_SPEED_LIMIT);
-
-  stopMotors();
-
-  Serial.println("TERMIT_SILENT_STEPPER_READY");
-  lastCmdTime = millis();
-  lastMotionTime = millis();
+  engine.init();
+  ready = true;
+  for (int i = 0; i < 3; ++i) {
+    motors[i] = engine.stepperConnectToPin(STEP_PINS[i]);
+    if (!motors[i]) { ready = false; break; }
+    motors[i]->setDirectionPin(DIR_PINS[i], true, 50);
+    motors[i]->setAutoEnable(false); // Shared enables managed together above.
+    motors[i]->setAcceleration(1600);
+    motors[i]->setSpeedInHz(1000);
+  }
+  lastCmd = lastMotion = millis();
+  Serial.println(ready ? VERSION : "ERROR_STEPPER_INIT");
 }
-
-void parseCommand(char* cmd) {
-  // 1. Установка скоростей: "s <speed_F> <speed_R> <speed_L>"
-  if (cmd[0] == 's') {
-    long speedF = 0, speedR = 0, speedL = 0;
-    int parsed = sscanf(cmd, "s %ld %ld %ld", &speedF, &speedR, &speedL);
-    if (parsed == 3) {
-      if (speedF != 0 || speedR != 0 || speedL != 0) {
-        enableDrivers();
-        lastMotionTime = millis();
-        motorsStopped = false;
-      } else {
-        motorsStopped = true;
-      }
-      
-      speedF = constrain(speedF, -MAX_SPEED_LIMIT, MAX_SPEED_LIMIT);
-      speedR = constrain(speedR, -MAX_SPEED_LIMIT, MAX_SPEED_LIMIT);
-      speedL = constrain(speedL, -MAX_SPEED_LIMIT, MAX_SPEED_LIMIT);
-      
-      stepperF.setSpeed(speedF);
-      stepperR.setSpeed(speedR);
-      stepperL.setSpeed(speedL);
-      
-      lastCmdTime = millis();
-      activeTestMotor = -1;
-    }
-  }
-  // 2. Тест отдельного мотора: "t <motor_idx 0..2> <speed> <duration_ms>"
-  else if (cmd[0] == 't') {
-    int mIdx = 0, spd = 2000, dur = 2000;
-    int parsed = sscanf(cmd, "t %d %d %d", &mIdx, &spd, &dur);
-    if (parsed >= 1) {
-      enableDrivers();
-      stopMotors();
-      long stepSpd = (abs(spd) < 500) ? (spd * 30) : spd;
-      if (stepSpd == 0) stepSpd = 1500;
-      stepSpd = constrain(stepSpd, -MAX_SPEED_LIMIT, MAX_SPEED_LIMIT);
-
-      if (mIdx == 0) stepperF.setSpeed(stepSpd);
-      else if (mIdx == 1) stepperR.setSpeed(stepSpd);
-      else if (mIdx == 2) stepperL.setSpeed(stepSpd);
-
-      activeTestMotor = mIdx;
-      testEndTime = millis() + (dur > 0 ? dur : 2000);
-      lastCmdTime = millis();
-      lastMotionTime = millis();
-      motorsStopped = false;
-    }
-  }
-  // 3. Микротест мотора на точное число шагов: "m <motor_idx 0..2> <steps>"
-  else if (cmd[0] == 'm') {
-    int mIdx = 0, steps = 200;
-    int parsed = sscanf(cmd, "m %d %d", &mIdx, &steps);
-    if (parsed >= 2) {
-      enableDrivers();
-      stopMotors();
-      int dir = (steps >= 0) ? 1 : 0;
-      hardwareStep(mIdx, dir, abs(steps), 400);
-      lastMotionTime = millis();
-    }
-  }
-  // 4. Прямой аппаратный тест: "h <motor_idx 0..2> <dir 0/1> <steps>"
-  else if (cmd[0] == 'h') {
-    int mIdx = 0, dir = 1, steps = 1600;
-    sscanf(cmd, "h %d %d %d", &mIdx, &dir, &steps);
-    hardwareStep(mIdx, dir, steps, 300);
-  }
-  // 5. Ручное переключение уровня Enable: "e 0" (включить ток) или "e 1" (выключить ток)
-  else if (cmd[0] == 'e') {
-    int lvl = 0;
-    sscanf(cmd, "e %d", &lvl);
-    if (lvl == 0) enableDrivers();
-    else sleepDrivers();
-  }
-  // 6. Настройка режима удержания: "a 1" (авто-сон) или "a 0" (постоянное удержание)
-  else if (cmd[0] == 'a') {
-    int val = 1;
-    sscanf(cmd, "a %d", &val);
-    autoSleepEnabled = (val != 0);
-    if (!autoSleepEnabled) {
-      enableDrivers(); // При отключении авто-сна сразу включаем удержание
-    }
-  }
-  // 7. Настройка таймаута Watchdog: "w <timeout_ms>" (например "w 500")
-  else if (cmd[0] == 'w') {
-    unsigned long val = 500;
-    sscanf(cmd, "w %lu", &val);
-    if (val >= 100 && val <= 10000) {
-      watchdogTimeoutMs = val;
-    }
-  }
-  // 8. Сброс одометрии (счетчиков шагов в 0): "r"
-  else if (cmd[0] == 'r') {
-    stepperF.setCurrentPosition(0);
-    stepperR.setCurrentPosition(0);
-    stepperL.setCurrentPosition(0);
-  }
-  // 9. Стоп
-  else if (strcmp(cmd, "stop") == 0 || cmd[0] == 'x') {
-    stopMotors();
-  }
-}
-
 void loop() {
-  unsigned long now = millis();
-
-  // 1. Генерация шагов для всех трех моторов
-  stepperF.runSpeed();
-  stepperR.runSpeed();
-  stepperL.runSpeed();
-
-  // 2. Heartbeat светодиод
-  if (now - lastBlinkTime >= 250) {
-    lastBlinkTime = now;
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-  }
-
-  // 3. Отправка одометрии и скоростей моторов (20 Гц)
-  if (now - lastOdomTime >= ODOM_INTERVAL_MS) {
-    lastOdomTime = now;
-    Serial.printf("o %ld %ld %ld %ld %ld %ld\n",
-      stepperF.currentPosition(),
-      stepperR.currentPosition(),
-      stepperL.currentPosition(),
-      (long)stepperF.speed(),
-      (long)stepperR.speed(),
-      (long)stepperL.speed()
-    );
-  }
-
-  // 4. Чтение команд по Serial
-  while (Serial.available() > 0) {
+  // Bound UART work per iteration; hardware stepping is independent of loop.
+  for (int n = 0; n < 96 && Serial.available(); ++n) {
     char c = Serial.read();
     if (c == '\n' || c == '\r') {
-      if (bufIdx > 0) {
-        inputBuf[bufIdx] = '\0';
-        parseCommand(inputBuf);
-        bufIdx = 0;
-      }
-    } else if (bufIdx < MAX_BUF - 1) {
-      inputBuf[bufIdx++] = c;
-    }
+      if (bufIdx && !overflowLine) { inputBuf[bufIdx] = 0; parseCommand(inputBuf); }
+      bufIdx = 0;
+      overflowLine = false;
+    } else if (bufIdx < sizeof(inputBuf) - 1) inputBuf[bufIdx++] = c;
+    else overflowLine = true;
   }
-
-  // 5. Окончание теста отдельного мотора
-  if (activeTestMotor >= 0 && now >= testEndTime) {
-    stopMotors();
+  uint32_t now = millis();
+  if (!ready) { delay(1); return; }
+  if (timedTest && int32_t(now - testEnd) >= 0) halt(false);
+  if (!timedTest && watchdogArmed && uint32_t(now - lastCmd) > watchdogMs) halt(false);
+  if (moving()) lastMotion = now;
+  if (autoSleepEnabled && !moving() && uint32_t(now - lastMotion) >= 2000) power(false);
+  digitalWrite(2, (now / 250) % 2);
+  if (uint32_t(now - lastOdom) >= 50) {
+    lastOdom = now;
+    char line[96];
+    int len = snprintf(line, sizeof(line), "o %ld %ld %ld %ld %ld %ld\n",
+      (long)motors[0]->getCurrentPosition(), (long)motors[1]->getCurrentPosition(),
+      (long)motors[2]->getCurrentPosition(), (long)(motors[0]->getCurrentSpeedInMilliHz() / 1000),
+      (long)(motors[1]->getCurrentSpeedInMilliHz() / 1000), (long)(motors[2]->getCurrentSpeedInMilliHz() / 1000));
+    if (len > 0 && len < sizeof(line) && Serial.availableForWrite() >= len)
+      Serial.write((uint8_t*)line, len);
   }
-
-  // 6. Watchdog безопасности (остановка скорости при потере связи)
-  if (!motorsStopped && activeTestMotor < 0 && (now - lastCmdTime > watchdogTimeoutMs)) {
-    stopMotors();
-  }
-
-  // 7. АВТО-СОН: если включен авто-сон и моторы остановлены дольше AUTO_SLEEP_DELAY_MS -> гасим ток
-  if (autoSleepEnabled && motorsStopped && activeTestMotor < 0 && driversActive && (now - lastMotionTime > AUTO_SLEEP_DELAY_MS)) {
-    sleepDrivers();
-  }
+  delay(1);
 }

@@ -3,12 +3,14 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry, Path
 from fake_tag_interfaces.msg import TagDetectionArray
+from sensor_msgs.msg import CompressedImage
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
 from std_msgs.msg import String, Empty
 import tf2_ros
 from ament_index_python.packages import get_package_share_directory
 import os
+import time
 import yaml
 import numpy as np
 from scipy.spatial.transform import Rotation as R, Slerp
@@ -36,6 +38,12 @@ class LocalizationNode(Node):
         # Подписка на топик /fake_tag (сообщения типа TagDetectionArray)
         self.tag_sub = self.create_subscription(
             TagDetectionArray, '/fake_tag', self.tag_callback, 10)
+
+        # Буфер и подписка на сжатое видео с камеры
+        self.latest_jpeg_frame = None
+        self.latest_frame_lock = threading.Lock()
+        self.image_sub = self.create_subscription(
+            CompressedImage, '/camera/annotated_image/compressed', self.image_callback, 10)
 
         # Публикатор оцененного положения робота в топик /estimated_pose
         self.pose_pub = self.create_publisher(
@@ -97,11 +105,47 @@ class LocalizationNode(Node):
         self.raw_path_length = 0.0
         self.filtered_path_length = 0.0
 
+        # Состояние автопилота и маршрутизатора
+        self.route_waypoints = []
+        self.route_state = "idle"  # idle, running, paused, finished
+        self.current_wp_idx = 0
+        self.autopilot_thread = None
+        self.autopilot_active = False
+
+        # Параметры автопилота Pure Pursuit (плавный ход без зависаний)
+        self.ap_look_ahead = 0.15
+        self.ap_max_lin = 0.14
+        self.ap_max_ang = 0.70
+        self.ap_kp_lin = 0.80
+        self.ap_kp_ang = 1.50
+        self.ap_goal_tol = 0.04
+        self.ap_decel_dist = 0.30
+        self.ap_min_lin = 0.03
+        self.ap_yaw_deadzone = 0.05
+        self.ap_wp_tol = 0.08
+        self.ap_turn_decel = 0.20
+
+        # Состояние слияния и фильтрации выбросов
+        self.outlier_count = 0
+        self.last_valid_tag_time = 0.0
+        self.tracking_mode = "dead_reckoning"
+
+        # Состояние питания обмоток шаговых двигателей (enabled / disabled)
+        self.motor_power_state = "enabled"
+        self.last_motion_cmd_time = time.time()
+        
+        # Таймер автоматического снятия тока с обмоток при отсутствии команд 2 секунды (5 Гц)
+        self.power_watchdog_timer = self.create_timer(0.2, self.check_motor_power_watchdog)
+
+        # Аппаратное подключение к ESP32 для прямого управления моторами
+        self.robot = None
+        self.init_robot_api()
+
         # Запуск веб-сервера для real-time визуализации траектории
         self.web_port = 8080
         self.start_web_server()
 
-        self.get_logger().info('Localization node started successfully (Multi-tag Data Fusion)')
+        self.get_logger().info('Localization node started successfully (Multi-tag Data Fusion + ESP32 API + Autopilot Engine)')
 
     def load_tags_config(self):
         try:
@@ -114,6 +158,10 @@ class LocalizationNode(Node):
                 self.get_logger().info(f"Loaded {len(self.tags_db)} ceiling tags from config.")
         except Exception as e:
             self.get_logger().error(f"Failed to load config: {str(e)}")
+
+    def image_callback(self, msg):
+        with self.latest_frame_lock:
+            self.latest_jpeg_frame = bytes(msg.data)
 
     def tag_callback(self, msg):
         try:
@@ -149,8 +197,8 @@ class LocalizationNode(Node):
             except Exception as tf_err:
                 # Если TF еще не опубликован, считаем, что они совпадают
                 self.get_logger().debug(f"TF lookup base_link->camera_link failed, using identity/hardcoded pitch: {str(tf_err)}")
-                # По умолчанию: камера на роботе смотрит вверх (pitch = -90 градусов)
-                camera_rot = R.from_euler('xyz', [0.0, -np.pi / 2.0, 0.0])
+                # По умолчанию: камера на роботе смотрит вверх (pitch = -90 градусов, yaw = +90 градусов)
+                camera_rot = R.from_euler('xyz', [0.0, -np.pi / 2.0, np.pi / 2.0])
                 T_base_camera = np.eye(4)
                 T_base_camera[:3, :3] = camera_rot.as_matrix()
                 T_base_camera[:3, 3] = [0.0, 0.0, 0.0]
@@ -214,7 +262,7 @@ class LocalizationNode(Node):
                     self.get_logger().error(f"Rotation averaging failed: {str(rot_mean_err)}")
                     avg_rot = rotations[0]
 
-            # 4. Применяем слияние датчиков (Комплементарный фильтр)
+            # 4. Применяем слияние датчиков (Комплементарный фильтр + Outlier Rejection)
             avg_yaw = self.quaternion_to_yaw_from_quat(avg_rot)
             
             if not self.fused_initialized:
@@ -223,7 +271,28 @@ class LocalizationNode(Node):
                 self.fused_z = avg_pos[2]
                 self.fused_yaw = avg_yaw
                 self.fused_initialized = True
+                self.outlier_count = 0
             else:
+                # Проверка на пространственный выброс (Outlier Gating)
+                spatial_jump = np.sqrt((avg_pos[0] - self.fused_x)**2 + (avg_pos[1] - self.fused_y)**2)
+                # Если скачок больше 0.40 м за один кадр:
+                if spatial_jump > 0.40:
+                    self.outlier_count += 1
+                    if self.outlier_count < 4:
+                        self.get_logger().warn(
+                            f"⚠️ Игнорируем выброс ArUco: скачок {spatial_jump:.2f}м (порог 0.40м). Выбросов подряд: {self.outlier_count}"
+                        )
+                        return
+                    else:
+                        # Если 4 кадра подряд фиксируют новую позицию (робота переставили руками)
+                        self.get_logger().info(f"🔄 Смена позиции робота подтверждена (4 кадра): X={avg_pos[0]:.2f}, Y={avg_pos[1]:.2f}")
+                        self.fused_x = avg_pos[0]
+                        self.fused_y = avg_pos[1]
+                        self.fused_yaw = avg_yaw
+                        self.outlier_count = 0
+                else:
+                    self.outlier_count = 0
+
                 # Коэффициент доверия к визуальной метке (filter_alpha)
                 K = self.filter_alpha
                 self.fused_x += K * (avg_pos[0] - self.fused_x)
@@ -234,6 +303,9 @@ class LocalizationNode(Node):
                 yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
                 self.fused_yaw += K * yaw_diff
                 self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
+
+            self.tracking_mode = "aruco_fused"
+            self.last_valid_tag_time = time.time()
 
             # Обновляем длину сырого пути
             if len(self.raw_trajectory_x) > 0:
@@ -253,10 +325,6 @@ class LocalizationNode(Node):
             self.last_detected_tags = [d.tag_id for d in detections]
             self.publish_fused_pose(msg.header.stamp)
 
-            self.get_logger().info(
-                f"Fused update by tags {self.last_detected_tags}: X={self.fused_x:.2f}, Y={self.fused_y:.2f}, Z={self.fused_z:.2f}"
-            )
-
         except Exception as e:
             self.get_logger().error(f"Error in tag_callback: {str(e)}")
 
@@ -269,7 +337,399 @@ class LocalizationNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to start Web UI server: {str(e)}")
 
+    def init_robot_api(self):
+        """Прямая аппаратная интеграция с ESP32 через TermitRobotAPI"""
+        try:
+            try:
+                from .termit_api import TermitRobotAPI, RobotConfig, HoldMode
+            except (ImportError, ValueError):
+                from termit_api import TermitRobotAPI, RobotConfig, HoldMode
+                
+            config = RobotConfig(
+                wheel_radius=0.030,
+                base_radius=0.122,
+                steps_per_rev=1600,
+                watchdog_timeout_ms=1500,
+                max_linear_speed=0.15,
+                max_motor_speed_steps=1100,
+                min_start_speed_steps=120.0,
+                max_wheel_accel_steps=1600.0
+            )
+            self.robot = TermitRobotAPI(config)
+            ports = self.robot.list_available_ports()
+            if ports:
+                port = '/dev/ttyUSB0' if '/dev/ttyUSB0' in ports else ports[0]
+                self.get_logger().info(f"Connecting TermitRobotAPI to ESP32 on {port}...")
+                self.robot.connect(port=port)
+                self.robot.set_holding_mode(HoldMode.CONTINUOUS_HOLD)
+                self.robot.add_odometry_callback(self.on_esp32_odometry)
+                self.get_logger().info(f"✅ TermitRobotAPI successfully connected to ESP32 on {port} (Continuous Hold enabled)")
+            else:
+                self.get_logger().warn("No serial ports found for ESP32. Running with ROS cmd_vel fallback.")
+        except Exception as e:
+            self.get_logger().warn(f"TermitRobotAPI initialization note: {str(e)}")
+            self.robot = None
+
+    def on_esp32_odometry(self, odom):
+        """Коллбэк прямой одометрии шаговых двигателей от TermitRobotAPI (20-50 Гц)"""
+        now = self.get_clock().now()
+        dt = 0.04
+        
+        if not self.fused_initialized:
+            self.fused_x = odom.x
+            self.fused_y = odom.y
+            self.fused_yaw = odom.theta
+            self.fused_initialized = True
+            return
+
+        # В termit_api:
+        # odom.vy = продольная скорость тела робота (вперед > 0, назад < 0)
+        # odom.vx = боковая скорость тела робота (вправо > 0, влево < 0)
+        # В СК робота base_link (REP 103):
+        # X_base = вперед = odom.vy
+        # Y_base = влево = -odom.vx
+        v_forward = odom.vy
+        v_left = -odom.vx
+        w = odom.omega
+
+        self.fused_yaw += w * dt
+        self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
+
+        # Точное преобразование движения из ПСК робота в СК карты
+        dx_global = (v_forward * np.cos(self.fused_yaw) - v_left * np.sin(self.fused_yaw)) * dt
+        dy_global = (v_forward * np.sin(self.fused_yaw) + v_left * np.cos(self.fused_yaw)) * dt
+
+        self.fused_x += dx_global
+        self.fused_y += dy_global
+
+        if time.time() - self.last_valid_tag_time > 0.6:
+            self.tracking_mode = "dead_reckoning"
+
+        self.publish_fused_pose(now.to_msg())
+
+    def check_motor_power_watchdog(self):
+        """Автоматическое снятие тока с обмоток при отсутствии команд более 2.0 секунд"""
+        if self.motor_power_state == "enabled":
+            # Не снимаем ток, если активно автономное движение по маршруту или калибровочный тест
+            if not self.autopilot_active and not self.test_drive_active:
+                if time.time() - self.last_motion_cmd_time >= 2.0:
+                    self.set_motor_power("disable")
+                    self.get_logger().info("💤 Нет команд 2 секунды: ток с обмоток моторов снят автоматически")
+
+    def set_motor_power(self, state: str) -> bool:
+        """
+        Управление питанием обмоток шаговых двигателей:
+        state == 'enable'  -> включить ток (удержание валов, HoldMode.CONTINUOUS_HOLD)
+        state == 'disable' -> снять ток с обмоток (HoldMode.DISABLED, валы свободны, 0 Вт, охлаждение)
+        """
+        try:
+            try:
+                from .termit_api import HoldMode
+            except (ImportError, ValueError):
+                from termit_api import HoldMode
+        except Exception:
+            HoldMode = None
+
+        if state == "disable":
+            self.motor_power_state = "disabled"
+            if self.robot and self.robot.is_connected and HoldMode:
+                self.robot.set_holding_mode(HoldMode.DISABLED)
+            self.notify_ui_event()
+            self.get_logger().info("💤 Ток с обмоток снят (валы свободны, нагрев 0)")
+            return True
+        elif state == "enable":
+            self.motor_power_state = "enabled"
+            self.last_motion_cmd_time = time.time()
+            if self.robot and self.robot.is_connected and HoldMode:
+                self.robot.set_holding_mode(HoldMode.CONTINUOUS_HOLD)
+            self.notify_ui_event()
+            self.get_logger().info("⚡ Ток подан на обмотки моторов (удержание активно)")
+            return True
+        return False
+
+    def drive_robot(self, forward, strafe, w):
+        """Прямое аппаратное управление моторами через ESP32 API + публикация Twist в /cmd_vel"""
+        is_motion = (abs(forward) > 0.001 or abs(strafe) > 0.001 or abs(w) > 0.001)
+
+        # Автоматическое включение питания обмоток и обновление таймера простоя при команде движения
+        if is_motion:
+            self.last_motion_cmd_time = time.time()
+            if self.motor_power_state == "disabled":
+                self.set_motor_power("enable")
+
+        # 1. Прямая отправка в ESP32
+        if self.robot and self.robot.is_connected:
+            try:
+                if not is_motion:
+                    self.robot.stop()
+                else:
+                    # В termit_api: vx = боковой стрейф (вправо > 0), vy = продольный ход (вперед > 0), omega = разворот
+                    self.robot.drive(vx=float(strafe), vy=float(forward), omega=float(w))
+            except Exception as e:
+                self.get_logger().error(f"ESP32 motor drive error: {str(e)}")
+
+        # 2. Публикация в ROS 2 топик /cmd_vel для совместимости
+        msg = Twist()
+        msg.linear.x = float(forward)
+        msg.linear.y = float(strafe)
+        msg.angular.z = float(w)
+        self.cmd_vel_pub.publish(msg)
+
+    def set_path_plan(self, waypoints):
+        """Сохранение путевых точек маршрута и публикация Path в ROS"""
+        self.route_waypoints = list(waypoints)
+        self.current_wp_idx = 0
+        self.route_state = "idle"
+        self.publish_plan(waypoints)
+        self.notify_ui_event()
+        self.get_logger().info(f"Загружен новый маршрут из {len(waypoints)} точек")
+
+    def start_route(self):
+        """Запуск автономного движения по маршруту (Pure Pursuit)"""
+        if not self.route_waypoints:
+            self.get_logger().warn("Невозможно запустить маршрут: список точек пуст!")
+            return False
+            
+        self.set_motor_power("enable")
+        self.route_state = "running"
+        self.autopilot_active = True
+        
+        if self.autopilot_thread is None or not self.autopilot_thread.is_alive():
+            self.autopilot_thread = threading.Thread(target=self.autopilot_loop, daemon=True, name="Autopilot")
+            self.autopilot_thread.start()
+            
+        self.notify_ui_event()
+        self.get_logger().info(f"▶ Старт автопилота с точки {self.current_wp_idx + 1}/{len(self.route_waypoints)}")
+        return True
+
+    def pause_route(self):
+        """Пауза / Снятие с паузы автопилота"""
+        if self.route_state == "running":
+            self.route_state = "paused"
+            self.autopilot_active = False
+            self.drive_robot(0.0, 0.0, 0.0)
+            self.notify_ui_event()
+            self.get_logger().info(f"⏸ Автопилот на паузе (точка {self.current_wp_idx + 1}/{len(self.route_waypoints)})")
+            return True
+        elif self.route_state == "paused":
+            return self.start_route()
+        return False
+
+    def stop_route(self):
+        """Полная остановка и сброс маршрута с автоматическим снятием тока"""
+        self.route_state = "idle"
+        self.autopilot_active = False
+        self.current_wp_idx = 0
+        self.drive_robot(0.0, 0.0, 0.0)
+        # Allow the ESP32 braking ramp to finish before the 2 s power timer.
+        self.last_motion_cmd_time = time.time()
+        self.notify_ui_event()
+        self.get_logger().info("⏹ Маршрут сброшен; плавная остановка, затем авто-снятие тока.")
+        return True
+
+    def clear_waypoints(self):
+        """Очистка путевых точек"""
+        self.stop_route()
+        self.route_waypoints = []
+        self.publish_plan([])
+        self.notify_ui_event()
+        self.get_logger().info("🗑 Путевые точки очищены.")
+        return True
+
+    def return_to_origin(self):
+        """Автоматическое построение гладкого маршрута и возврат робота в начало координат (0,0)"""
+        rx = float(self.fused_x)
+        ry = float(self.fused_y)
+        dist = np.sqrt(rx*rx + ry*ry)
+        num_pts = max(3, int(np.ceil(dist / 0.05)))
+        points = []
+        for i in range(num_pts + 1):
+            t = i / float(num_pts)
+            points.append([float(rx * (1.0 - t)), float(ry * (1.0 - t))])
+        self.set_path_plan(points)
+        self.get_logger().info(f"🎯 Построен маршрут возврата в (0,0): {len(points)} точек, дистанция {dist:.2f}м")
+        return self.start_route()
+
+    def autopilot_loop(self):
+        """
+        Высокоточный цикл автономного движения Lookahead Pure Pursuit (20 Гц).
+        Прямое управление через ESP32 API с плавным круиз-контролем.
+        Исключает рывки, зависания на промежуточных точках и разворот векторов назад.
+        """
+        import time as pytime
+        smooth_forward = 0.0
+        smooth_strafe = 0.0
+        smooth_w = 0.0
+
+        while self.autopilot_active and self.route_state == "running":
+            t_loop_start = pytime.time()
+            self.last_motion_cmd_time = t_loop_start
+            
+            if not self.route_waypoints or self.current_wp_idx >= len(self.route_waypoints):
+                self.route_state = "finished"
+                self.autopilot_active = False
+                self.drive_robot(0.0, 0.0, 0.0)
+                self.notify_ui_event()
+                self.get_logger().info("🎉 Маршрут полностью выполнен! Робот на финише.")
+                # Power watchdog releases coils after braking, not mid-ramp.
+                self.last_motion_cmd_time = pytime.time()
+                break
+
+            rx = float(self.fused_x)
+            ry = float(self.fused_y)
+            ryaw = float(self.fused_yaw)
+
+            fx, fy = self.route_waypoints[-1]
+            dist_to_finish = float(np.hypot(fx - rx, fy - ry))
+
+            # Проверка достижения финальной цели
+            if dist_to_finish < self.ap_goal_tol and self.current_wp_idx >= len(self.route_waypoints) - 2:
+                self.route_state = "finished"
+                self.autopilot_active = False
+                self.drive_robot(0.0, 0.0, 0.0)
+                self.notify_ui_event()
+                self.get_logger().info(f"🎉 Финиш достигнут (дистанция {dist_to_finish*100:.1f} см)!")
+                # Power watchdog releases coils after braking, not mid-ramp.
+                self.last_motion_cmd_time = pytime.time()
+                break
+
+            # 1. Продвижение по точкам вперед (Dynamic Waypoint Advancement)
+            # Робот никогда не зависает на пройденной точке: переключается, если ближе к следующей
+            # или если проекция позиции находится впереди текущего сегмента
+            while self.current_wp_idx < len(self.route_waypoints) - 1:
+                c_wp = self.route_waypoints[self.current_wp_idx]
+                n_wp = self.route_waypoints[self.current_wp_idx + 1]
+                d_c = np.hypot(c_wp[0] - rx, c_wp[1] - ry)
+                d_n = np.hypot(n_wp[0] - rx, n_wp[1] - ry)
+                s_dx = n_wp[0] - c_wp[0]
+                s_dy = n_wp[1] - c_wp[1]
+                s_len_sq = s_dx**2 + s_dy**2
+
+                if d_c < max(0.10, self.ap_wp_tol) or d_n < d_c:
+                    self.current_wp_idx += 1
+                    self.notify_ui_event()
+                    self.get_logger().info(f"📍 Пройдена точка! Следующая: {self.current_wp_idx + 1}/{len(self.route_waypoints)}")
+                elif s_len_sq > 1e-6:
+                    proj = ((rx - c_wp[0]) * s_dx + (ry - c_wp[1]) * s_dy) / s_len_sq
+                    if proj > 0.75:
+                        self.current_wp_idx += 1
+                        self.notify_ui_event()
+                        self.get_logger().info(f"📍 Пройдена точка! Следующая: {self.current_wp_idx + 1}/{len(self.route_waypoints)}")
+                    else:
+                        break
+                else:
+                    break
+
+            # 2. Расчет точки упреждения (Lookahead Carrot Point) вдоль маршрута
+            # Carrot point всегда находится на расстоянии lookahead вперед по пути
+            lookahead_dist = max(0.14, self.ap_look_ahead)
+            accum_dist = 0.0
+            carrot_pt = self.route_waypoints[self.current_wp_idx]
+            
+            for idx in range(self.current_wp_idx, len(self.route_waypoints) - 1):
+                p_a = self.route_waypoints[idx]
+                p_b = self.route_waypoints[idx + 1]
+                seg_len = np.hypot(p_b[0] - p_a[0], p_b[1] - p_a[1])
+                if accum_dist + seg_len >= lookahead_dist:
+                    rem = lookahead_dist - accum_dist
+                    t_seg = rem / max(0.001, seg_len)
+                    carrot_pt = [p_a[0] + t_seg * (p_b[0] - p_a[0]), p_a[1] + t_seg * (p_b[1] - p_a[1])]
+                    break
+                accum_dist += seg_len
+                carrot_pt = p_b
+
+            tx, ty = carrot_pt
+            dx = tx - rx
+            dy = ty - ry
+            dist_to_target = np.hypot(dx, dy)
+            if dist_to_target < 0.001:
+                dist_to_target = 0.001
+
+            # 3. Скорость: постоянная крейсерская по трассе, плавное торможение только перед финишем
+            if dist_to_finish > self.ap_decel_dist:
+                linear_speed = self.ap_max_lin
+            else:
+                ratio = (dist_to_finish - self.ap_goal_tol) / max(0.01, self.ap_decel_dist - self.ap_goal_tol)
+                ratio = np.clip(ratio, 0.0, 1.0)
+                linear_speed = self.ap_min_lin + ratio * (self.ap_max_lin - self.ap_min_lin)
+
+            # 4. Кинематика Omni: проекция вектора скорости на систему координат робота
+            # v_forward: проекция на продольную ось робота (вперед)
+            # v_left:    проекция на поперечную ось робота (влево)
+            v_forward = linear_speed * (dx * np.cos(ryaw) + dy * np.sin(ryaw)) / dist_to_target
+            v_left    = linear_speed * (-dx * np.sin(ryaw) + dy * np.cos(ryaw)) / dist_to_target
+
+            # 5. Мягкая угловая ориентация (ограничена 0.35 рад/с для стабильности ArUco)
+            target_yaw = np.arctan2(dy, dx)
+            yaw_err = target_yaw - ryaw
+            yaw_err = np.arctan2(np.sin(yaw_err), np.cos(yaw_err))
+            w = np.clip(0.8 * yaw_err, -0.35, 0.35)
+
+            strafe_right = -v_left
+
+            # EMA-фильтр векторов скорости (исключает ступенчатые рывки между путевыми точками)
+            alpha = 0.35
+            smooth_forward = smooth_forward * (1.0 - alpha) + v_forward * alpha
+            smooth_strafe  = smooth_strafe  * (1.0 - alpha) + strafe_right * alpha
+            smooth_w       = smooth_w       * (1.0 - alpha) + w * alpha
+
+            self.drive_robot(smooth_forward, smooth_strafe, smooth_w)
+
+            elapsed = pytime.time() - t_loop_start
+            pytime.sleep(max(0.01, 0.05 - elapsed))
+            
+        self.drive_robot(0.0, 0.0, 0.0)
+
+    def notify_ui_event(self):
+        """Отправка немедленного обновления состояния маршрута в SSE"""
+        web_data = {
+            "type": "route_status",
+            "route_state": self.route_state,
+            "current_wp": int(self.current_wp_idx),
+            "total_wps": int(len(self.route_waypoints)),
+            "tracking_mode": self.tracking_mode,
+            "esp32_connected": bool(self.robot and self.robot.is_connected),
+            "motor_power": self.motor_power_state
+        }
+        with sse_clients_lock:
+            for q in sse_clients:
+                try:
+                    q.put_nowait(web_data)
+                except:
+                    pass
+
+    def get_latest_frame(self):
+        """Получение последнего кадра с камеры для MJPEG стрима"""
+        with self.latest_frame_lock:
+            if self.latest_jpeg_frame is not None:
+                return self.latest_jpeg_frame
+        return self.generate_placeholder_frame()
+
+    def generate_placeholder_frame(self):
+        """Генерация заглушки при отсутствии активного видеопотока"""
+        if hasattr(self, '_placeholder_jpeg') and self._placeholder_jpeg is not None:
+            return self._placeholder_jpeg
+        try:
+            import cv2
+            img = np.zeros((240, 320, 3), dtype=np.uint8)
+            cv2.putText(img, "TERMiT Camera Feed", (35, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 200), 2)
+            cv2.putText(img, "Waiting for /video_feed...", (40, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+            ret, buf = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            if ret:
+                self._placeholder_jpeg = buf.tobytes()
+                return self._placeholder_jpeg
+        except:
+            pass
+        return None
+
     def destroy_node(self):
+        self.autopilot_active = False
+        if hasattr(self, 'robot') and self.robot:
+            try:
+                self.robot.stop()
+                self.robot.disconnect()
+            except Exception:
+                pass
         if hasattr(self, 'server'):
             self.get_logger().info("Stopping web server...")
             try:
@@ -309,10 +769,11 @@ class LocalizationNode(Node):
             self.test_drive_thread.join()
             
         if drive_type == 'stop':
-            msg = Twist()
-            self.cmd_vel_pub.publish(msg)
+            self.drive_robot(0.0, 0.0, 0.0)
+            self.set_motor_power("disable")
             return True
             
+        self.set_motor_power("enable")
         self.test_drive_active = True
         import time as pytime
         self.test_drive_thread = threading.Thread(target=self.test_drive_loop, args=(drive_type,), daemon=True)
@@ -325,11 +786,13 @@ class LocalizationNode(Node):
         
         if drive_type == 'forward':
             duration = 1.0 / 0.15 # 6.67 seconds to drive 1m
-            vx = 0.15
+            forward = 0.15
+            strafe = 0.0
             w = 0.0
         elif drive_type == 'rotate':
             duration = (2.0 * np.pi) / 0.5 # 12.57 seconds to rotate 360 degrees
-            vx = 0.0
+            forward = 0.0
+            strafe = 0.0
             w = 0.5
         else:
             return
@@ -337,16 +800,14 @@ class LocalizationNode(Node):
         self.get_logger().info(f"Starting test motion '{drive_type}' for {duration:.2f} seconds")
         
         while self.test_drive_active and (pytime.time() - start_time < duration):
-            msg = Twist()
-            msg.linear.x = vx
-            msg.angular.z = w
-            self.cmd_vel_pub.publish(msg)
+            self.drive_robot(forward, strafe, w)
             pytime.sleep(0.05)
             
-        msg = Twist()
-        self.cmd_vel_pub.publish(msg)
+        self.drive_robot(0.0, 0.0, 0.0)
         self.test_drive_active = False
         self.get_logger().info("Test motion finished, robot stopped.")
+        pytime.sleep(0.3)
+        self.set_motor_power("disable")
 
     def odom_callback(self, msg):
         """Интеграция одометрии шаговых двигателей для экстраполяции позы"""
@@ -387,6 +848,9 @@ class LocalizationNode(Node):
 
         self.fused_x += dx_global
         self.fused_y += dy_global
+
+        if time.time() - self.last_valid_tag_time > 0.6:
+            self.tracking_mode = "dead_reckoning"
 
         self.publish_fused_pose(now.to_msg())
 
@@ -449,11 +913,20 @@ class LocalizationNode(Node):
             "distance_filtered": float(self.filtered_path_length),
             "timestamp": float(stamp_sec),
             "detected_tags": self.last_detected_tags,
-            "follower_status": self.follower_status
+            "follower_status": self.route_state,
+            "route_state": self.route_state,
+            "current_wp": int(self.current_wp_idx),
+            "total_wps": int(len(self.route_waypoints)),
+            "tracking_mode": self.tracking_mode,
+            "esp32_connected": bool(self.robot and self.robot.is_connected),
+            "motor_power": self.motor_power_state
         }
         with sse_clients_lock:
             for q in sse_clients:
-                q.put(web_data)
+                try:
+                    q.put_nowait(web_data)
+                except:
+                    pass
 
     def publish_plan(self, points):
         self.get_logger().info(f"Publishing new path plan with {len(points)} waypoints")
@@ -474,31 +947,36 @@ class LocalizationNode(Node):
     def status_callback(self, msg):
         self.follower_status = msg.data
 
-    def trigger_start_work(self):
-        self.get_logger().info("Triggering start work signal for path follower.")
-        self.start_work_pub.publish(Empty())
-
     def set_follower_parameters(self, look_ahead, max_lin, max_ang, kp_lin, kp_ang, goal_tol, decel_dist, min_lin, yaw_deadzone, wp_tol, turn_decel):
-        """Отправка запроса на изменение параметров в ноду path_follower"""
-        if not self.param_client.service_is_ready():
-            self.get_logger().warn("Path follower parameter service not ready.")
-            return False
-            
-        req = SetParameters.Request()
-        req.parameters.append(Parameter(name='look_ahead_distance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(look_ahead))))
-        req.parameters.append(Parameter(name='max_linear_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(max_lin))))
-        req.parameters.append(Parameter(name='max_angular_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(max_ang))))
-        req.parameters.append(Parameter(name='kp_linear', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(kp_lin))))
-        req.parameters.append(Parameter(name='kp_angular', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(kp_ang))))
-        req.parameters.append(Parameter(name='goal_tolerance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(goal_tol))))
-        req.parameters.append(Parameter(name='decel_dist', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(decel_dist))))
-        req.parameters.append(Parameter(name='min_linear_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(min_lin))))
-        req.parameters.append(Parameter(name='yaw_deadzone_dist', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(yaw_deadzone))))
-        req.parameters.append(Parameter(name='waypoint_tolerance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(wp_tol))))
-        req.parameters.append(Parameter(name='kp_turn_decel', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(turn_decel))))
+        """Обновление параметров автопилота внутри ноды и в ROS"""
+        self.ap_look_ahead = float(look_ahead)
+        self.ap_max_lin = float(max_lin)
+        self.ap_max_ang = float(max_ang)
+        self.ap_kp_lin = float(kp_lin)
+        self.ap_kp_ang = float(kp_ang)
+        self.ap_goal_tol = float(goal_tol)
+        self.ap_decel_dist = float(decel_dist)
+        self.ap_min_lin = float(min_lin)
+        self.ap_yaw_deadzone = float(yaw_deadzone)
+        self.ap_wp_tol = float(wp_tol)
+        self.ap_turn_decel = float(turn_decel)
         
-        self.param_client.call_async(req)
-        self.get_logger().info("Sent parameter update request to path_follower.")
+        if self.param_client.service_is_ready():
+            req = SetParameters.Request()
+            req.parameters.append(Parameter(name='look_ahead_distance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(look_ahead))))
+            req.parameters.append(Parameter(name='max_linear_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(max_lin))))
+            req.parameters.append(Parameter(name='max_angular_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(max_ang))))
+            req.parameters.append(Parameter(name='kp_linear', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(kp_lin))))
+            req.parameters.append(Parameter(name='kp_angular', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(kp_ang))))
+            req.parameters.append(Parameter(name='goal_tolerance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(goal_tol))))
+            req.parameters.append(Parameter(name='decel_dist', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(decel_dist))))
+            req.parameters.append(Parameter(name='min_linear_velocity', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(min_lin))))
+            req.parameters.append(Parameter(name='yaw_deadzone_dist', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(yaw_deadzone))))
+            req.parameters.append(Parameter(name='waypoint_tolerance', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(wp_tol))))
+            req.parameters.append(Parameter(name='kp_turn_decel', value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(turn_decel))))
+            self.param_client.call_async(req)
+
+        self.get_logger().info(f"Updated autopilot parameters: max_lin={max_lin}, max_ang={max_ang}, goal_tol={goal_tol}")
         return True
 
     def quaternion_to_yaw_from_quat(self, q):
@@ -516,7 +994,6 @@ class LocalizationNode(Node):
     def save_trajectory_and_shutdown(self):
         if not self.raw_trajectory_x:
             self.get_logger().warn("Trajectory is empty. Cannot generate plot or statistics.")
-            rclpy.shutdown()
             return
 
         # 1. Расчет статистики для сырых и отфильтрованных данных
@@ -622,8 +1099,6 @@ class LocalizationNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to generate trajectory plot: {str(e)}")
 
-        rclpy.shutdown()
-
 # --- ВЕБ-СЕРВЕР ДЛЯ ОТОБРАЖЕНИЯ В РЕАЛЬНОМ ВРЕМЕНИ ---
 
 sse_clients = []
@@ -634,6 +1109,11 @@ class WebServerHandler(SimpleHTTPRequestHandler):
         # Отключаем логирование запросов, чтобы не мусорить в консоли
         pass
 
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.end_headers()
+
     def do_GET(self):
         if self.path == '/':
             self.send_response(200)
@@ -643,6 +1123,27 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.send_header('Expires', '0')
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
+        elif self.path == '/video_feed':
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+            self.send_header('Cache-Control', 'no-cache, no-store, must-revalidate')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Expires', '0')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            try:
+                while True:
+                    frame = self.server.node.get_latest_frame()
+                    if frame is not None:
+                        self.wfile.write(b"--frame\r\n")
+                        self.wfile.write(b"Content-Type: image/jpeg\r\n\r\n")
+                        self.wfile.write(frame)
+                        self.wfile.write(b"\r\n")
+                        time.sleep(0.04)
+                    else:
+                        time.sleep(0.08)
+            except (ConnectionResetError, BrokenPipeError):
+                pass
         elif self.path == '/config':
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -726,32 +1227,75 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 for pt_str in points_str.split(';'):
                     if ',' in pt_str:
                         coords = pt_str.split(',')
-                        points.append([float(coords[0]), float(coords[1])])
+                        try:
+                            points.append([float(coords[0]), float(coords[1])])
+                        except ValueError:
+                            pass
             
-            self.server.node.publish_plan(points)
+            self.server.node.set_path_plan(points)
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
+            self.wfile.write(json.dumps({"status": "success", "count": len(points)}).encode('utf-8'))
+
+        elif self.path.startswith('/start_route'):
+            success = self.server.node.start_route()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success" if success else "error", "route_state": self.server.node.route_state}).encode('utf-8'))
+
+        elif self.path.startswith('/pause_route'):
+            success = self.server.node.pause_route()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success" if success else "error", "route_state": self.server.node.route_state}).encode('utf-8'))
+
+        elif self.path.startswith('/stop_route'):
+            self.server.node.stop_route()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success", "route_state": "idle"}).encode('utf-8'))
+
+        elif self.path.startswith('/clear_waypoints'):
+            self.server.node.clear_waypoints()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
             self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+
+        elif self.path.startswith('/return_home'):
+            success = self.server.node.return_to_origin()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success" if success else "error"}).encode('utf-8'))
             
         elif self.path.startswith('/set_follower_params'):
             from urllib.parse import urlparse, parse_qs
             parsed_url = urlparse(self.path)
             query = parse_qs(parsed_url.query)
             
-            look_ahead = float(query.get('look_ahead', [0.10])[0])
-            max_lin = float(query.get('max_lin', [0.18])[0])
-            max_ang = float(query.get('max_ang', [0.8])[0])
-            kp_lin = float(query.get('kp_lin', [0.8])[0])
-            kp_ang = float(query.get('kp_ang', [1.5])[0])
-            goal_tol = float(query.get('goal_tol', [0.02])[0])
+            look_ahead = float(query.get('look_ahead', [0.15])[0])
+            max_lin = float(query.get('max_lin', [0.14])[0])
+            max_ang = float(query.get('max_ang', [0.70])[0])
+            kp_lin = float(query.get('kp_lin', [0.80])[0])
+            kp_ang = float(query.get('kp_ang', [1.50])[0])
+            goal_tol = float(query.get('goal_tol', [0.03])[0])
             decel_dist = float(query.get('decel_dist', [0.30])[0])
-            min_lin = float(query.get('min_lin', [0.04])[0])
-            yaw_deadzone = float(query.get('yaw_deadzone', [0.08])[0])
-            wp_tol = float(query.get('wp_tol', [0.0])[0])
-            turn_decel = float(query.get('turn_decel', [0.4])[0])
+            min_lin = float(query.get('min_lin', [0.03])[0])
+            yaw_deadzone = float(query.get('yaw_deadzone', [0.05])[0])
+            wp_tol = float(query.get('wp_tol', [0.06])[0])
+            turn_decel = float(query.get('turn_decel', [0.35])[0])
             
             self.server.node.set_follower_parameters(
                 look_ahead, max_lin, max_ang, kp_lin, kp_ang, goal_tol, decel_dist, min_lin, yaw_deadzone, wp_tol, turn_decel
@@ -764,7 +1308,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
             
         elif self.path.startswith('/start_work'):
-            self.server.node.trigger_start_work()
+            self.server.node.start_route()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -780,17 +1324,37 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             vy = float(query.get('vy', [0.0])[0])
             w = float(query.get('w', [0.0])[0])
             
-            msg = Twist()
-            msg.linear.x = vx
-            msg.linear.y = vy
-            msg.angular.z = w
-            self.server.node.cmd_vel_pub.publish(msg)
+            self.server.node.drive_robot(vx, vy, w)
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            self.wfile.write(json.dumps({"status": "success", "vx": vx, "vy": vy, "w": w}).encode('utf-8'))
+
+        elif self.path.startswith('/set_motor_power'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            state = query.get('state', ['enable'])[0]
+            success = self.server.node.set_motor_power(state)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                "status": "success" if success else "error",
+                "motor_power": self.server.node.motor_power_state
+            }).encode('utf-8'))
+
+        elif self.path.startswith('/esp32_status'):
+            connected = bool(self.server.node.robot and self.server.node.robot.is_connected)
+            port_str = self.server.node.robot._port_name if self.server.node.robot else "none"
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"connected": connected, "port": port_str}).encode('utf-8'))
         else:
             self.send_error(404, "File not found")
 
@@ -1043,13 +1607,88 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-size: 11px;
             font-weight: 600;
         }
-        .control-panel {
+        .video-panel {
             position: absolute;
             top: 20px;
             right: 20px;
             display: flex;
+            flex-direction: column;
+            align-items: flex-end;
             gap: 8px;
             z-index: 10;
+        }
+        .video-box {
+            width: 320px;
+            background: rgba(20, 24, 33, 0.85);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6);
+            backdrop-filter: blur(12px);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .video-box.minimized .video-content {
+            display: none;
+        }
+        .video-box-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 7px 12px;
+            background: rgba(0, 0, 0, 0.35);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            user-select: none;
+        }
+        .video-title {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.8px;
+            color: #66fcf1;
+            text-transform: uppercase;
+        }
+        .video-dot {
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: #2ea043;
+            box-shadow: 0 0 8px #2ea043;
+        }
+        .video-toggle-btn {
+            background: transparent;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #8b9bb4;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            padding: 2px 6px;
+            line-height: 1;
+            transition: all 0.2s;
+        }
+        .video-toggle-btn:hover {
+            color: #fff;
+            border-color: #66fcf1;
+        }
+        .video-content {
+            position: relative;
+            background: #000;
+            width: 100%;
+            line-height: 0;
+        }
+        #camera-stream {
+            width: 100%;
+            height: auto;
+            max-height: 240px;
+            object-fit: contain;
+            display: block;
+        }
+        .control-panel {
+            display: flex;
+            gap: 8px;
+            justify-content: flex-end;
+            width: 100%;
         }
         .icon-btn {
             background: rgba(20, 24, 33, 0.85);
@@ -1233,13 +1872,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
         <button class="btn" id="btn-test-stop" style="background-color: #ff4d4d; color: white; box-shadow: 0 0 10px rgba(255, 77, 77, 0.3); border-color: #ff4d4d; margin-bottom: 12px; font-size: 13px;">ЭКСТРЕННЫЙ СТОП</button>
 
+        <div class="section-title" style="margin-top: 15px;">Питание моторов (Ток)</div>
+        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; font-size: 12px;">
+                <span style="color: #8b9bb4;">Обмотки моторов:</span>
+                <span id="motor-power-badge" style="font-weight: 600; color: #2ecc71;">⚡ ПОД ТОКОМ (УДЕРЖАНИЕ)</span>
+            </div>
+            <div style="display: flex; gap: 8px;">
+                <button class="btn" id="btn-power-on" style="flex: 1; margin-bottom: 0; font-size: 12px; padding: 10px 4px; background-color: #2ecc71; color: white; border-color: #2ecc71; box-shadow: 0 0 10px rgba(46, 204, 113, 0.3);">⚡ Подать ток</button>
+                <button class="btn btn-secondary" id="btn-power-off" style="flex: 1; margin-bottom: 0; font-size: 12px; padding: 10px 4px; background-color: #34495e; color: #ecf0f1; border-color: #7f8c8d;">💤 Снять ток</button>
+            </div>
+            <div style="font-size: 11px; color: #8b9bb4; line-height: 1.3;">
+                Ток снимается автоматически через 2 секунды после последней команды или при финише маршрута.
+            </div>
+        </div>
+
         <div class="section-title" style="margin-top: 15px;">Автопилот (Маршруты)</div>
         <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px;">
-            <button class="btn btn-secondary" id="btn-draw-mode" style="margin-bottom: 0; font-size: 13px;">Режим рисования: ВЫКЛ</button>
-            <div style="display: flex; gap: 8px;">
-                <button class="btn" id="btn-start-plan" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0; background-color: #3498db; color: white; box-shadow: 0 0 10px rgba(52, 152, 219, 0.2); border-color: #3498db;">Приехать на старт</button>
-                <button class="btn btn-secondary" id="btn-clear-plan" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0;">Очистить</button>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; font-size: 12px;">
+                <span style="color: #8b9bb4;">Статус:</span>
+                <span id="route-status-badge" style="font-weight: 600; color: #45a29e;">ОЖИДАНИЕ</span>
             </div>
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 2px 4px; font-size: 11px; color: #8b9bb4;">
+                <span>Прогресс: <span id="route-progress-text" style="color: #fff; font-weight: 500;">0 / 0</span></span>
+                <span>Режим: <span id="tracking-mode-badge" style="color: #2ecc71; font-weight: 500;">ArUco Fusion</span></span>
+            </div>
+            
+            <button class="btn btn-secondary" id="btn-draw-mode" style="margin-bottom: 0; font-size: 13px;">✏️ Режим рисования: ВЫКЛ</button>
+            
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+                <button class="btn" id="btn-route-start" style="margin-bottom: 0; font-size: 13px; padding: 10px 4px; background-color: #2ecc71; color: white; box-shadow: 0 0 10px rgba(46, 204, 113, 0.3); border-color: #2ecc71;">▶ Старт</button>
+                <button class="btn btn-secondary" id="btn-route-pause" style="margin-bottom: 0; font-size: 13px; padding: 10px 4px; background-color: #f39c12; color: white; border-color: #f39c12;">⏸ Пауза</button>
+                <button class="btn btn-secondary" id="btn-route-stop" style="margin-bottom: 0; font-size: 13px; padding: 10px 4px; background-color: #e74c3c; color: white; border-color: #e74c3c;">⏹ Стоп</button>
+                <button class="btn btn-secondary" id="btn-clear-plan" style="margin-bottom: 0; font-size: 13px; padding: 10px 4px;">🗑 Очистить</button>
+            </div>
+            
+            <button class="btn btn-secondary" id="btn-return-home" style="margin-bottom: 0; font-size: 13px; padding: 9px 4px; background-color: #3498db; color: white; border-color: #3498db; box-shadow: 0 0 10px rgba(52, 152, 219, 0.25);">🎯 Приехать в ноль (0, 0)</button>
+            
             <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 8px; margin-top: 4px;">
                 <div class="calib-row" style="margin-bottom: 8px;">
                     <span class="stat-label" style="font-size: 11px;">Шаг точек (м):</span>
@@ -1256,15 +1925,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="calib-container">
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Look-ahead (м):</span>
-                <input type="number" id="input-look-ahead" class="calib-input" value="0.001" step="0.001" min="0.001" max="1.50" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-look-ahead" class="calib-input" value="0.15" step="0.01" min="0.01" max="1.50" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Макс. линейная (м/с):</span>
-                <input type="number" id="input-max-lin" class="calib-input" value="0.18" step="0.01" min="0.05" max="0.50" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-max-lin" class="calib-input" value="0.14" step="0.01" min="0.05" max="0.50" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Макс. угловая (рад/с):</span>
-                <input type="number" id="input-max-ang" class="calib-input" value="0.80" step="0.01" min="0.10" max="3.00" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-max-ang" class="calib-input" value="0.70" step="0.01" min="0.10" max="3.00" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Kp Линейный:</span>
@@ -1276,7 +1945,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Точность финиша (м):</span>
-                <input type="number" id="input-goal-tol" class="calib-input" value="0.01" step="0.01" min="0.01" max="0.50" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-goal-tol" class="calib-input" value="0.04" step="0.01" min="0.01" max="0.50" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Торможение (м):</span>
@@ -1284,15 +1953,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Мин. линейная (м/с):</span>
-                <input type="number" id="input-min-lin" class="calib-input" value="0.04" step="0.01" min="0.01" max="0.20" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-min-lin" class="calib-input" value="0.03" step="0.01" min="0.01" max="0.20" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Мертвая зона Yaw (м):</span>
-                <input type="number" id="input-yaw-deadzone" class="calib-input" value="0.02" step="0.01" min="0.01" max="0.30" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-yaw-deadzone" class="calib-input" value="0.05" step="0.01" min="0.01" max="0.30" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Точность точек (м):</span>
-                <input type="number" id="input-wp-tol" class="calib-input" value="0.01" step="0.01" min="0.00" max="0.50" style="font-size: 12px; padding: 2px 6px;">
+                <input type="number" id="input-wp-tol" class="calib-input" value="0.08" step="0.01" min="0.01" max="0.50" style="font-size: 12px; padding: 2px 6px;">
             </div>
             <div class="calib-row">
                 <span class="stat-label" style="font-size: 12px;">Торможение в повороте:</span>
@@ -1321,9 +1990,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div id="map-container">
-        <div class="control-panel">
-            <button class="icon-btn active" id="toggle-raw">Показать сырой путь</button>
-            <button class="icon-btn" id="toggle-grid">Сетка</button>
+        <div class="video-panel">
+            <div class="video-box" id="video-box">
+                <div class="video-box-header">
+                    <div class="video-title">
+                        <span class="video-dot"></span>
+                        Камера (ArUco)
+                    </div>
+                    <button class="video-toggle-btn" id="btn-toggle-cam" title="Свернуть / Развернуть">▼</button>
+                </div>
+                <div class="video-content" id="video-content">
+                    <img id="camera-stream" src="/video_feed" alt="Загрузка видео..." />
+                </div>
+            </div>
+            <div class="control-panel">
+                <button class="icon-btn active" id="toggle-raw">Показать сырой путь</button>
+                <button class="icon-btn" id="toggle-grid">Сетка</button>
+            </div>
         </div>
         <canvas id="map-canvas"></canvas>
     </div>
@@ -1756,6 +2439,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             draw();
         });
 
+        const btnToggleCam = document.getElementById('btn-toggle-cam');
+        const videoBox = document.getElementById('video-box');
+        if (btnToggleCam && videoBox) {
+            btnToggleCam.addEventListener('click', () => {
+                videoBox.classList.toggle('minimized');
+                btnToggleCam.textContent = videoBox.classList.contains('minimized') ? '▲' : '▼';
+            });
+        }
+
         function updateActiveTagsUI() {
             const container = document.getElementById('active-tags');
             if (activeTags.length === 0) {
@@ -1818,45 +2510,72 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     activeTags = data.detected_tags || [];
                     updateActiveTagsUI();
 
-                    // Обновляем состояние кнопки запуска автопилота
-                    updateAutopilotButton(data.follower_status);
+                    // Обновляем состояние автопилота и статуса
+                    updateRouteStatusUI(data);
 
                     if (autoCenter) {
                         centerMap();
                     }
                     draw();
+                } else if (data.type === 'route_status') {
+                    updateRouteStatusUI(data);
                 }
             };
         }
 
-        function updateAutopilotButton(status) {
-            const btn = document.getElementById('btn-start-plan');
-            if (!btn) return;
+        function updateRouteStatusUI(data) {
+            const badge = document.getElementById('route-status-badge');
+            const progress = document.getElementById('route-progress-text');
+            const modeBadge = document.getElementById('tracking-mode-badge');
+            const btnPause = document.getElementById('btn-route-pause');
             
-            if (status === 'pre_positioning') {
-                btn.textContent = "Еду на старт...";
-                btn.disabled = true;
-                btn.style.backgroundColor = "#e67e22";
-                btn.style.borderColor = "#e67e22";
-                btn.style.boxShadow = "0 0 10px rgba(230, 126, 34, 0.2)";
-            } else if (status === 'ready_to_work') {
-                btn.textContent = "Начать работу";
-                btn.disabled = false;
-                btn.style.backgroundColor = "#2ecc71";
-                btn.style.borderColor = "#2ecc71";
-                btn.style.boxShadow = "0 0 10px rgba(46, 204, 113, 0.2)";
-            } else if (status === 'tracking') {
-                btn.textContent = "Выполняется...";
-                btn.disabled = true;
-                btn.style.backgroundColor = "#9b59b6";
-                btn.style.borderColor = "#9b59b6";
-                btn.style.boxShadow = "0 0 10px rgba(155, 89, 182, 0.2)";
-            } else {
-                btn.textContent = "Приехать на старт";
-                btn.disabled = false;
-                btn.style.backgroundColor = "#3498db";
-                btn.style.borderColor = "#3498db";
-                btn.style.boxShadow = "0 0 10px rgba(52, 152, 219, 0.2)";
+            const rState = data.route_state || data.follower_status;
+            if (rState) {
+                if (badge) {
+                    if (rState === 'running' || rState === 'tracking' || rState === 'pre_positioning') {
+                        badge.textContent = "В ДВИЖЕНИИ";
+                        badge.style.color = "#2ecc71";
+                    } else if (rState === 'paused') {
+                        badge.textContent = "НА ПАУЗЕ";
+                        badge.style.color = "#f39c12";
+                    } else if (rState === 'finished') {
+                        badge.textContent = "ФИНИШ";
+                        badge.style.color = "#3498db";
+                    } else {
+                        badge.textContent = "ОЖИДАНИЕ";
+                        badge.style.color = "#8b9bb4";
+                    }
+                }
+                if (btnPause) {
+                    btnPause.textContent = (rState === 'paused') ? "▶ Продолжить" : "⏸ Пауза";
+                    btnPause.style.backgroundColor = (rState === 'paused') ? "#2ecc71" : "#f39c12";
+                    btnPause.style.borderColor = (rState === 'paused') ? "#2ecc71" : "#f39c12";
+                }
+            }
+            if (progress && data.total_wps !== undefined) {
+                const cur = (data.total_wps > 0 && data.current_wp !== undefined) ? (data.current_wp + 1) : 0;
+                progress.textContent = `${cur} / ${data.total_wps}`;
+            }
+            if (modeBadge && data.tracking_mode) {
+                if (data.tracking_mode === 'aruco_fused') {
+                    modeBadge.textContent = "ArUco Fusion";
+                    modeBadge.style.color = "#2ecc71";
+                } else {
+                    modeBadge.textContent = "Dead Reckoning";
+                    modeBadge.style.color = "#f39c12";
+                }
+            }
+            if (data.motor_power) {
+                const pBadge = document.getElementById('motor-power-badge');
+                if (pBadge) {
+                    if (data.motor_power === 'enabled') {
+                        pBadge.textContent = "⚡ ПОД ТОКОМ (УДЕРЖАНИЕ)";
+                        pBadge.style.color = "#2ecc71";
+                    } else {
+                        pBadge.textContent = "💤 ТОК СНЯТ (СВОБОДНЫЙ ВАЛ)";
+                        pBadge.style.color = "#8b9bb4";
+                    }
+                }
             }
         }
 
@@ -1903,6 +2622,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         btnTestRotate.addEventListener('click', () => triggerTestDrive('rotate', 'Тест движения: поворот на 360°'));
         btnTestStop.addEventListener('click', () => triggerTestDrive('stop', 'ЭКСТРЕННАЯ ОСТАНОВКА'));
 
+        // Управление питанием моторов (снятие и подача тока на обмотки)
+        const btnPowerOn = document.getElementById('btn-power-on');
+        const btnPowerOff = document.getElementById('btn-power-off');
+        if (btnPowerOn) {
+            btnPowerOn.addEventListener('click', () => {
+                fetch('/set_motor_power?state=enable')
+                    .then(res => res.json())
+                    .then(data => {
+                        const pBadge = document.getElementById('motor-power-badge');
+                        if (pBadge) {
+                            pBadge.textContent = "⚡ ПОД ТОКОМ (УДЕРЖАНИЕ)";
+                            pBadge.style.color = "#2ecc71";
+                        }
+                        addLog("⚡ Ток подан на обмотки моторов (удержание активно).");
+                    })
+                    .catch(err => addLog("Сеть: Ошибка подачи тока на моторы."));
+            });
+        }
+        if (btnPowerOff) {
+            btnPowerOff.addEventListener('click', () => {
+                fetch('/set_motor_power?state=disable')
+                    .then(res => res.json())
+                    .then(data => {
+                        const pBadge = document.getElementById('motor-power-badge');
+                        if (pBadge) {
+                            pBadge.textContent = "💤 ТОК СНЯТ (СВОБОДНЫЙ ВАЛ)";
+                            pBadge.style.color = "#8b9bb4";
+                        }
+                        addLog("💤 Ток с обмоток снят (валы свободны, охлаждение).");
+                    })
+                    .catch(err => addLog("Сеть: Ошибка снятия тока с моторов."));
+            });
+        }
+
         // Переменные автопилота
         let drawMode = false;
         let plannedPath = [];
@@ -1910,12 +2663,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let dragStartY = 0;
         
         const btnDrawMode = document.getElementById('btn-draw-mode');
-        const btnStartPlan = document.getElementById('btn-start-plan');
+        const btnRouteStart = document.getElementById('btn-route-start');
+        const btnRoutePause = document.getElementById('btn-route-pause');
+        const btnRouteStop = document.getElementById('btn-route-stop');
         const btnClearPlan = document.getElementById('btn-clear-plan');
+        const btnReturnHome = document.getElementById('btn-return-home');
         
         btnDrawMode.addEventListener('click', () => {
             drawMode = !drawMode;
-            btnDrawMode.textContent = drawMode ? "Режим рисования: ВКЛ" : "Режим рисования: ВЫКЛ";
+            btnDrawMode.textContent = drawMode ? "✏️ Режим рисования: ВКЛ" : "✏️ Режим рисования: ВЫКЛ";
             btnDrawMode.style.borderColor = drawMode ? "#66fcf1" : "rgba(255, 255, 255, 0.1)";
             btnDrawMode.style.color = drawMode ? "#66fcf1" : "#c5c6c7";
             if (drawMode) {
@@ -1943,26 +2699,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             draw();
         });
 
-        btnStartPlan.addEventListener('click', () => {
+        btnRouteStart.addEventListener('click', () => {
             if (plannedPath.length === 0) {
-                addLog("Ошибка: Сначала нарисуйте маршрут!");
+                addLog("⚠️ Сначала нарисуйте маршрут!");
                 return;
             }
             
-            if (btnStartPlan.textContent === "Начать работу") {
-                fetch(`/start_work`)
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.status === 'success') {
-                            addLog("Автопилот: Работа начата!");
-                        } else {
-                            addLog("Ошибка начала работы.");
-                        }
-                    })
-                    .catch(err => {
-                        addLog("Сеть: Ошибка отправки сигнала старта.");
-                    });
-                return;
+            if (drawMode) {
+                drawMode = false;
+                btnDrawMode.textContent = "✏️ Режим рисования: ВЫКЛ";
+                btnDrawMode.style.borderColor = "rgba(255, 255, 255, 0.1)";
+                btnDrawMode.style.color = "#c5c6c7";
+                canvas.style.cursor = 'grab';
             }
             
             // Автоматически отправляем текущие параметры из полей ввода перед стартом
@@ -1979,37 +2727,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const turnDecel = parseFloat(inputTurnDecel.value);
             
             fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
-                .then(res => res.json())
-                .then(data => {
-                    if (data.status === 'success') {
-                        addLog("Автопилот: Параметры синхронизированы.");
-                    }
-                })
-                .catch(err => {
-                    console.error("Ошибка авто-синхронизации параметров:", err);
-                });
+                .catch(err => console.error("Error setting follower params:", err));
             
             const ptsStr = plannedPath.map(pt => `${pt.x.toFixed(3)},${pt.y.toFixed(3)}`).join(';');
             fetch(`/set_path?points=${ptsStr}`)
                 .then(res => res.json())
                 .then(data => {
-                    if (data.status === 'success') {
-                        addLog("Автопилот: Маршрут отправлен, едем на старт!");
-                    } else {
-                        addLog("Ошибка отправки маршрута.");
-                    }
+                    fetch(`/start_route`)
+                        .then(r => r.json())
+                        .then(resData => {
+                            addLog("▶ Автопилот запущен. Робот начинает движение по маршруту!");
+                        });
                 })
                 .catch(err => {
-                    addLog("Сеть: Ошибка отправки маршрута.");
+                    addLog("Сеть: Ошибка запуска маршрута.");
                 });
+        });
+
+        btnRoutePause.addEventListener('click', () => {
+            fetch('/pause_route')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.route_state === 'paused') {
+                        addLog("⏸ Автопилот на паузе.");
+                    } else if (data.route_state === 'running') {
+                        addLog("▶ Движение возобновлено.");
+                    }
+                })
+                .catch(err => addLog("Сеть: Ошибка переключения паузы."));
+        });
+
+        btnRouteStop.addEventListener('click', () => {
+            fetch('/stop_route')
+                .then(res => res.json())
+                .then(data => {
+                    addLog("⏹ Автопилот остановлен, маршрут сброшен.");
+                })
+                .catch(err => addLog("Сеть: Ошибка остановки маршрута."));
         });
         
         btnClearPlan.addEventListener('click', () => {
             plannedPath = [];
-            fetch(`/set_path?points=`)
+            fetch(`/clear_waypoints`)
                 .then(res => res.json())
                 .then(data => {
-                    addLog("Автопилот: Маршрут очищен.");
+                    addLog("🗑 Маршрут и путевые точки очищены.");
                     draw();
                 })
                 .catch(err => {
@@ -2017,6 +2779,54 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     draw();
                 });
         });
+
+        if (btnReturnHome) {
+            btnReturnHome.addEventListener('click', () => {
+                if (drawMode) {
+                    drawMode = false;
+                    btnDrawMode.textContent = "✏️ Режим рисования: ВЫКЛ";
+                    btnDrawMode.style.borderColor = "rgba(255, 255, 255, 0.1)";
+                    btnDrawMode.style.color = "#c5c6c7";
+                    canvas.style.cursor = 'grab';
+                }
+                
+                // Автоматически отправляем текущие параметры из полей ввода
+                const lookAhead = parseFloat(inputLookAhead.value);
+                const maxLin = parseFloat(inputMaxLin.value);
+                const maxAng = parseFloat(inputMaxAng.value);
+                const kpLin = parseFloat(inputKpLin.value);
+                const kpAng = parseFloat(inputKpAng.value);
+                const goalTol = parseFloat(inputGoalTol.value);
+                const decelDist = parseFloat(inputDecelDist.value);
+                const minLin = parseFloat(inputMinLin.value);
+                const yawDeadzone = parseFloat(inputYawDeadzone.value);
+                const wpTol = parseFloat(inputWpTol.value);
+                const turnDecel = parseFloat(inputTurnDecel.value);
+                
+                fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
+                    .catch(err => console.error("Error setting follower params:", err));
+
+                const rx = robotPos.x;
+                const ry = robotPos.y;
+                const dist = Math.sqrt(rx * rx + ry * ry);
+                const numPts = Math.max(3, Math.ceil(dist / 0.05));
+                plannedPath = [];
+                for (let i = 0; i <= numPts; i++) {
+                    const t = i / numPts;
+                    plannedPath.push({ x: rx * (1.0 - t), y: ry * (1.0 - t) });
+                }
+                draw();
+                addLog(`🎯 Возврат в (0,0): дистанция ${dist.toFixed(2)}м (${plannedPath.length} точек).`);
+                
+                const ptsStr = plannedPath.map(pt => `${pt.x.toFixed(3)},${pt.y.toFixed(3)}`).join(';');
+                fetch(`/set_path?points=${ptsStr}`)
+                    .then(res => res.json())
+                    .then(() => fetch('/start_route'))
+                    .then(r => r.json())
+                    .then(() => addLog("▶ Автопилот запущен для возврата в ноль!"))
+                    .catch(err => addLog("Сеть: Ошибка отправки маршрута возврата в ноль."));
+            });
+        }
 
         // Генерация тестовых контуров
         const btnGenSquare = document.getElementById('btn-gen-square');
@@ -2151,10 +2961,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             jHandle.style.transform = `translate(${dx}px, ${dy}px)`;
             
-            // Y-axis drag corresponds to Vx (forward/backward)
-            // X-axis drag corresponds to Vy (sideways)
-            targetVx = -(dy / jMaxDist) * 0.20; // max speed 0.20 m/s
-            targetVy = -(dx / jMaxDist) * 0.20; // right is negative Vy
+            // Y-axis drag corresponds to forward/backward (dy < 0 is UP / Forward)
+            // X-axis drag corresponds to strafe (dx > 0 is RIGHT / Strafe Right)
+            targetVx = -(dy / jMaxDist) * 0.15; // max safe speed 0.15 m/s
+            targetVy = (dx / jMaxDist) * 0.15;  // right is positive Vy
         };
         
         const resetJoystick = () => {
@@ -2162,12 +2972,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             jHandle.style.transform = 'translate(0px, 0px)';
             targetVx = 0;
             targetVy = 0;
+            targetW = 0;
             sendDriveCommand();
         };
         
         jBase.addEventListener('mousedown', (e) => {
             jActive = true;
             updateJoystick(e.clientX, e.clientY);
+            sendDriveCommand();
         });
         
         window.addEventListener('mousemove', (e) => {
@@ -2183,8 +2995,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         });
         
         jBase.addEventListener('touchstart', (e) => {
+            e.preventDefault();
             jActive = true;
             updateJoystick(e.touches[0].clientX, e.touches[0].clientY);
+            sendDriveCommand();
         });
         
         window.addEventListener('touchmove', (e) => {
@@ -2200,7 +3014,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         });
 
         const startRotate = (dir) => {
-            targetW = dir * 0.7; // rad/s
+            targetW = dir * 0.6; // rad/s
             sendDriveCommand();
         };
         
@@ -2223,6 +3037,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         btnRotCW.addEventListener('touchstart', (e) => { e.preventDefault(); startRotate(-1.0); });
         btnRotCW.addEventListener('touchend', stopRotate);
 
+        // Управление с клавиатуры (WASD / QE / Пробел)
+        let keyActive = false;
+        window.addEventListener('keydown', (e) => {
+            if (['input', 'textarea'].includes(document.activeElement.tagName.toLowerCase())) return;
+            let changed = false;
+            if (e.key === 'w' || e.key === 'W' || e.key === 'ArrowUp') { targetVx = 0.15; changed = true; keyActive = true; }
+            else if (e.key === 's' || e.key === 'S' || e.key === 'ArrowDown') { targetVx = -0.15; changed = true; keyActive = true; }
+            else if (e.key === 'd' || e.key === 'D' || e.key === 'ArrowRight') { targetVy = 0.15; changed = true; keyActive = true; }
+            else if (e.key === 'a' || e.key === 'A' || e.key === 'ArrowLeft') { targetVy = -0.15; changed = true; keyActive = true; }
+            else if (e.key === 'q' || e.key === 'Q') { targetW = 0.6; changed = true; keyActive = true; }
+            else if (e.key === 'e' || e.key === 'E') { targetW = -0.6; changed = true; keyActive = true; }
+            else if (e.key === ' ' || e.key === 'Escape') {
+                targetVx = 0; targetVy = 0; targetW = 0; keyActive = false; resetJoystick(); changed = true;
+            }
+            if (changed) sendDriveCommand();
+        });
+
+        window.addEventListener('keyup', (e) => {
+            if (['input', 'textarea'].includes(document.activeElement.tagName.toLowerCase())) return;
+            let stopped = false;
+            if (['w', 'W', 's', 'S', 'ArrowUp', 'ArrowDown'].includes(e.key)) { targetVx = 0; stopped = true; }
+            if (['a', 'A', 'd', 'D', 'ArrowLeft', 'ArrowRight'].includes(e.key)) { targetVy = 0; stopped = true; }
+            if (['q', 'Q', 'e', 'E'].includes(e.key)) { targetW = 0; stopped = true; }
+            if (targetVx === 0 && targetVy === 0 && targetW === 0) keyActive = false;
+            if (stopped) sendDriveCommand();
+        });
+
         const sendDriveCommand = () => {
             fetch(`/drive?vx=${targetVx.toFixed(3)}&vy=${targetVy.toFixed(3)}&w=${targetW.toFixed(3)}`)
                 .catch(err => console.error("Error sending drive command", err));
@@ -2230,7 +3071,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         // Цикл отправки команд ручного управления на частоте 10 Гц
         setInterval(() => {
-            if (jActive || targetW !== 0) {
+            if (jActive || keyActive || targetW !== 0) {
                 sendDriveCommand();
             }
         }, 100);

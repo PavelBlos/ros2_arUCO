@@ -4,3 +4,10 @@ log/
 .vscode/
 __pycache__/
 *.pyc
+
+# Local ESP32 artifacts
+firmware/**/build/
+*.bin
+*.elf
+*.map
+
