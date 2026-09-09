@@ -1,15 +1,10 @@
-#!/usr/bin/env python3
-"""
-Deploy Termit Omni Robot Files to Raspberry Pi
-===============================================
-Скрипт синхронизации файлов проекта с Raspberry Pi по SSH/SFTP.
-"""
-
 import os
 import sys
 import time
 import socket
 import logging
+import hashlib
+import subprocess
 import paramiko
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
@@ -21,16 +16,14 @@ if hasattr(sys.stderr, 'reconfigure'):
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-FILES_TO_DEPLOY = [
-    'localization_node_remote.py',
-    'termit_api.py',
-    'termit_ros2_node.py',
-    'video_tag_detector_remote.py',
-    'example_api_usage.py',
-    'web_pult.py',
-    'start_termit.sh',
-    'test_cam.py'
-]
+REQUIRED_FILES = {
+    'localization_node.py': os.path.join(PROJECT_DIR, 'src', 'fake_tag_publisher', 'fake_tag_publisher', 'localization_node.py'),
+    'video_tag_detector.py': os.path.join(PROJECT_DIR, 'src', 'fake_tag_publisher', 'fake_tag_publisher', 'video_tag_detector.py'),
+    'termit_api.py': os.path.join(PROJECT_DIR, 'src', 'fake_tag_publisher', 'fake_tag_publisher', 'termit_api.py'),
+    'start_termit.sh': os.path.join(PROJECT_DIR, 'start_termit.sh'),
+    'tags_config.yaml': os.path.join(PROJECT_DIR, 'tags_config.yaml'),
+    'test_cam.py': os.path.join(PROJECT_DIR, 'test_cam.py')
+}
 
 CANDIDATE_HOSTS = [
     '192.168.10.163',
@@ -60,11 +53,11 @@ def scan_port(host, port=22, timeout=0.8):
     except Exception:
         return False
 
-def try_connect(host, user, pwd, timeout=10.0):
+def try_connect(host, user, pwd, timeout=5.0):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(host, port=22, username=user, password=pwd, timeout=timeout, banner_timeout=15.0, auth_timeout=15.0)
+        ssh.connect(host, port=22, username=user, password=pwd, timeout=timeout, banner_timeout=5.0)
         return ssh
     except Exception:
         return None
@@ -88,111 +81,145 @@ def find_active_ssh(target_host=None, target_user=None, target_pass=None):
 
     return None, None, None
 
+def get_git_commit():
+    try:
+        res = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd=PROJECT_DIR)
+        return res.decode().strip()
+    except Exception:
+        return "unknown"
+
+def calc_sha256(filepath):
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(8192):
+            h.update(chunk)
+    return h.hexdigest()
+
 def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False):
     print("=" * 65)
-    print("🚀 СИНХРОНИЗАЦИЯ ФАЙЛОВ С RASPBERRY PI")
+    print("🚀 АТОМАРНЫЙ ДЕПЛОЙ И СИНХРОНИЗАЦИЯ С RASPBERRY PI")
     print("=" * 65)
     
-    ssh = None
-    host = None
-    user = None
+    # 1. Проверка наличия всех обязательных локальных файлов
+    missing = []
+    local_hashes = {}
+    for name, path in REQUIRED_FILES.items():
+        if not os.path.exists(path):
+            missing.append(f"{name} ({path})")
+        else:
+            local_hashes[name] = calc_sha256(path)
+            
+    if missing:
+        print("\n❌ КРИТИЧЕСКАЯ ОШИБКА: отсутствуют обязательные файлы:")
+        for m in missing:
+            print(f"  - {m}")
+        sys.exit(1)
 
-    if wait_loop:
-        print("⏳ Ожидание появления Raspberry Pi в сети (Ctrl+C для отмены)...")
-        while not ssh:
-            ssh, host, user = find_active_ssh(target_host, target_user, target_pass)
-            if not ssh:
-                time.sleep(2.0)
-    else:
-        ssh, host, user = find_active_ssh(target_host, target_user, target_pass)
+    print("✅ Все локальные файлы проверены (sha256 рассчитаны)")
 
+    ssh, host, user = find_active_ssh(target_host, target_user, target_pass)
     if not ssh:
         print("\n❌ Малина сейчас не в сети или не отвечает по SSH.")
-        print("\n💡 Как передать файлы:")
-        print("1. Включите питание Raspberry Pi и подключите её к Wi-Fi / Точке доступа / Tailscale.")
-        print("2. Если известен IP-адрес, запустите:")
-        print("     python deploy_to_pi.py <IP_МАЛИНЫ> [USER] [PASSWORD]")
-        print("   Пример: python deploy_to_pi.py 192.168.1.100 raspberry pi")
-        print("3. Или запустите режим ожидания подключения:")
-        print("     python deploy_to_pi.py --wait")
         return False
 
     try:
         sftp = ssh.open_sftp()
-        remote_dir = f"/home/{user}/arUco_termit"
+        commit_hash = get_git_commit()
+        timestamp = int(time.time())
+        release_tag = f"release-{timestamp}-{commit_hash}"
+        base_dir = f"/home/{user}/arUco_termit"
+        releases_dir = f"{base_dir}/releases"
+        target_rel_dir = f"{releases_dir}/{release_tag}"
+        current_symlink = f"{base_dir}/current"
+        shared_config_dir = f"{base_dir}/shared_config"
 
-        # Создание каталога при необходимости
-        try:
-            sftp.stat(remote_dir)
-        except FileNotFoundError:
-            print(f"📁 Создание каталога на Малине: {remote_dir}")
-            ssh.exec_command(f"mkdir -p {remote_dir}")
-            time.sleep(0.5)
+        # Создаем необходимые директории на Малине
+        for d in [base_dir, releases_dir, target_rel_dir, shared_config_dir]:
+            ssh.exec_command(f"mkdir -p {d}")
+        time.sleep(0.3)
 
-        print(f"\n📤 Передача файлов в {remote_dir} на {host}...")
-        for filename in FILES_TO_DEPLOY:
-            local_path = os.path.join(PROJECT_DIR, filename)
-            if not os.path.exists(local_path):
-                continue
-            
-            remote_path = f"{remote_dir}/{filename}"
-            print(f"  -> Отправка {filename} ... ", end="", flush=True)
-            sftp.put(local_path, remote_path)
-            if filename.endswith('.py'):
-                ssh.exec_command(f"chmod +x {remote_path}")
-            print("✅ OK")
-
-        # Проверяем наличие пакета ROS 2 fake_tag_publisher
-        stdin, stdout, stderr = ssh.exec_command("find /home/raspberry/ros2_ws/src -type d -name fake_tag_publisher 2>/dev/null")
-        ros_dirs = [d.strip() for d in stdout.read().decode().splitlines() if d.strip()]
+        print(f"\n📦 Подготовка нового релиза: {release_tag}")
         
-        target_pkg_dir = "/home/raspberry/ros2_ws/src/fake_tag_publisher/fake_tag_publisher"
-        print(f"\n📦 Обновляем файлы в пакете ROS 2 ({target_pkg_dir}):")
-        
-        # localization_node.py
-        local_loc = os.path.join(PROJECT_DIR, 'localization_node_remote.py')
-        if os.path.exists(local_loc):
-            sftp.put(local_loc, f"{target_pkg_dir}/localization_node.py")
-            ssh.exec_command(f"chmod +x {target_pkg_dir}/localization_node.py")
-            print(f"  -> localization_node.py обновлен в ROS 2 ✅")
+        # 2. Загрузка файлов во временные имена (*.tmp) внутри релиза
+        for name, local_path in REQUIRED_FILES.items():
+            tmp_remote = f"{target_rel_dir}/{name}.tmp"
+            final_remote = f"{target_rel_dir}/{name}"
+            print(f"  -> Передача {name} ... ", end="", flush=True)
+            sftp.put(local_path, tmp_remote)
+            # Переименование в релизной директории
+            ssh.exec_command(f"mv {tmp_remote} {final_remote}")
+            if name.endswith('.py') or name.endswith('.sh'):
+                ssh.exec_command(f"chmod +x {final_remote}")
+            print("OK")
 
-        # video_tag_detector.py
-        local_vid = os.path.join(PROJECT_DIR, 'video_tag_detector_remote.py')
-        if os.path.exists(local_vid):
-            sftp.put(local_vid, f"{target_pkg_dir}/video_tag_detector.py")
-            ssh.exec_command(f"chmod +x {target_pkg_dir}/video_tag_detector.py")
-            print(f"  -> video_tag_detector.py обновлен в ROS 2 ✅")
-            
-        # termit_api.py & termit_ros2_node.py
-        for fn in ['termit_api.py', 'termit_ros2_node.py', 'example_api_usage.py']:
-            lp = os.path.join(PROJECT_DIR, fn)
-            if os.path.exists(lp):
-                sftp.put(lp, f"{target_pkg_dir}/{fn}")
-                ssh.exec_command(f"chmod +x {target_pkg_dir}/{fn}")
-                print(f"  -> {fn} обновлен в ROS 2 ✅")
+        # 3. Синтаксическая проверка py_compile на Raspberry Pi
+        print("\n🔍 Валидация синтаксиса Python на Raspberry Pi...")
+        stdin, stdout, stderr = ssh.exec_command(f"python3 -m py_compile {target_rel_dir}/*.py")
+        compile_err = stderr.read().decode().strip()
+        if compile_err:
+            print(f"❌ Ошибка компиляции на Малине: {compile_err}")
+            print("Откат: релиз не активирован!")
+            sftp.close()
+            ssh.close()
+            return False
+        print("✅ Все Python-модули успешно скомпилированы без ошибок")
 
-        # tags_config.yaml
-        local_tags = os.path.join(PROJECT_DIR, 'tags_config.yaml')
-        if os.path.exists(local_tags):
-            for t_dir in [
-                "/home/raspberry/ros2_ws/src/fake_tag_publisher/config",
-                "/home/raspberry/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config"
-            ]:
-                try:
-                    sftp.put(local_tags, f"{t_dir}/tags_config.yaml")
-                    print(f"  -> tags_config.yaml обновлен в {t_dir} ✅")
-                except Exception as e:
-                    print(f"  -> Ошибка обновления tags_config.yaml в {t_dir}: {e}")
+        # 4. Атомарное переключение симлинка current
+        print(f"\n🔗 Атомарное переключение симлинка: current -> {release_tag}")
+        ssh.exec_command(f"ln -sfn {target_rel_dir} {current_symlink}")
+
+        # 5. Синхронизация постоянного каталога arUco_termit и ROS 2 share
+        print("\n🔄 Синхронизация с постоянными путями ROS 2...")
+        # Копируем в корень arUco_termit
+        for name, local_path in REQUIRED_FILES.items():
+            sftp.put(local_path, f"{base_dir}/{name}")
+            if name.endswith('.py') or name.endswith('.sh'):
+                ssh.exec_command(f"chmod +x {base_dir}/{name}")
+
+        # Копируем в ros2_ws/src
+        ros2_pkg_dir = f"/home/{user}/ros2_ws/src/fake_tag_publisher/fake_tag_publisher"
+        ssh.exec_command(f"mkdir -p {ros2_pkg_dir}")
+        for name in ['localization_node.py', 'video_tag_detector.py', 'termit_api.py']:
+            local_path = REQUIRED_FILES[name]
+            sftp.put(local_path, f"{ros2_pkg_dir}/{name}")
+            ssh.exec_command(f"chmod +x {ros2_pkg_dir}/{name}")
+
+        # Копируем tags_config.yaml в share
+        ros2_share_cfg = f"/home/{user}/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config"
+        ssh.exec_command(f"mkdir -p {ros2_share_cfg}")
+        sftp.put(REQUIRED_FILES['tags_config.yaml'], f"{ros2_share_cfg}/tags_config.yaml")
+        sftp.put(REQUIRED_FILES['tags_config.yaml'], f"{shared_config_dir}/tags_config.yaml")
+
+        # 6. Проверка контрольных сумм sha256 на Малине
+        print("\n🔒 Проверка SHA256 контрольных сумм...")
+        stdin, stdout, stderr = ssh.exec_command(f"sha256sum {current_symlink}/*")
+        remote_hashes = stdout.read().decode().splitlines()
+        all_match = True
+        for line in remote_hashes:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                r_hash = parts[0]
+                r_name = os.path.basename(parts[1])
+                if r_name in local_hashes:
+                    if local_hashes[r_name] == r_hash:
+                        print(f"  - {r_name}: SHA256 совпадает ✅")
+                    else:
+                        print(f"  - {r_name}: ХЭШ НЕ СОВПАДАЕТ ❌ ({local_hashes[r_name][:8]} vs {r_hash[:8]})")
+                        all_match = False
 
         sftp.close()
         ssh.close()
-        
-        print("\n" + "=" * 65)
-        print(f"🎉 ВСЕ ФАЙЛЫ УСПЕШНО ЗАГРУЖЕНЫ НА RASPBERRY PI ({host})!")
-        print(f"Для запуска выполните по SSH:")
-        print(f"  python3 {remote_dir}/localization_node_remote.py")
-        print("=" * 65)
-        return True
+
+        if all_match:
+            print("\n" + "=" * 65)
+            print(f"🎉 РЕЛИЗ {release_tag} УСПЕШНО АКТИВИРОВАН!")
+            print(f"Активный путь: {current_symlink}")
+            print(f"Запуск: python pi_exec.py 'nohup bash {current_symlink}/start_termit.sh > /tmp/termit_start.log 2>&1 < /dev/null &'")
+            print("=" * 65)
+            return True
+        else:
+            print("\n⚠️ Предупреждение: не все хэши совпали.")
+            return False
 
     except Exception as e:
         print(f"❌ Ошибка во время передачи: {e}")
@@ -207,3 +234,4 @@ if __name__ == '__main__':
     user_arg = args[1] if len(args) > 1 else None
     pass_arg = args[2] if len(args) > 2 else None
     deploy(host_arg, user_arg, pass_arg, wait_loop=wait_flag)
+

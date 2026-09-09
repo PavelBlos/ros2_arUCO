@@ -137,6 +137,17 @@ class LocalizationNode(Node):
         # Таймер автоматического снятия тока с обмоток при отсутствии команд 2 секунды (5 Гц)
         self.power_watchdog_timer = self.create_timer(0.2, self.check_motor_power_watchdog)
 
+        # Телеметрия и мониторинг свежести данных
+        self.last_esp32_odom_time = 0.0
+        self.last_pose_publish_time = 0.0
+        self.git_commit = "5729a2e"
+        
+        # Журнал забегов (Run Logger в JSONL)
+        self.run_logger_lock = threading.Lock()
+        self.active_log_file = None
+        self.active_run_id = None
+        self.active_log_path = None
+
         # Аппаратное подключение к ESP32 для прямого управления моторами
         self.robot = None
         self.init_robot_api()
@@ -147,15 +158,90 @@ class LocalizationNode(Node):
 
         self.get_logger().info('Localization node started successfully (Multi-tag Data Fusion + ESP32 API + Autopilot Engine)')
 
+    def start_run_logging(self, run_id=None):
+        with self.run_logger_lock:
+            if self.active_log_file:
+                try:
+                    self.active_log_file.close()
+                except Exception:
+                    pass
+            if not run_id:
+                run_id = f"run_{int(time.time())}"
+            self.active_run_id = run_id
+            log_dir = "/home/raspberry/arUco_termit/logs"
+            os.makedirs(log_dir, exist_ok=True)
+            self.active_log_path = os.path.join(log_dir, f"{run_id}.jsonl")
+            self.active_log_file = open(self.active_log_path, "a", encoding="utf-8")
+            self.get_logger().info(f"📝 Запись лога забега активна: {self.active_log_path}")
+            return self.active_run_id
+
+    def stop_run_logging(self):
+        with self.run_logger_lock:
+            if self.active_log_file:
+                try:
+                    self.active_log_file.flush()
+                    self.active_log_file.close()
+                except Exception:
+                    pass
+                p = self.active_log_path
+                self.active_log_file = None
+                self.get_logger().info(f"💾 Лог забега сохранен: {p}")
+                return p
+            return None
+
+    def log_record(self, rec: dict):
+        with self.run_logger_lock:
+            if self.active_log_file:
+                try:
+                    self.active_log_file.write(json.dumps(rec) + "\n")
+                    self.active_log_file.flush()
+                except Exception:
+                    pass
+
+    def clear_trajectory_history(self):
+        self.raw_trajectory_x.clear()
+        self.raw_trajectory_y.clear()
+        self.raw_trajectory_z.clear()
+        self.filtered_trajectory_x.clear()
+        self.filtered_trajectory_y.clear()
+        self.filtered_trajectory_z.clear()
+        self.trajectory_timestamps.clear()
+        self.raw_path_length = 0.0
+        self.filtered_path_length = 0.0
+        self.notify_ui_event()
+        self.get_logger().info("🧹 История траекторий на сервере очищена.")
+
     def load_tags_config(self):
         try:
-            share_dir = get_package_share_directory('fake_tag_publisher')
-            config_path = os.path.join(share_dir, 'config', 'tags_config.yaml')
-            
-            with open(config_path, 'r') as f:
+            curr_dir = os.path.dirname(os.path.abspath(__file__))
+            cand_paths = [
+                '/home/raspberry/arUco_termit/shared_config/tags_config.yaml',
+                os.path.join(curr_dir, 'tags_config.yaml'),
+                os.path.join(curr_dir, '..', '..', '..', 'tags_config.yaml'),
+                os.path.join(curr_dir, 'config', 'tags_config.yaml'),
+                os.path.join(curr_dir, '..', 'config', 'tags_config.yaml'),
+            ]
+            try:
+                share_dir = get_package_share_directory('fake_tag_publisher')
+                cand_paths.append(os.path.join(share_dir, 'config', 'tags_config.yaml'))
+            except Exception:
+                pass
+
+            config_path = None
+            for p in cand_paths:
+                if os.path.exists(p):
+                    config_path = os.path.abspath(p)
+                    break
+
+            if not config_path:
+                self.get_logger().error("tags_config.yaml not found!")
+                return
+
+            with open(config_path, 'r', encoding='utf-8') as f:
                 config_data = yaml.safe_load(f)
-                self.tags_db = config_data.get('tags', {})
-                self.get_logger().info(f"Loaded {len(self.tags_db)} ceiling tags from config.")
+                all_tags = config_data.get('tags', {})
+                self.tags_db = {k: v for k, v in all_tags.items() if v.get('enabled', True)}
+                self.get_logger().info(f"Loaded {len(self.tags_db)} enabled tags from {config_path} (out of {len(all_tags)} total).")
         except Exception as e:
             self.get_logger().error(f"Failed to load config: {str(e)}")
 
@@ -356,9 +442,16 @@ class LocalizationNode(Node):
                 max_wheel_accel_steps=1600.0
             )
             self.robot = TermitRobotAPI(config)
+            hardware_by_id = '/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0'
             ports = self.robot.list_available_ports()
-            if ports:
+            if os.path.exists(hardware_by_id):
+                port = hardware_by_id
+            elif ports:
                 port = '/dev/ttyUSB0' if '/dev/ttyUSB0' in ports else ports[0]
+            else:
+                port = None
+
+            if port:
                 self.get_logger().info(f"Connecting TermitRobotAPI to ESP32 on {port}...")
                 self.robot.connect(port=port)
                 self.robot.set_holding_mode(HoldMode.CONTINUOUS_HOLD)
@@ -372,6 +465,7 @@ class LocalizationNode(Node):
 
     def on_esp32_odometry(self, odom):
         """Коллбэк прямой одометрии шаговых двигателей от TermitRobotAPI (20-50 Гц)"""
+        self.last_esp32_odom_time = time.time()
         now = self.get_clock().now()
         dt = 0.04
         
@@ -675,6 +769,23 @@ class LocalizationNode(Node):
 
             self.drive_robot(smooth_forward, smooth_strafe, smooth_w)
 
+            rec = {
+                "t": t_loop_start,
+                "run_id": self.active_run_id,
+                "wp_idx": int(self.current_wp_idx),
+                "rx": round(rx, 4),
+                "ry": round(ry, 4),
+                "ryaw": round(ryaw, 4),
+                "tx": round(tx, 4),
+                "ty": round(ty, 4),
+                "dist_finish": round(dist_to_finish, 4),
+                "cmd_fwd": round(smooth_forward, 4),
+                "cmd_strafe": round(smooth_strafe, 4),
+                "cmd_w": round(smooth_w, 4),
+                "mode": self.tracking_mode
+            }
+            self.log_record(rec)
+
             elapsed = pytime.time() - t_loop_start
             pytime.sleep(max(0.01, 0.05 - elapsed))
             
@@ -855,6 +966,7 @@ class LocalizationNode(Node):
         self.publish_fused_pose(now.to_msg())
 
     def publish_fused_pose(self, stamp):
+        self.last_pose_publish_time = time.time()
         if not self.fused_initialized:
             return
             
@@ -1355,6 +1467,63 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps({"connected": connected, "port": port_str}).encode('utf-8'))
+
+        elif self.path.startswith('/api/health'):
+            now_t = time.time()
+            connected = bool(self.server.node.robot and self.server.node.robot.is_connected)
+            esp_odom_fresh = (now_t - self.server.node.last_esp32_odom_time < 0.5) if self.server.node.last_esp32_odom_time > 0 else False
+            pose_fresh = (now_t - self.server.node.last_pose_publish_time < 0.5) if self.server.node.last_pose_publish_time > 0 else False
+            tag_fresh = (now_t - self.server.node.last_valid_tag_time < 1.0) if self.server.node.last_valid_tag_time > 0 else False
+            
+            health_data = {
+                "status": "ok" if connected else "degraded",
+                "git_commit": getattr(self.server.node, "git_commit", "5729a2e"),
+                "esp32_connected": connected,
+                "esp32_port": self.server.node.robot._port_name if self.server.node.robot else None,
+                "esp32_odom_fresh": esp_odom_fresh,
+                "esp32_odom_age_s": round(now_t - self.server.node.last_esp32_odom_time, 3) if self.server.node.last_esp32_odom_time > 0 else None,
+                "pose_fresh": pose_fresh,
+                "pose_age_s": round(now_t - self.server.node.last_pose_publish_time, 3) if self.server.node.last_pose_publish_time > 0 else None,
+                "tag_fresh": tag_fresh,
+                "tag_age_s": round(now_t - self.server.node.last_valid_tag_time, 3) if self.server.node.last_valid_tag_time > 0 else None,
+                "active_run_id": self.server.node.active_run_id,
+                "motor_power": self.server.node.motor_power_state,
+                "tracking_mode": self.server.node.tracking_mode,
+                "active_tags_count": len(self.server.node.tags_db)
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(health_data).encode('utf-8'))
+
+        elif self.path.startswith('/api/clear_history'):
+            self.server.node.clear_trajectory_history()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok"}).encode('utf-8'))
+
+        elif self.path.startswith('/api/start_log'):
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(self.path)
+            query = parse_qs(parsed_url.query)
+            run_id = query.get('run_id', [None])[0]
+            actual_run_id = self.server.node.start_run_logging(run_id)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "run_id": actual_run_id, "path": self.server.node.active_log_path}).encode('utf-8'))
+
+        elif self.path.startswith('/api/stop_log'):
+            log_path = self.server.node.stop_run_logging()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "saved_path": log_path}).encode('utf-8'))
         else:
             self.send_error(404, "File not found")
 
