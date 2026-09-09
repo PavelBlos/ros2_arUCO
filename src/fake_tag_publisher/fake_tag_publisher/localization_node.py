@@ -245,7 +245,6 @@ class LocalizationNode(Node):
         # Телеметрия и мониторинг свежести данных
         self.last_esp32_odom_time = 0.0
         self.last_pose_publish_time = 0.0
-        self.git_commit = "5729a2e"
         
         # Журнал забегов (Run Logger в JSONL)
         self.run_logger_lock = threading.Lock()
@@ -319,14 +318,19 @@ class LocalizationNode(Node):
     def _get_git_commit(self) -> str:
         if "ROBOT_RELEASE_COMMIT" in os.environ:
             return os.environ["ROBOT_RELEASE_COMMIT"]
-        manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "manifest.json")
-        if os.path.exists(manifest_path):
-            try:
-                with open(manifest_path, "r", encoding="utf-8") as f:
-                    m = json.load(f)
-                    return m.get("git_commit", "unknown")
-            except Exception:
-                pass
+        cand_manifests = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "manifest.json"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "manifest.json"),
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "manifest.json")
+        ]
+        for manifest_path in cand_manifests:
+            if os.path.exists(manifest_path):
+                try:
+                    with open(manifest_path, "r", encoding="utf-8") as f:
+                        m = json.load(f)
+                        return m.get("git_commit", "unknown")
+                except Exception:
+                    pass
         try:
             import subprocess
             res = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2)
@@ -703,6 +707,13 @@ class LocalizationNode(Node):
                         frame_rev = int(msg.header.frame_id.replace("rev_", ""))
                 except Exception:
                     frame_rev = None
+
+            det_rev = getattr(msg, 'tag_map_revision', getattr(msg, 'detector_revision', frame_rev))
+            if det_rev is not None:
+                try:
+                    self.detector_revision = int(det_rev)
+                except Exception:
+                    pass
 
             fusion_res = self.fusion.process_frame(
                 det_dicts,
