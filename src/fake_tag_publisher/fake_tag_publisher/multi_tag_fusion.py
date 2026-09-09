@@ -165,7 +165,7 @@ class MultiTagFusion:
             if tid not in active_tags_db:
                 continue
             tag_info = active_tags_db[tid]
-            if not tag_info.get("enabled", False) or tag_info.get("state") != "confirmed":
+            if not tag_info.get("enabled", True) or tag_info.get("state") != "confirmed":
                 continue
             
             valid_candidates.append({

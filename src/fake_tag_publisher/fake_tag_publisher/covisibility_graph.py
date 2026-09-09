@@ -228,6 +228,9 @@ class CovisibilityGraph:
         edge_key = (min(int(tag_a), int(tag_b)), max(int(tag_a), int(tag_b)))
         return len(self._edge_observations.get(edge_key, []))
 
+    def get_all_edges(self) -> list:
+        return list(self._edge_observations.keys())
+
     def get_diagnostics(self) -> Dict[str, Any]:
         """Summary diagnostics for Web UI and health monitoring."""
         return {
