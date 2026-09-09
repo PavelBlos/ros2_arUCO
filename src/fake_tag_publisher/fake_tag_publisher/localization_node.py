@@ -2,7 +2,34 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry, Path
-from fake_tag_interfaces.msg import TagDetectionArray
+try:
+    from fake_tag_interfaces.msg import TagDetection, TagDetectionArray, TagMapUpdate, TagMapAck
+except ImportError:
+    from fake_tag_interfaces.msg import TagDetectionArray
+    TagDetection = None
+    TagMapUpdate = None
+    TagMapAck = None
+
+try:
+    from .geometry_transforms import (
+        normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
+        compute_map_to_odom_se2, compute_fused_pose_se2, smooth_map_to_odom_se2,
+        optical_to_ros_matrix, ros_to_optical_matrix
+    )
+    from .tag_registry import TagRegistry
+    from .multi_tag_fusion import MultiTagFusion
+    from .tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
+    from .covisibility_graph import CovisibilityGraph
+except ImportError:
+    from geometry_transforms import (
+        normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
+        compute_map_to_odom_se2, compute_fused_pose_se2, smooth_map_to_odom_se2,
+        optical_to_ros_matrix, ros_to_optical_matrix
+    )
+    from tag_registry import TagRegistry
+    from multi_tag_fusion import MultiTagFusion
+    from tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
+    from covisibility_graph import CovisibilityGraph
 from sensor_msgs.msg import CompressedImage
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
@@ -11,6 +38,7 @@ import tf2_ros
 from ament_index_python.packages import get_package_share_directory
 import os
 import time
+import math
 import yaml
 import numpy as np
 from scipy.spatial.transform import Rotation as R, Slerp
@@ -33,7 +61,41 @@ class LocalizationNode(Node):
 
         # Загрузка базы данных меток из конфигурационного файла tags_config.yaml
         self.tags_db = {}
+        self.tag_registry = None
         self.load_tags_config()
+
+        # Camera Intrinsics and Extrinsics
+        self.camera_matrix = np.array([[794.108, 0.0, 317.316], [0.0, 798.507, 293.119], [0.0, 0.0, 1.0]], dtype=np.float64)
+        self.dist_coeffs = np.array([-0.400, -0.0655, -0.00376, 0.00322, 1.105], dtype=np.float64)
+        self.load_camera_calibration()
+
+        self.camera_extrinsics_status = "unverified"
+        self.T_base_cam = pose_to_matrix(0.0, 0.0, 0.0, 0.0, -np.pi/2.0, np.pi/2.0)
+        self.load_camera_extrinsics()
+
+        # Fusion, Motion Mutex, Wizard, and Co-Visibility Graph
+        self.fusion = MultiTagFusion()
+        self.motion_mgr = MotionAuthorityManager()
+        self.wizard = TagCalibrationWizard(motion_manager=self.motion_mgr)
+        self.covis_graph = CovisibilityGraph()
+
+        # Hot-reload Handshake
+        if TagMapUpdate:
+            self.tag_map_pub = self.create_publisher(TagMapUpdate, '/tag_map/updated', 10)
+        else:
+            self.tag_map_pub = None
+
+        if TagMapAck:
+            self.tag_map_ack_sub = self.create_subscription(TagMapAck, '/tag_map/ack', self.tag_map_ack_callback, 10)
+        else:
+            self.tag_map_ack_sub = None
+        self.last_tag_map_ack = None
+
+        # Safety and Versioning
+        self.is_nav_locked = False
+        self.visual_jump_pending = False
+        self.firmware_version = "FastAccelStepper-v2.0"
+        self.git_commit = self._get_git_commit()
         
         # Подписка на топик /fake_tag (сообщения типа TagDetectionArray)
         self.tag_sub = self.create_subscription(
@@ -226,6 +288,105 @@ class LocalizationNode(Node):
         self.notify_ui_event()
         self.get_logger().info("🧹 История траекторий на сервере очищена.")
 
+    def _get_git_commit(self) -> str:
+        if "ROBOT_RELEASE_COMMIT" in os.environ:
+            return os.environ["ROBOT_RELEASE_COMMIT"]
+        manifest_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "manifest.json")
+        if os.path.exists(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as f:
+                    m = json.load(f)
+                    return m.get("git_commit", "unknown")
+            except Exception:
+                pass
+        try:
+            import subprocess
+            res = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True, timeout=2)
+            if res.returncode == 0 and res.stdout.strip():
+                return res.stdout.strip()
+        except Exception:
+            pass
+        return "b4ee324"
+
+    def load_camera_calibration(self):
+        curr_dir = os.path.dirname(os.path.abspath(__file__))
+        cand_paths = [
+            os.path.join(curr_dir, 'config', 'camera_info.yaml'),
+            os.path.join(curr_dir, '..', 'config', 'camera_info.yaml'),
+            os.path.join(curr_dir, 'camera_info.yaml'),
+            os.path.join(curr_dir, 'camera_calibration.yaml')
+        ]
+        for p in cand_paths:
+            if os.path.exists(p):
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        data = yaml.safe_load(f)
+                    self.camera_matrix = np.array(data['camera_matrix'], dtype=np.float64).reshape(3, 3)
+                    self.dist_coeffs = np.array(data['distortion_coefficients'], dtype=np.float64)
+                    self.get_logger().info(f"Loaded camera calibration from {p}")
+                    return
+                except Exception as e:
+                    self.get_logger().warn(f"Failed loading camera calibration from {p}: {e}")
+
+    def load_camera_extrinsics(self):
+        curr_dir = os.path.dirname(os.path.abspath(__file__))
+        cand_paths = [
+            '/home/raspberry/arUco_termit/shared_config/camera_extrinsics.yaml',
+            os.path.join(curr_dir, 'camera_extrinsics.yaml'),
+            os.path.join(curr_dir, '..', '..', '..', 'camera_extrinsics.yaml'),
+            os.path.join(curr_dir, 'config', 'camera_extrinsics.yaml'),
+            os.path.join(curr_dir, '..', 'config', 'camera_extrinsics.yaml'),
+        ]
+        ext_path = None
+        for p in cand_paths:
+            if os.path.exists(p):
+                ext_path = os.path.abspath(p)
+                break
+
+        if ext_path and os.path.exists(ext_path):
+            try:
+                with open(ext_path, 'r', encoding='utf-8') as f:
+                    data = yaml.safe_load(f) or {}
+                self.camera_extrinsics_status = data.get("status", "unverified")
+                x = float(data.get("x", 0.0))
+                y = float(data.get("y", 0.0))
+                z = float(data.get("z", 0.0))
+                roll = float(data.get("roll", 0.0))
+                pitch = float(data.get("pitch", -np.pi / 2.0))
+                yaw = float(data.get("yaw", np.pi / 2.0))
+                self.T_base_cam = pose_to_matrix(x, y, z, roll, pitch, yaw)
+                self.camera_extrinsics_path = ext_path
+                self.get_logger().info(f"Loaded camera extrinsics from {ext_path} (status: {self.camera_extrinsics_status})")
+                return
+            except Exception as e:
+                self.get_logger().warn(f"Failed to parse camera extrinsics: {e}")
+
+        self.camera_extrinsics_status = "unverified"
+        self.T_base_cam = pose_to_matrix(0.0, 0.0, 0.0, 0.0, -np.pi / 2.0, np.pi / 2.0)
+        self.camera_extrinsics_path = os.path.join(curr_dir, 'camera_extrinsics.yaml')
+
+    def publish_tag_map_update(self):
+        if getattr(self, 'tag_map_pub', None) and TagMapUpdate:
+            try:
+                msg = TagMapUpdate()
+                msg.config_epoch = int(self.tag_registry.config_epoch)
+                msg.tag_map_revision = int(self.tag_registry.revision)
+                msg.tag_map_sha256 = str(self.tag_registry.sha256)
+                msg.timestamp.sec = int(time.time())
+                self.tag_map_pub.publish(msg)
+                self.get_logger().info(f"Published /tag_map/updated (rev: {msg.tag_map_revision})")
+            except Exception as e:
+                self.get_logger().warn(f"Failed to publish /tag_map/updated: {e}")
+
+    def tag_map_ack_callback(self, msg):
+        self.last_tag_map_ack = {
+            "config_epoch": msg.config_epoch,
+            "tag_map_revision": msg.tag_map_revision,
+            "ack_status": msg.ack_status,
+            "error_msg": msg.error_msg
+        }
+        self.get_logger().info(f"Received /tag_map/ack (rev: {msg.tag_map_revision}, status: {msg.ack_status})")
+
     def load_tags_config(self):
         try:
             curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -252,11 +413,9 @@ class LocalizationNode(Node):
                 self.get_logger().error("tags_config.yaml not found!")
                 return
 
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = yaml.safe_load(f)
-                all_tags = config_data.get('tags', {})
-                self.tags_db = {k: v for k, v in all_tags.items() if v.get('enabled', True)}
-                self.get_logger().info(f"Loaded {len(self.tags_db)} enabled tags from {config_path} (out of {len(all_tags)} total).")
+            self.tag_registry = TagRegistry(config_path)
+            self.tags_db = self.tag_registry.get_active_confirmed_tags()
+            self.get_logger().info(f"Loaded {len(self.tags_db)} active tags from {config_path}")
         except Exception as e:
             self.get_logger().error(f"Failed to load config: {str(e)}")
 
@@ -266,7 +425,7 @@ class LocalizationNode(Node):
 
     def tag_callback(self, msg):
         try:
-            # Проверяем сигнал окончания
+            # Check finished signal
             if msg.header.frame_id == "finished":
                 self.get_logger().info("Received finished signal. Saving trajectory plot and shutting down...")
                 self.save_trajectory_and_shutdown()
@@ -274,160 +433,158 @@ class LocalizationNode(Node):
 
             detections = msg.detections
             if not detections:
-                # Метки не обнаружены в текущем кадре
                 return
 
-            translations = []
-            rotations = []
-
-            # 1. Получаем смещение камеры относительно базы робота base_link -> camera_link из TF
-            try:
-                t = self.tf_buffer.lookup_transform('base_link', 'camera_link', rclpy.time.Time())
-                T_base_camera = np.eye(4)
-                T_base_camera[:3, :3] = R.from_quat([
-                    t.transform.rotation.x,
-                    t.transform.rotation.y,
-                    t.transform.rotation.z,
-                    t.transform.rotation.w
-                ]).as_matrix()
-                T_base_camera[:3, 3] = [
-                    t.transform.translation.x,
-                    t.transform.translation.y,
-                    t.transform.translation.z
-                ]
-            except Exception as tf_err:
-                # Если TF еще не опубликован, считаем, что они совпадают
-                self.get_logger().debug(f"TF lookup base_link->camera_link failed, using identity/hardcoded pitch: {str(tf_err)}")
-                # По умолчанию: камера на роботе смотрит вверх (pitch = -90 градусов, yaw = +90 градусов)
-                camera_rot = R.from_euler('xyz', [0.0, -np.pi / 2.0, np.pi / 2.0])
-                T_base_camera = np.eye(4)
-                T_base_camera[:3, :3] = camera_rot.as_matrix()
-                T_base_camera[:3, 3] = [0.0, 0.0, 0.0]
-
-            # 2. Обрабатываем каждую метку из массива обнаруженных
-            for detection in detections:
-                tag_id = detection.tag_id
-                tag_key = f"tag_{tag_id}"
-                
-                if tag_key not in self.tags_db:
-                    self.get_logger().warn(f"Detected unknown tag with ID: {tag_id}")
-                    continue
-                
-                tag_info = self.tags_db[tag_key]
-
-                # Поза метки на потолке T_map_tag (высота 2.5м, разворот вниз)
-                T_map_tag = np.eye(4)
-                T_map_tag[:3, :3] = R.from_euler('xyz', [tag_info['roll'], tag_info['pitch'], tag_info['yaw']]).as_matrix()
-                T_map_tag[:3, 3] = [tag_info['x'], tag_info['y'], tag_info['z']]
-
-                # Поза метки относительно камеры T_camera_tag
-                T_camera_tag = np.eye(4)
-                rel_rot = R.from_quat([
-                    detection.pose.orientation.x,
-                    detection.pose.orientation.y,
-                    detection.pose.orientation.z,
-                    detection.pose.orientation.w
-                ])
-                T_camera_tag[:3, :3] = rel_rot.as_matrix()
-                T_camera_tag[:3, 3] = [detection.pose.position.x, detection.pose.position.y, detection.pose.position.z]
-
-                # Поза камеры на карте: T_map_camera = T_map_tag * (T_camera_tag)^-1
-                T_map_camera = T_map_tag @ np.linalg.inv(T_camera_tag)
-
-                # Поза робота на карте T_map_base = T_map_camera * (T_base_camera)^-1
-                T_map_base = T_map_camera @ np.linalg.inv(T_base_camera)
-
-                # Извлекаем смещение и кватернион
-                robot_pos = T_map_base[:3, 3]
-                robot_rot = R.from_matrix(T_map_base[:3, :3]).as_quat()
-
-                translations.append(robot_pos)
-                rotations.append(robot_rot)
-
-            if not translations:
-                return
-
-            # 3. Усреднение (слияние) данных локализации от нескольких меток
-            if len(translations) == 1:
-                # Если обнаружена только одна метка, берем ее позу напрямую
-                avg_pos = translations[0]
-                avg_rot = rotations[0]
-            else:
-                # Если несколько меток:
-                # 3.1. Усредняем линейные координаты (X, Y, Z) - среднее арифметическое
-                avg_pos = np.mean(translations, axis=0)
-                # 3.2. Усредняем вращения с помощью Rotation.mean()
-                try:
-                    avg_rot = R.from_quat(rotations).mean().as_quat()
-                except Exception as rot_mean_err:
-                    self.get_logger().error(f"Rotation averaging failed: {str(rot_mean_err)}")
-                    avg_rot = rotations[0]
-
-            # 4. Применяем слияние датчиков с компенсацией задержки камеры через кольцевой буфер
-            avg_yaw = self.quaternion_to_yaw_from_quat(avg_rot)
             stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-            # Извлекаем позу одометрии на точный момент съемки кадра камеры
+            # Lookup odometry at exact frame midpoint capture stamp
             odom_at_cam = self.lookup_odom_at(stamp_sec)
             if odom_at_cam is None:
                 odom_x_c, odom_y_c, odom_yaw_c = self.fused_x, self.fused_y, self.fused_yaw
             else:
                 odom_x_c, odom_y_c, odom_yaw_c = odom_at_cam
 
-            # Поправка map-to-odom: разность между абсолютной меткой и одометрией на момент кадра
-            target_delta_x = float(avg_pos[0] - odom_x_c)
-            target_delta_y = float(avg_pos[1] - odom_y_c)
-            target_delta_yaw = float((avg_yaw - odom_yaw_c + np.pi) % (2.0 * np.pi) - np.pi)
+            # Get camera extrinsics
+            try:
+                t = self.tf_buffer.lookup_transform('base_link', 'camera_link', rclpy.time.Time())
+                T_base_camera = np.eye(4)
+                T_base_camera[:3, :3] = R.from_quat([
+                    t.transform.rotation.x, t.transform.rotation.y,
+                    t.transform.rotation.z, t.transform.rotation.w
+                ]).as_matrix()
+                T_base_camera[:3, 3] = [
+                    t.transform.translation.x, t.transform.translation.y, t.transform.translation.z
+                ]
+            except Exception:
+                T_base_camera = self.T_base_cam
 
-            if not self.map_odom_initialized:
-                self.delta_map_odom_x = target_delta_x
-                self.delta_map_odom_y = target_delta_y
-                self.delta_map_odom_yaw = target_delta_yaw
-                self.fused_z = avg_pos[2]
-                self.map_odom_initialized = True
-                self.outlier_count = 0
-            else:
-                diff_jump = float(np.hypot(target_delta_x - self.delta_map_odom_x, target_delta_y - self.delta_map_odom_y))
-                if diff_jump > 0.40:
-                    self.outlier_count += 1
-                    if self.outlier_count < 4:
-                        self.get_logger().warn(f"⚠️ Игнорируем выброс ArUco: скачок {diff_jump:.2f}м. Выбросов подряд: {self.outlier_count}")
-                        return
-                    else:
-                        self.get_logger().info(f"🔄 Смена позиции робота подтверждена (4 кадра): X={avg_pos[0]:.2f}, Y={avg_pos[1]:.2f}")
-                        self.delta_map_odom_x = target_delta_x
-                        self.delta_map_odom_y = target_delta_y
-                        self.delta_map_odom_yaw = target_delta_yaw
-                        self.outlier_count = 0
+            # Convert detections to standardized dicts
+            det_dicts = []
+            for d in detections:
+                corners = list(d.corners_px) if hasattr(d, 'corners_px') else []
+                pos = [d.pose.position.x, d.pose.position.y, d.pose.position.z]
+                rot = [d.pose.orientation.x, d.pose.orientation.y, d.pose.orientation.z, d.pose.orientation.w]
+                T_ros = np.eye(4, dtype=np.float64)
+                T_ros[:3, :3] = R.from_quat(rot).as_matrix()
+                T_ros[:3, 3] = pos
+
+                det_dicts.append({
+                    "tag_id": int(d.tag_id),
+                    "pose_valid": bool(getattr(d, 'pose_valid', True)),
+                    "rejection_reason": getattr(d, 'rejection_reason', ''),
+                    "reproj_err": float(getattr(d, 'reproj_err', 0.5)),
+                    "marker_area_px": float(getattr(d, 'marker_area_px', 1000.0)),
+                    "marker_perimeter_px": float(getattr(d, 'marker_perimeter_px', 120.0)),
+                    "distance_m": float(getattr(d, 'distance_m', 2.5)),
+                    "viewing_angle_deg": float(getattr(d, 'viewing_angle_deg', 0.0)),
+                    "ambiguity_status": int(getattr(d, 'ambiguity_status', 0)),
+                    "marker_size_mm": float(getattr(d, 'marker_size_mm', 100.0)),
+                    "corners_px": corners,
+                    "pose_position": pos,
+                    "pose_orientation": rot,
+                    "T_cameraRos_tag": T_ros
+                })
+
+            # Check robot motion state
+            is_moving = self.autopilot_active or self.test_drive_active
+            if self.robot and getattr(self.robot, 'is_connected', False):
+                sp1 = abs(getattr(self.robot, 'current_speed_m1', 0))
+                sp2 = abs(getattr(self.robot, 'current_speed_m2', 0))
+                sp3 = abs(getattr(self.robot, 'current_speed_m3', 0))
+                if sp1 > 15 or sp2 > 15 or sp3 > 15:
+                    is_moving = True
+
+            # Process through MultiTagFusion
+            active_tags = self.tag_registry.get_active_confirmed_tags() if self.tag_registry else self.tags_db
+            fusion_res = self.fusion.process_frame(
+                det_dicts,
+                active_tags,
+                self.camera_matrix,
+                self.dist_coeffs,
+                T_base_camera,
+                (odom_x_c, odom_y_c, odom_yaw_c)
+            )
+
+            # Record in Co-Visibility Graph
+            self.covis_graph.record_frame_observations(
+                det_dicts, (self.fused_x, self.fused_y, self.fused_yaw), stamp_sec
+            )
+
+            # Update Calibration Wizard if active
+            if self.wizard and self.wizard.state not in (WizardState.IDLE, WizardState.COMPLETED, WizardState.ABORTED):
+                wiz_state, cmd_vel_tuple, status_msg = self.wizard.update(
+                    det_dicts,
+                    not is_moving,
+                    (self.fused_x, self.fused_y, self.fused_yaw),
+                    self.camera_matrix,
+                    self.dist_coeffs,
+                    T_base_camera,
+                    now=time.time()
+                )
+                if cmd_vel_tuple is not None:
+                    self.drive_robot(cmd_vel_tuple[0], cmd_vel_tuple[1], cmd_vel_tuple[2])
+                if wiz_state == WizardState.COMPLETED and self.wizard.calibrated_tag_result:
+                    res_tag = self.wizard.calibrated_tag_result
+                    self.tag_registry.set_tag(res_tag["tag_id"], res_tag)
+                    self.tags_db = self.tag_registry.get_active_confirmed_tags()
+                    self.publish_tag_map_update()
+                    self.notify_ui_event()
+                    self.get_logger().info(f"🎉 Calibration Wizard successfully registered tag {res_tag['tag_id']}")
+
+            # Handle Fusion Result
+            if fusion_res.get("fused_base_pose") is not None:
+                vis_x, vis_y, vis_yaw = fusion_res["fused_base_pose"]
+                jump_dist = float(math.hypot(vis_x - self.fused_x, vis_y - self.fused_y))
+
+                # Stop-and-Reanchor gate
+                if jump_dist > 0.15 and is_moving and self.map_odom_initialized:
+                    self.is_nav_locked = True
+                    self.visual_jump_pending = True
+                    self.drive_robot(0.0, 0.0, 0.0)
+                    self.get_logger().warn(
+                        f"⚠️ Visual jump {jump_dist:.2f}m > 0.15m while in motion! "
+                        f"Locking navigation and halting robot for Stop-and-Reanchor."
+                    )
+                    return
                 else:
-                    self.outlier_count = 0
-                    K = self.filter_alpha
-                    self.delta_map_odom_x += K * (target_delta_x - self.delta_map_odom_x)
-                    self.delta_map_odom_y += K * (target_delta_y - self.delta_map_odom_y)
-                    yaw_err = (target_delta_yaw - self.delta_map_odom_yaw + np.pi) % (2.0 * np.pi) - np.pi
-                    self.delta_map_odom_yaw = (self.delta_map_odom_yaw + K * yaw_err + np.pi) % (2.0 * np.pi) - np.pi
-                    self.fused_z += K * (avg_pos[2] - self.fused_z)
+                    target_x_mo, target_y_mo, target_yaw_mo = compute_map_to_odom_se2(
+                        vis_x, vis_y, vis_yaw, odom_x_c, odom_y_c, odom_yaw_c
+                    )
+                    if not self.map_odom_initialized:
+                        self.delta_map_odom_x = target_x_mo
+                        self.delta_map_odom_y = target_y_mo
+                        self.delta_map_odom_yaw = target_yaw_mo
+                        self.map_odom_initialized = True
+                    else:
+                        self.delta_map_odom_x, self.delta_map_odom_y, self.delta_map_odom_yaw = smooth_map_to_odom_se2(
+                            self.delta_map_odom_x, self.delta_map_odom_y, self.delta_map_odom_yaw,
+                            target_x_mo, target_y_mo, target_yaw_mo,
+                            alpha=self.filter_alpha
+                        )
 
-            self.tracking_mode = "aruco_fused"
-            self.last_valid_tag_time = time.time()
+                    if self.visual_jump_pending and not is_moving:
+                        self.visual_jump_pending = False
+                        self.is_nav_locked = False
+                        self.get_logger().info("✅ Stop-and-Reanchor completed cleanly at zero velocity. Navigation unlocked.")
 
-            # Обновляем длину сырого пути
-            if len(self.raw_trajectory_x) > 0:
-                dx = avg_pos[0] - self.raw_trajectory_x[-1]
-                dy = avg_pos[1] - self.raw_trajectory_y[-1]
-                dz = avg_pos[2] - self.raw_trajectory_z[-1]
-                self.raw_path_length += np.sqrt(dx*dx + dy*dy + dz*dz)
+                self.tracking_mode = "aruco_multi" if fusion_res.get("multi_tag_used") else "aruco_single"
+                self.last_valid_tag_time = time.time()
 
-            self.raw_trajectory_x.append(avg_pos[0])
-            self.raw_trajectory_y.append(avg_pos[1])
-            self.raw_trajectory_z.append(avg_pos[2])
+                # Update trajectory
+                if len(self.raw_trajectory_x) > 0:
+                    dx = vis_x - self.raw_trajectory_x[-1]
+                    dy = vis_y - self.raw_trajectory_y[-1]
+                    self.raw_path_length += math.hypot(dx, dy)
+                self.raw_trajectory_x.append(vis_x)
+                self.raw_trajectory_y.append(vis_y)
+                self.raw_trajectory_z.append(0.0)
+                self.trajectory_timestamps.append(stamp_sec)
 
-            stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            self.trajectory_timestamps.append(stamp_sec)
+                self.last_detected_tags = fusion_res.get("inlier_ids", [d.tag_id for d in detections])
+                self.publish_fused_pose(msg.header.stamp)
 
-            # Вызываем публикацию отфильтрованной позы и TF
-            self.last_detected_tags = [d.tag_id for d in detections]
-            self.publish_fused_pose(msg.header.stamp)
+            elif fusion_res.get("status") == "multi_tag_conflict":
+                self.get_logger().warn("⚠️ Multi-tag conflict detected between visible tags! Holding dead reckoning.")
 
         except Exception as e:
             self.get_logger().error(f"Error in tag_callback: {str(e)}")
@@ -450,7 +607,7 @@ class LocalizationNode(Node):
                 from termit_api import TermitRobotAPI, RobotConfig, HoldMode
                 
             config = RobotConfig(
-                wheel_radius=0.030,
+                wheel_radius=0.035,
                 base_radius=0.122,
                 steps_per_rev=1600,
                 watchdog_timeout_ms=1500,
@@ -539,10 +696,11 @@ class LocalizationNode(Node):
             self.fused_initialized = True
             self.map_odom_initialized = True
         else:
-            # Преобразование: поза на карте = одометрия + сглаженная поправка карты
-            self.fused_x = raw_odom_x + self.delta_map_odom_x
-            self.fused_y = raw_odom_y + self.delta_map_odom_y
-            self.fused_yaw = (raw_odom_yaw + self.delta_map_odom_yaw + np.pi) % (2.0 * np.pi) - np.pi
+            # Преобразование SE(2): T_map_base = T_map_odom @ T_odom_base
+            self.fused_x, self.fused_y, self.fused_yaw = compute_fused_pose_se2(
+                self.delta_map_odom_x, self.delta_map_odom_y, self.delta_map_odom_yaw,
+                raw_odom_x, raw_odom_y, raw_odom_yaw
+            )
 
         if time.time() - self.last_valid_tag_time > 0.6:
             self.tracking_mode = "dead_reckoning"
@@ -1317,6 +1475,157 @@ class WebServerHandler(SimpleHTTPRequestHandler):
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.end_headers()
 
+    def do_POST(self):
+        node = self.server.node
+        content_length = int(self.headers.get('Content-Length', 0))
+        post_data = self.rfile.read(content_length) if content_length > 0 else b""
+        payload = {}
+        if post_data:
+            try:
+                payload = json.loads(post_data.decode('utf-8'))
+            except Exception:
+                pass
+
+        from urllib.parse import urlparse, parse_qs
+        parsed_url = urlparse(self.path)
+        query = parse_qs(parsed_url.query)
+
+        if self.path.startswith('/api/tags/save'):
+            reg = getattr(node, 'tag_registry', None)
+            if not reg:
+                self._send_json(500, {"error": "Registry not initialized"})
+                return
+
+            tag_id = payload.get('tag_id', query.get('id', [None])[0])
+            tag_data = payload.get('tag_data', {})
+            expected_rev = payload.get('expected_revision', query.get('expected_revision', [None])[0])
+            if expected_rev is not None:
+                try:
+                    expected_rev = int(expected_rev)
+                except ValueError:
+                    expected_rev = None
+
+            if tag_id is None:
+                self._send_json(400, {"error": "Missing tag_id"})
+                return
+
+            try:
+                rev, sha = reg.set_tag(int(tag_id), tag_data, expected_revision=expected_rev)
+                node.tags_db = reg.get_active_confirmed_tags()
+                node.publish_tag_map_update()
+                node.notify_ui_event()
+                self._send_json(200, {"status": "ok", "message": f"Tag {tag_id} saved", "revision": rev, "sha256": sha})
+            except Exception as e:
+                err_str = str(e)
+                code = 409 if "conflict" in err_str.lower() else 400
+                self._send_json(code, {"error": err_str})
+
+        elif self.path.startswith('/api/tags/delete'):
+            reg = getattr(node, 'tag_registry', None)
+            if not reg:
+                self._send_json(500, {"error": "Registry not initialized"})
+                return
+
+            tag_id = payload.get('tag_id', query.get('id', [None])[0])
+            expected_rev = payload.get('expected_revision', query.get('expected_revision', [None])[0])
+            if expected_rev is not None:
+                try:
+                    expected_rev = int(expected_rev)
+                except ValueError:
+                    expected_rev = None
+
+            if tag_id is None:
+                self._send_json(400, {"error": "Missing tag_id"})
+                return
+
+            try:
+                rev, sha = reg.delete_tag(int(tag_id), expected_revision=expected_rev)
+                node.tags_db = reg.get_active_confirmed_tags()
+                node.publish_tag_map_update()
+                node.notify_ui_event()
+                self._send_json(200, {"status": "ok", "message": f"Tag {tag_id} deleted", "revision": rev, "sha256": sha})
+            except Exception as e:
+                err_str = str(e)
+                code = 409 if "conflict" in err_str.lower() else 400
+                self._send_json(code, {"error": err_str})
+
+        elif self.path.startswith('/api/anchor/set'):
+            reg = getattr(node, 'tag_registry', None)
+            anchor_id = payload.get('anchor_tag_id', query.get('id', [None])[0])
+            confirm = payload.get('confirm', True)
+
+            if anchor_id is None:
+                self._send_json(400, {"error": "Missing anchor_tag_id"})
+                return
+
+            try:
+                rev, sha = reg.set_anchor_tag(int(anchor_id), confirm=bool(confirm))
+                node.tags_db = reg.get_active_confirmed_tags()
+                node.publish_tag_map_update()
+                node.notify_ui_event()
+                self._send_json(200, {"status": "ok", "message": f"Anchor set to tag {anchor_id}", "revision": rev})
+            except Exception as e:
+                self._send_json(400, {"error": str(e)})
+
+        elif self.path.startswith('/api/calibration/start'):
+            wiz = getattr(node, 'wizard', None)
+            tid = payload.get('tag_id', query.get('id', [None])[0])
+            size_m = float(payload.get('marker_size_m', query.get('size', [0.100])[0]))
+
+            if tid is None:
+                self._send_json(400, {"error": "Missing tag_id"})
+                return
+
+            ok, msg = wiz.start(int(tid), marker_size_m=size_m)
+            if not ok:
+                self._send_json(409, {"error": msg})
+                return
+            self._send_json(200, {"status": "ok", "message": msg})
+
+        elif self.path.startswith('/api/calibration/heartbeat'):
+            wiz = getattr(node, 'wizard', None)
+            ok, msg = wiz.heartbeat() if wiz else (False, "Wizard not initialized")
+            if not ok:
+                self._send_json(400, {"error": msg})
+                return
+            self._send_json(200, {"status": "ok", "message": msg})
+
+        elif self.path.startswith('/api/calibration/abort'):
+            wiz = getattr(node, 'wizard', None)
+            if wiz:
+                wiz.abort("User requested abort via API")
+            self._send_json(200, {"status": "ok", "message": "Calibration aborted"})
+
+        elif self.path.startswith('/api/extrinsics'):
+            node.camera_extrinsics_status = payload.get('status', 'verified')
+            # Save extrinsics to file
+            try:
+                import yaml
+                data = {
+                    "status": node.camera_extrinsics_status,
+                    "x": float(payload.get('x', 0.0)),
+                    "y": float(payload.get('y', 0.0)),
+                    "z": float(payload.get('z', 0.0)),
+                    "roll": float(payload.get('roll', 0.0)),
+                    "pitch": float(payload.get('pitch', -np.pi/2.0)),
+                    "yaw": float(payload.get('yaw', np.pi/2.0))
+                }
+                node.T_base_cam = pose_to_matrix(data['x'], data['y'], data['z'], data['roll'], data['pitch'], data['yaw'])
+                with open(node.camera_extrinsics_path, 'w', encoding='utf-8') as f:
+                    yaml.dump(data, f)
+                self._send_json(200, {"status": "ok", "message": "Extrinsics saved"})
+            except Exception as e:
+                self._send_json(500, {"error": str(e)})
+        else:
+            self._send_json(404, {"error": "Not Found"})
+
+    def _send_json(self, code: int, data: dict):
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(data).encode('utf-8'))
+
     def do_GET(self):
         if self.path == '/':
             self.send_response(200)
@@ -1561,32 +1870,112 @@ class WebServerHandler(SimpleHTTPRequestHandler):
 
         elif self.path.startswith('/api/health'):
             now_t = time.time()
-            connected = bool(self.server.node.robot and self.server.node.robot.is_connected)
-            esp_odom_fresh = (now_t - self.server.node.last_esp32_odom_time < 0.5) if self.server.node.last_esp32_odom_time > 0 else False
-            pose_fresh = (now_t - self.server.node.last_pose_publish_time < 0.5) if self.server.node.last_pose_publish_time > 0 else False
-            tag_fresh = (now_t - self.server.node.last_valid_tag_time < 1.0) if self.server.node.last_valid_tag_time > 0 else False
-            
+            node = self.server.node
+            connected = bool(node.robot and node.robot.is_connected)
+            esp_odom_fresh = (now_t - node.last_esp32_odom_time < 0.5) if node.last_esp32_odom_time > 0 else False
+            pose_fresh = (now_t - node.last_pose_publish_time < 0.5) if node.last_pose_publish_time > 0 else False
+            tag_fresh = (now_t - node.last_valid_tag_time < 1.0) if node.last_valid_tag_time > 0 else False
+
+            reg = getattr(node, 'tag_registry', None)
             health_data = {
                 "status": "ok" if connected else "degraded",
-                "git_commit": getattr(self.server.node, "git_commit", "5729a2e"),
+                "git_commit": getattr(node, "git_commit", "b4ee324"),
+                "firmware_version": getattr(node, "firmware_version", "FastAccelStepper-v2.0"),
                 "esp32_connected": connected,
-                "esp32_port": self.server.node.robot._port_name if self.server.node.robot else None,
+                "esp32_port": node.robot._port_name if node.robot else None,
                 "esp32_odom_fresh": esp_odom_fresh,
-                "esp32_odom_age_s": round(now_t - self.server.node.last_esp32_odom_time, 3) if self.server.node.last_esp32_odom_time > 0 else None,
+                "esp32_odom_age_s": round(now_t - node.last_esp32_odom_time, 3) if node.last_esp32_odom_time > 0 else None,
                 "pose_fresh": pose_fresh,
-                "pose_age_s": round(now_t - self.server.node.last_pose_publish_time, 3) if self.server.node.last_pose_publish_time > 0 else None,
+                "pose_age_s": round(now_t - node.last_pose_publish_time, 3) if node.last_pose_publish_time > 0 else None,
                 "tag_fresh": tag_fresh,
-                "tag_age_s": round(now_t - self.server.node.last_valid_tag_time, 3) if self.server.node.last_valid_tag_time > 0 else None,
-                "active_run_id": self.server.node.active_run_id,
-                "motor_power": self.server.node.motor_power_state,
-                "tracking_mode": self.server.node.tracking_mode,
-                "active_tags_count": len(self.server.node.tags_db)
+                "tag_age_s": round(now_t - node.last_valid_tag_time, 3) if node.last_valid_tag_time > 0 else None,
+                "active_run_id": node.active_run_id,
+                "motor_power": node.motor_power_state,
+                "tracking_mode": node.tracking_mode,
+                "active_tags_count": len(node.tags_db),
+                "config_epoch": reg.config_epoch if reg else 0,
+                "tag_map_revision": reg.revision if reg else 0,
+                "tag_map_sha256": reg.sha256 if reg else "",
+                "anchor_tag_id": int(reg.anchor_tag_id) if (reg and reg.anchor_tag_id is not None) else None,
+                "anchor_confirmed": reg.anchor_confirmed if reg else False,
+                "camera_extrinsics": {
+                    "status": getattr(node, 'camera_extrinsics_status', 'unverified'),
+                    "path": getattr(node, 'camera_extrinsics_path', '')
+                },
+                "is_nav_locked": getattr(node, 'is_nav_locked', False),
+                "visual_jump_pending": getattr(node, 'visual_jump_pending', False)
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(health_data).encode('utf-8'))
+
+        elif self.path.startswith('/api/tags'):
+            node = self.server.node
+            reg = getattr(node, 'tag_registry', None)
+            if not reg:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "Tag registry not initialized"}).encode('utf-8'))
+                return
+
+            resp = {
+                "status": "ok",
+                "config_epoch": reg.config_epoch,
+                "tag_map_revision": reg.revision,
+                "tag_map_sha256": reg.sha256,
+                "anchor_tag_id": reg.anchor_tag_id,
+                "anchor_confirmed": reg.anchor_confirmed,
+                "tags": reg.get_all_tags()
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
+
+        elif self.path.startswith('/api/calibration/status'):
+            node = self.server.node
+            wiz = getattr(node, 'wizard', None)
+            if not wiz:
+                resp = {"state": "IDLE"}
+            else:
+                resp = {
+                    "state": wiz.state.value,
+                    "target_tag_id": wiz.target_tag_id,
+                    "elapsed_s": round(time.time() - wiz.state_enter_time, 2),
+                    "samples_count": len(wiz.collected_samples),
+                    "abort_reason": wiz.abort_reason,
+                    "calibrated_result": wiz.calibrated_tag_result
+                }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
+
+        elif self.path.startswith('/api/covisibility'):
+            node = self.server.node
+            covis = getattr(node, 'covis_graph', None)
+            resp = covis.get_diagnostics() if covis else {}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
+
+        elif self.path.startswith('/api/extrinsics'):
+            node = self.server.node
+            resp = {
+                "status": getattr(node, 'camera_extrinsics_status', 'unverified'),
+                "matrix": node.T_base_cam.tolist()
+            }
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
 
         elif self.path.startswith('/api/clear_history'):
             self.server.node.clear_trajectory_history()
@@ -2071,6 +2460,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <span id="status-text">ПОДКЛЮЧЕНИЕ...</span>
         </div>
 
+        <div class="sync-badge-container" id="sync-container" style="background: rgba(0,0,0,0.4); border: 1px solid rgba(255,255,255,0.08); border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; font-size: 11px;">
+            <div style="display:flex; justify-content:space-between; margin-bottom: 4px;">
+                <span style="color: #8b9bb4;">Map Rev / Epoch:</span>
+                <span id="sync-rev-epoch" style="color: #66fcf1; font-weight:600;">rev 0 | epoch 0</span>
+            </div>
+            <div style="display:flex; justify-content:space-between; margin-bottom: 4px;">
+                <span style="color: #8b9bb4;">Anchor Tag:</span>
+                <span id="sync-anchor-badge" style="color: #ffa500; font-weight:600;">⚠️ None</span>
+            </div>
+            <div style="display:flex; justify-content:space-between;">
+                <span style="color: #8b9bb4;">Camera Extrinsics:</span>
+                <span id="sync-extrinsics-badge" style="color: #e74c3c; font-weight:600;">UNVERIFIED</span>
+            </div>
+        </div>
+
         <div class="section-title">Текущие Координаты</div>
         <div class="card coords-grid">
             <div class="coord-box">
@@ -2111,6 +2515,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <button class="btn" id="btn-autocenter">Автоцентрирование: ВКЛ</button>
         <button class="btn btn-secondary" id="btn-reset">Сбросить Траекторию & Вид</button>
+
+        <div class="section-title" style="margin-top: 15px;">Карта меток ArUco (Schema v2)</div>
+        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-size: 12px; color: #8b9bb4;">Метки в реестре:</span>
+                <button class="btn btn-secondary" id="btn-refresh-tags" style="font-size: 11px; padding: 4px 8px; margin: 0;">Обновить</button>
+            </div>
+            <div id="tag-registry-table-container" style="max-height: 150px; overflow-y: auto; font-size: 11px; background: rgba(0,0,0,0.25); border-radius: 4px; padding: 4px;">
+                <div style="color: #666; font-style: italic; padding: 4px;">Загрузка меток...</div>
+            </div>
+            <div style="display: flex; gap: 6px;">
+                <input type="number" id="input-new-tag-id" placeholder="ID" min="0" max="99" style="width: 45px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 4px; border-radius: 4px; text-align: center;">
+                <input type="number" id="input-new-tag-x" placeholder="X (m)" step="0.05" style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 4px; border-radius: 4px; text-align: center;">
+                <input type="number" id="input-new-tag-y" placeholder="Y (m)" step="0.05" style="flex: 1; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 4px; border-radius: 4px; text-align: center;">
+                <button class="btn" id="btn-add-tag-save" style="font-size: 11px; padding: 4px 8px; margin: 0;">💾 Сохр</button>
+            </div>
+        </div>
+
+        <div class="section-title" style="margin-top: 15px;">Мастер автокалибровки метки</div>
+        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+            <div style="display:flex; align-items:center; justify-content:space-between;">
+                <span style="font-size:12px; color:#8b9bb4;">Целевой ID:</span>
+                <input type="number" id="wizard-target-tag" class="calib-input" value="17" min="0" max="99" style="width:50px; text-align:center;">
+                <span id="wizard-status-badge" style="font-weight:600; color:#45a29e; font-size:11px;">IDLE</span>
+            </div>
+            <div style="display:flex; gap: 8px;">
+                <button class="btn" id="btn-wizard-start" style="flex: 1; font-size: 11px; padding: 8px 4px; background-color: #2ecc71; border-color: #2ecc71; margin: 0;">Центрировать & Обучить</button>
+                <button class="btn btn-secondary" id="btn-wizard-abort" style="flex: 1; font-size: 11px; padding: 8px 4px; background-color: #e74c3c; border-color: #e74c3c; color: white; margin: 0;">Стоп</button>
+            </div>
+            <div id="wizard-diagnostics" style="font-size: 11px; color: #8b9bb4; line-height: 1.3; background: rgba(0,0,0,0.2); border-radius: 4px; padding: 4px;">
+                Готов к запуску.
+            </div>
+        </div>
 
         <div class="section-title" style="margin-top: 20px;">Калибровка моторов</div>
         <div class="calib-container">
@@ -3335,6 +3772,219 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 sendDriveCommand();
             }
         }, 100);
+
+        // --- Tag Registry & Calibration Wizard JS Logic ---
+        let currentTagMapRevision = 0;
+        let wizardActive = false;
+
+        async function fetchTagRegistry() {
+            try {
+                const res = await fetch('/api/tags');
+                if (!res.ok) return;
+                const data = await res.json();
+                currentTagMapRevision = data.tag_map_revision || 0;
+
+                const revEpochEl = document.getElementById('sync-rev-epoch');
+                if (revEpochEl) {
+                    revEpochEl.textContent = `rev ${data.tag_map_revision} | epoch ${data.config_epoch}`;
+                }
+
+                const anchorEl = document.getElementById('sync-anchor-badge');
+                if (anchorEl) {
+                    if (data.anchor_tag_id !== null && data.anchor_tag_id !== undefined) {
+                        const statusStr = data.anchor_confirmed ? 'CONFIRMED' : 'UNCONFIRMED';
+                        anchorEl.textContent = `⚓ Tag ${data.anchor_tag_id} [${statusStr}]`;
+                        anchorEl.style.color = data.anchor_confirmed ? '#2ecc71' : '#ffa500';
+                    } else {
+                        anchorEl.textContent = '⚠️ Не назначена';
+                        anchorEl.style.color = '#e74c3c';
+                    }
+                }
+
+                const container = document.getElementById('tag-registry-table-container');
+                if (container && data.tags) {
+                    let html = '<table style="width:100%; border-collapse:collapse; text-align:left;">';
+                    html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.1); color:#66fcf1;"><th>ID</th><th>X</th><th>Y</th><th>Статус</th><th>Действия</th></tr>';
+                    for (const [tid, info] of Object.entries(data.tags)) {
+                        const p = info.pose || {x: 0, y: 0};
+                        const stateColor = info.state === 'confirmed' ? '#2ecc71' : (info.state === 'provisional' ? '#f39c12' : '#888');
+                        const isAnchor = (parseInt(tid) === data.anchor_tag_id);
+                        html += `<tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
+                            <td><b>${tid}</b> ${isAnchor ? '⚓' : ''}</td>
+                            <td>${p.x.toFixed(2)}</td>
+                            <td>${p.y.toFixed(2)}</td>
+                            <td style="color:${stateColor}">${info.state || 'unconfirmed'}</td>
+                            <td>
+                                <button onclick="setAnchorTag(${tid})" style="background:none; border:none; color:#66fcf1; cursor:pointer; font-size:10px;">⚓</button>
+                                <button onclick="deleteTag(${tid})" style="background:none; border:none; color:#e74c3c; cursor:pointer; font-size:10px;">✕</button>
+                            </td>
+                        </tr>`;
+                    }
+                    html += '</table>';
+                    container.innerHTML = html;
+                }
+            } catch (e) {
+                console.error("fetchTagRegistry error:", e);
+            }
+        }
+
+        async function setAnchorTag(tagId) {
+            try {
+                const res = await fetch('/api/anchor/set', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({anchor_tag_id: tagId, confirm: true})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    addLog(`Anchor tag set to ${tagId}`);
+                    fetchTagRegistry();
+                } else {
+                    addLog(`Error setting anchor: ${data.error}`);
+                }
+            } catch (e) {
+                addLog(`Network error setting anchor: ${e}`);
+            }
+        }
+
+        async function deleteTag(tagId) {
+            if (!confirm(`Удалить метку ${tagId}?`)) return;
+            try {
+                const res = await fetch('/api/tags/delete', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tag_id: tagId, expected_revision: currentTagMapRevision})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    addLog(`Tag ${tagId} deleted`);
+                    fetchTagRegistry();
+                } else {
+                    addLog(`Delete error: ${data.error}`);
+                }
+            } catch (e) {
+                addLog(`Network error deleting tag: ${e}`);
+            }
+        }
+
+        async function saveNewTag() {
+            const tidInput = document.getElementById('input-new-tag-id');
+            const xInput = document.getElementById('input-new-tag-x');
+            const yInput = document.getElementById('input-new-tag-y');
+            const tid = parseInt(tidInput.value);
+            const x = parseFloat(xInput.value);
+            const y = parseFloat(yInput.value);
+            if (isNaN(tid) || isNaN(x) || isNaN(y)) {
+                alert("Укажите корректные ID, X и Y");
+                return;
+            }
+
+            const tagData = {
+                enabled: true,
+                state: "confirmed",
+                marker_size_m: 0.100,
+                pose: { x: x, y: y, z: 2.5, roll: 3.1416, pitch: 0.0, yaw: 0.0 }
+            };
+
+            try {
+                const res = await fetch('/api/tags/save', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tag_id: tid, tag_data: tagData, expected_revision: currentTagMapRevision})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    addLog(`Tag ${tid} saved successfully (rev ${data.revision})`);
+                    fetchTagRegistry();
+                } else {
+                    addLog(`Save tag error (${res.status}): ${data.error}`);
+                }
+            } catch (e) {
+                addLog(`Network error saving tag: ${e}`);
+            }
+        }
+
+        async function startWizard() {
+            const tid = parseInt(document.getElementById('wizard-target-tag').value);
+            if (isNaN(tid)) return;
+            try {
+                const res = await fetch('/api/calibration/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({tag_id: tid, marker_size_m: 0.100})
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    wizardActive = true;
+                    addLog(`Wizard started for tag ${tid}`);
+                } else {
+                    addLog(`Failed to start wizard: ${data.error}`);
+                }
+            } catch (e) {
+                addLog(`Network error starting wizard: ${e}`);
+            }
+        }
+
+        async function abortWizard() {
+            try {
+                await fetch('/api/calibration/abort', {method: 'POST'});
+                wizardActive = false;
+                addLog("Wizard aborted");
+            } catch (e) {}
+        }
+
+        async function pollWizardStatus() {
+            try {
+                const res = await fetch('/api/calibration/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                const badge = document.getElementById('wizard-status-badge');
+                const diag = document.getElementById('wizard-diagnostics');
+                if (badge) {
+                    badge.textContent = data.state || 'IDLE';
+                    badge.style.color = (data.state === 'COMPLETED') ? '#2ecc71' : ((data.state === 'ABORTED') ? '#e74c3c' : '#66fcf1');
+                }
+                if (diag) {
+                    if (data.state === 'FINE_CENTERING') {
+                        diag.textContent = `Идет центрирование кадра... (${data.elapsed_s}s)`;
+                    } else if (data.state === 'STATIONARY_SOLVE') {
+                        diag.textContent = `Сбор статических кадров: ${data.samples_count}/30`;
+                    } else if (data.state === 'COMPLETED') {
+                        diag.textContent = `Успешно обучена метка ${data.target_tag_id}!`;
+                        fetchTagRegistry();
+                    } else if (data.state === 'ABORTED') {
+                        diag.textContent = `Ошибка: ${data.abort_reason || 'Отмена'}`;
+                    } else {
+                        diag.textContent = `Режим: ${data.state}`;
+                    }
+                }
+
+                // Send heartbeat while actively running
+                if (data.state && !['IDLE', 'COMPLETED', 'ABORTED'].includes(data.state)) {
+                    wizardActive = true;
+                    fetch('/api/calibration/heartbeat', {method: 'POST'}).catch(() => {});
+                } else {
+                    wizardActive = false;
+                }
+            } catch (e) {}
+        }
+
+        // Attach listeners
+        const btnRefresh = document.getElementById('btn-refresh-tags');
+        if (btnRefresh) btnRefresh.addEventListener('click', fetchTagRegistry);
+
+        const btnSave = document.getElementById('btn-add-tag-save');
+        if (btnSave) btnSave.addEventListener('click', saveNewTag);
+
+        const btnWizStart = document.getElementById('btn-wizard-start');
+        if (btnWizStart) btnWizStart.addEventListener('click', startWizard);
+
+        const btnWizAbort = document.getElementById('btn-wizard-abort');
+        if (btnWizAbort) btnWizAbort.addEventListener('click', abortWizard);
+
+        fetchTagRegistry();
+        setInterval(fetchTagRegistry, 2000);
+        setInterval(pollWizardStatus, 400);
 
         // Старт
         resizeCanvas();

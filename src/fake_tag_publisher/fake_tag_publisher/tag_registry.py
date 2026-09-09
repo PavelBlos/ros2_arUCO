@@ -141,7 +141,19 @@ class TagRegistry:
     @property
     def anchor_tag_id(self) -> Optional[str]:
         with self.lock:
-            return self._data.get("anchor_tag_id")
+            aid = self._data.get("anchor_tag_id")
+            return str(aid) if aid is not None else None
+
+    @property
+    def anchor_confirmed(self) -> bool:
+        with self.lock:
+            aid = self.anchor_tag_id
+            if aid is None:
+                return False
+            tag = self.get_tag(aid)
+            if tag and tag.get("state") == "confirmed":
+                return True
+            return False
 
     def get_tag(self, tag_id: int | str) -> Optional[Dict[str, Any]]:
         norm_id = str(int(str(tag_id).replace("tag_", "")))
@@ -174,6 +186,10 @@ class TagRegistry:
             import copy
             return copy.deepcopy(res)
 
+    def get_active_confirmed_tags(self) -> Dict[str, Any]:
+        """Alias for get_active_tags_for_localization."""
+        return self.get_active_tags_for_localization()
+
     def validate_tag_data(self, tag_id: int | str, data: Dict[str, Any]):
         try:
             num_id = int(str(tag_id).replace("tag_", ""))
@@ -199,12 +215,17 @@ class TagRegistry:
         if pose["z"] <= 0:
             raise ValidationError(f"Ceiling z={pose['z']} must be positive.")
         
+        if "size_mm" not in data and "marker_size_m" in data and data["marker_size_m"] is not None:
+            data["size_mm"] = float(data["marker_size_m"]) * 1000.0
+
         if "size_mm" in data and data["size_mm"] is not None:
             sz = data["size_mm"]
             if not isinstance(sz, (int, float)) or not math.isfinite(sz) or sz < 20.0 or sz > 1000.0:
                 raise ValidationError(f"Marker size_mm={sz} must be between 20 mm and 1000 mm.")
 
-    def set_tag(self, tag_id: int | str, data: Dict[str, Any], expected_revision: Optional[int] = None) -> Tuple[int, str]:
+    def set_tag(self, tag_id: int | str, data: Dict[str, Any], expected_revision: Optional[int] = None, **kwargs) -> Tuple[int, str]:
+        if expected_revision is None and "expected_rev" in kwargs:
+            expected_revision = kwargs["expected_rev"]
         with self.lock:
             if expected_revision is not None and expected_revision != self.revision:
                 raise RevisionConflictError(
@@ -245,15 +266,17 @@ class TagRegistry:
             self.save(comment=f"Set tag {norm_id} (state={tag_entry['state']}, enabled={tag_entry['enabled']})")
             return self.revision, self.sha256
 
-    def delete_tag(self, tag_id: int | str, expected_revision: Optional[int] = None) -> Tuple[int, str]:
+    def delete_tag(self, tag_id: int | str, expected_revision: Optional[int] = None, **kwargs) -> Tuple[int, str]:
         """Soft-disables tag or removes it if unconfirmed."""
+        if expected_revision is None and "expected_rev" in kwargs:
+            expected_revision = kwargs["expected_rev"]
         with self.lock:
             if expected_revision is not None and expected_revision != self.revision:
                 raise RevisionConflictError(f"Revision conflict: expected {expected_revision}, got {self.revision}.")
             norm_id = str(int(str(tag_id).replace("tag_", "")))
             
             if norm_id == self.anchor_tag_id:
-                raise AnchorProtectionError(f"Cannot delete active anchor tag {norm_id}. Designate another anchor first.")
+                raise AnchorProtectionError(f"Cannot delete confirmed anchor tag {norm_id}. Designate another anchor first.")
             
             if norm_id not in self._data.get("tags", {}):
                 raise RegistryError(f"Tag {norm_id} not found in registry.")
@@ -271,6 +294,19 @@ class TagRegistry:
             self._data["revision"] = self.revision + 1
             self.save(comment=action)
             return self.revision, self.sha256
+
+    def set_anchor_tag(self, tag_id: int | str, confirm: bool = True, size_mm: Optional[float] = None, ceiling_z_m: Optional[float] = None, expected_revision: Optional[int] = None) -> Tuple[int, str]:
+        if confirm:
+            sz = size_mm if size_mm is not None else self.default_marker_size_mm
+            cz = ceiling_z_m if ceiling_z_m is not None else self._data.get("ceiling_z_m", 2.5)
+            return self.set_anchor(tag_id, sz, cz, expected_revision)
+        else:
+            with self.lock:
+                norm_id = str(int(str(tag_id).replace("tag_", "")))
+                self._data["anchor_tag_id"] = norm_id
+                self._data["revision"] = self.revision + 1
+                self.save(comment=f"Designated tag {norm_id} as unconfirmed anchor")
+                return self.revision, self.sha256
 
     def set_anchor(self, tag_id: int | str, size_mm: float, ceiling_z_m: float,
                    expected_revision: Optional[int] = None) -> Tuple[int, str]:
