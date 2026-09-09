@@ -167,3 +167,27 @@ def test_joint_pnp_reduces_noise(test_setup):
     x_f, y_f, yaw_f = res["fused_base_pose"]
     assert abs(x_f) < 0.02
     assert abs(y_f) < 0.02
+
+
+def test_three_tag_consensus_failure_holds_odometry():
+    """When N >= 3 tags contradict each other without forming a cluster of >= 2, hold odometry."""
+    fusion = MultiTagFusion()
+    K = np.array([[600., 0., 320.], [0., 600., 240.], [0., 0., 1.]], dtype=np.float64)
+    dist = np.zeros(5)
+    T_base_cam = np.eye(4)
+
+    active_db = {
+        "1": {"state": "confirmed", "enabled": True, "pose": {"x": 0.0, "y": 0.0, "z": 2.5, "roll": math.pi, "pitch": 0.0, "yaw": 0.0}},
+        "2": {"state": "confirmed", "enabled": True, "pose": {"x": 2.0, "y": 0.0, "z": 2.5, "roll": math.pi, "pitch": 0.0, "yaw": 0.0}},
+        "3": {"state": "confirmed", "enabled": True, "pose": {"x": 0.0, "y": 2.0, "z": 2.5, "roll": math.pi, "pitch": 0.0, "yaw": 0.0}},
+    }
+
+    # Synthesize 3 completely contradictory detections that cannot agree with any single camera pose
+    det1 = {"tag_id": 1, "pose_valid": True, "marker_size_mm": 100.0, "distance_m": 2.5, "viewing_angle_deg": 5.0, "reproj_err": 0.5, "marker_area_px": 500.0, "corners_px": [310, 230, 330, 230, 330, 250, 310, 250]}
+    det2 = {"tag_id": 2, "pose_valid": True, "marker_size_mm": 100.0, "distance_m": 2.5, "viewing_angle_deg": 5.0, "reproj_err": 0.5, "marker_area_px": 500.0, "corners_px": [110, 130, 130, 130, 130, 150, 110, 150]}
+    det3 = {"tag_id": 3, "pose_valid": True, "marker_size_mm": 100.0, "distance_m": 2.5, "viewing_angle_deg": 5.0, "reproj_err": 0.5, "marker_area_px": 500.0, "corners_px": [510, 330, 530, 330, 530, 350, 510, 350]}
+
+    res = fusion.process_frame([det1, det2, det3], active_db, K, dist, T_base_cam=T_base_cam, odom_at_stamp=(10.0, 10.0, 0.0))
+    # Should not arbitrarily select tag 1! Must return conflict and None pose.
+    assert res["status"] == "multi_tag_conflict"
+    assert res["fused_base_pose"] is None

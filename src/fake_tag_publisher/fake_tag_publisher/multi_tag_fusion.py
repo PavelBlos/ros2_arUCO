@@ -141,7 +141,13 @@ class MultiTagFusion:
                       dist_coeffs: np.ndarray,
                       T_base_cam: np.ndarray,
                       odom_at_stamp: Tuple[float, float, float],
-                      pred_odom_cov: Optional[np.ndarray] = None) -> Dict[str, Any]:
+                      pred_odom_cov: Optional[np.ndarray] = None,
+                      expected_epoch: Optional[int] = None,
+                      expected_revision: Optional[int] = None,
+                      expected_sha256: Optional[str] = None,
+                      frame_epoch: Optional[int] = None,
+                      frame_revision: Optional[int] = None,
+                      frame_sha256: Optional[str] = None) -> Dict[str, Any]:
         """
         Main fusion entrypoint for a single video frame.
 
@@ -152,10 +158,26 @@ class MultiTagFusion:
           T_base_cam: SE(3) camera extrinsics (base_link -> camera_link)
           odom_at_stamp: (x_ob, y_ob, yaw_ob) odometry pose at frame capture_stamp
           pred_odom_cov: (3x3) predicted odometry covariance matrix
+          expected_epoch, expected_revision, expected_sha256: active tag map config metadata
+          frame_epoch, frame_revision, frame_sha256: metadata from detection frame
 
         Returns:
           Result dictionary with fused base pose, inliers, outliers, residuals, and diagnostics.
         """
+        # 0. Check hot-reload configuration handshake synchronization
+        if expected_revision is not None and frame_revision is not None:
+            if expected_revision != frame_revision or (expected_sha256 and frame_sha256 and expected_sha256 != frame_sha256):
+                return {
+                    "status": "revision_mismatch",
+                    "fused_base_pose": None,
+                    "inlier_ids": [],
+                    "rejected_ids": [str(d.get("tag_id")) for d in detections],
+                    "rejection_reasons": {str(d.get("tag_id")): "revision_mismatch" for d in detections},
+                    "reproj_rms_px": 0.0,
+                    "multi_tag_used": False,
+                    "covariance": pred_odom_cov if pred_odom_cov is not None else np.diag([0.05**2, 0.05**2, 0.05**2])
+                }
+
         # 1. Filter valid confirmed detections
         valid_candidates = []
         for det in detections:
@@ -369,19 +391,48 @@ class MultiTagFusion:
 
         inlier_candidates = [item[0] for item in best_inliers]
         if len(inlier_candidates) < 2:
-            # Fallback to best single tag
-            chosen = candidate_poses[0]
-            x_b, y_b, yaw_b = chosen["base_pose_se2"]
-            return {
-                "status": "single_tag_fallback",
-                "fused_base_pose": (x_b, y_b, yaw_b),
-                "inlier_ids": [chosen["tag_id"]],
-                "rejected_ids": [c["tag_id"] for c in candidate_poses if c["tag_id"] != chosen["tag_id"]],
-                "rejection_reasons": {c["tag_id"]: "consensus_outlier" for c in candidate_poses if c["tag_id"] != chosen["tag_id"]},
-                "reproj_rms_px": float(chosen["cand"]["detection"].get("reproj_err", 0.0)),
-                "multi_tag_used": False,
-                "covariance": chosen["cov_vis"]
-            }
+            # Consensus failed across N >= 3 tags!
+            # Check if odometry can unambiguously select one candidate
+            chosen = None
+            if pred_odom_cov is not None:
+                d_m_list = []
+                for c in candidate_poses:
+                    xc, yc, yawc = c["base_pose_se2"]
+                    dm, _ = compute_mahalanobis_distance(xc, yc, yawc, c["cov_vis"], x_ob, y_ob, yaw_ob, pred_odom_cov)
+                    d_m_list.append((c, dm))
+
+                d_m_list.sort(key=lambda x: x[1])
+                best_c, best_dm = d_m_list[0]
+                second_dm = d_m_list[1][1] if len(d_m_list) > 1 else 999.0
+
+                # Must be consistent with odom and clearly separated from runner-up
+                if best_dm <= math.sqrt(CHI2_3_95) and second_dm > math.sqrt(CHI2_3_999):
+                    chosen = best_c
+
+            if chosen is not None:
+                x_b, y_b, yaw_b = chosen["base_pose_se2"]
+                return {
+                    "status": "consensus_resolved_by_odometry",
+                    "fused_base_pose": (x_b, y_b, yaw_b),
+                    "inlier_ids": [chosen["tag_id"]],
+                    "rejected_ids": [c["tag_id"] for c in candidate_poses if c["tag_id"] != chosen["tag_id"]],
+                    "rejection_reasons": {c["tag_id"]: "consensus_outlier" for c in candidate_poses if c["tag_id"] != chosen["tag_id"]},
+                    "reproj_rms_px": float(chosen["cand"]["detection"].get("reproj_err", 0.0)),
+                    "multi_tag_used": False,
+                    "covariance": chosen["cov_vis"]
+                }
+            else:
+                # Ambiguous conflict: hold dead reckoning odometry, do NOT jump
+                return {
+                    "status": "multi_tag_conflict",
+                    "fused_base_pose": None,
+                    "inlier_ids": [],
+                    "rejected_ids": [c["tag_id"] for c in candidate_poses],
+                    "rejection_reasons": {c["tag_id"]: "multi_tag_consensus_failure" for c in candidate_poses},
+                    "reproj_rms_px": 999.0,
+                    "multi_tag_used": False,
+                    "covariance": pred_odom_cov if pred_odom_cov is not None else np.diag([0.1**2, 0.1**2, 0.1**2])
+                }
 
         # 6. Joint solvePnPRefineLM across all inlier corners
         return self._solve_joint_pnp(inlier_candidates, camera_matrix, dist_coeffs, T_base_cam)

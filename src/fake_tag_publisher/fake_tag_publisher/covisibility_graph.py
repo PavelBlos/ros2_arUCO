@@ -11,6 +11,8 @@ Features:
 
 import math
 import time
+import json
+import os
 import collections
 import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Set
@@ -87,16 +89,25 @@ class CovisibilityGraph:
             tid = int(d["tag_id"])
             st = self._tag_stats[tid]
             st["obs_count"] += 1
-            st["reproj_errs"].append(float(d.get("reproj_err", 1.0)))
-            st["view_angles"].append(float(d.get("viewing_angle_deg", 0.0)))
-            st["robot_positions"].append((robot_pose[0], robot_pose[1]))
-            # Keep rolling history limited to 200
-            if len(st["reproj_errs"]) > 200:
-                st["reproj_errs"] = st["reproj_errs"][-200:]
-                st["view_angles"] = st["view_angles"][-200:]
-                st["robot_positions"] = st["robot_positions"][-200:]
 
-        # 2. Update pairwise edges
+            # Only append to spatial diversity history if robot moved >= 3cm or 2 deg
+            last_pos = st["robot_positions"][-1] if st["robot_positions"] else None
+            moved = True
+            if last_pos is not None:
+                dist_moved = math.hypot(robot_pose[0] - last_pos[0], robot_pose[1] - last_pos[1])
+                if dist_moved < 0.03:
+                    moved = False
+
+            if moved or len(st["robot_positions"]) < 3:
+                st["reproj_errs"].append(float(d.get("reproj_err", 1.0)))
+                st["view_angles"].append(float(d.get("viewing_angle_deg", 0.0)))
+                st["robot_positions"].append((robot_pose[0], robot_pose[1]))
+                if len(st["reproj_errs"]) > 200:
+                    st["reproj_errs"] = st["reproj_errs"][-200:]
+                    st["view_angles"] = st["view_angles"][-200:]
+                    st["robot_positions"] = st["robot_positions"][-200:]
+
+        # 2. Update pairwise edges with canonical (min, max) orientation
         n = len(valid_dets)
         for i in range(n):
             for j in range(i + 1, n):
@@ -105,23 +116,38 @@ class CovisibilityGraph:
                 ta = int(da["tag_id"])
                 tb = int(db["tag_id"])
 
-                # Relative transform T_a_b = T_cam_a^-1 @ T_cam_b
                 T_ca = da.get("T_cameraRos_tag")
                 T_cb = db.get("T_cameraRos_tag")
                 if T_ca is None or T_cb is None:
                     continue
 
-                T_a_b = invert_transform(T_ca) @ T_cb
-                edge_key = (min(ta, tb), max(ta, tb))
+                # Canonical edge: key is (min_id, max_id)
+                # T_min_max maps coordinates from max_id to min_id: p_min = T_min_max @ p_max
+                if ta < tb:
+                    tag_min, tag_max = ta, tb
+                    T_min_max = invert_transform(T_ca) @ T_cb
+                    d_min = float(da.get("distance_m", 2.0))
+                    d_max = float(db.get("distance_m", 2.0))
+                    ang_min = float(da.get("viewing_angle_deg", 0.0))
+                    ang_max = float(db.get("viewing_angle_deg", 0.0))
+                else:
+                    tag_min, tag_max = tb, ta
+                    T_min_max = invert_transform(T_cb) @ T_ca
+                    d_min = float(db.get("distance_m", 2.0))
+                    d_max = float(da.get("distance_m", 2.0))
+                    ang_min = float(db.get("viewing_angle_deg", 0.0))
+                    ang_max = float(da.get("viewing_angle_deg", 0.0))
+
+                edge_key = (tag_min, tag_max)
 
                 obs = CovisibilityObservation(
-                    tag_a=ta,
-                    tag_b=tb,
-                    T_a_b=T_a_b,
-                    distance_a_m=da.get("distance_m", 2.0),
-                    distance_b_m=db.get("distance_m", 2.0),
-                    view_angle_a_deg=da.get("viewing_angle_deg", 0.0),
-                    view_angle_b_deg=db.get("viewing_angle_deg", 0.0),
+                    tag_a=tag_min,
+                    tag_b=tag_max,
+                    T_a_b=T_min_max,
+                    distance_a_m=d_min,
+                    distance_b_m=d_max,
+                    view_angle_a_deg=ang_min,
+                    view_angle_b_deg=ang_max,
                     robot_pose=robot_pose,
                     timestamp=t
                 )
@@ -240,3 +266,108 @@ class CovisibilityGraph:
             "tag_diversities": {str(tid): round(self.get_viewpoint_diversity(tid), 3) for tid in self._tag_stats},
             "tag_degrees": {str(tid): len(self._adj[tid]) for tid in self._tag_stats}
         }
+
+    def estimate_tag_pose_from_anchor(self,
+                                      target_tag_id: int,
+                                      anchor_tag_id: int,
+                                      anchor_pose: Dict[str, float]) -> Optional[Dict[str, float]]:
+        """
+        Estimate 3D pose of target_tag_id in map frame by traversing
+        the co-visibility BFS path from anchor_tag_id.
+        """
+        path = self.find_path_to_anchor(target_tag_id, anchor_tag_id)
+        if not path:
+            return None
+
+        # Path is [target, ..., anchor]. Reverse to traverse [anchor, ..., target]
+        rev_path = list(reversed(path))
+
+        T_map_curr = pose_to_matrix(
+            float(anchor_pose.get("x", 0.0)),
+            float(anchor_pose.get("y", 0.0)),
+            float(anchor_pose.get("z", 2.5)),
+            float(anchor_pose.get("roll", math.pi)),
+            float(anchor_pose.get("pitch", 0.0)),
+            float(anchor_pose.get("yaw", 0.0))
+        )
+
+        for idx in range(len(rev_path) - 1):
+            curr_id = rev_path[idx]
+            next_id = rev_path[idx + 1]
+            edge_key = (min(curr_id, next_id), max(curr_id, next_id))
+            obs_list = self._edge_observations.get(edge_key, [])
+            if not obs_list:
+                return None
+
+            recent_obs = obs_list[-20:]
+            trans_list = [o.T_a_b[:3, 3] for o in recent_obs]
+            med_trans = np.median(trans_list, axis=0)
+
+            T_canon = np.copy(recent_obs[-1].T_a_b)
+            T_canon[:3, 3] = med_trans
+
+            if curr_id < next_id:
+                T_curr_next = T_canon
+            else:
+                T_curr_next = invert_transform(T_canon)
+
+            T_map_curr = T_map_curr @ T_curr_next
+
+        x_est, y_est, z_est, r_est, p_est, yaw_est = matrix_to_pose(T_map_curr)
+        return {
+            "x": round(float(x_est), 4),
+            "y": round(float(y_est), 4),
+            "z": round(float(z_est), 4),
+            "roll": round(float(r_est), 4),
+            "pitch": round(float(p_est), 4),
+            "yaw": round(float(normalize_angle(yaw_est)), 4)
+        }
+
+    def save_to_json(self, filepath: str) -> bool:
+        """Persist graph state to json file."""
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+            data = {
+                "adj": {str(k): list(v) for k, v in self._adj.items()},
+                "tag_stats": {
+                    str(k): {
+                        "obs_count": v["obs_count"],
+                        "reproj_errs": v["reproj_errs"][-50:],
+                        "view_angles": v["view_angles"][-50:],
+                        "robot_positions": v["robot_positions"][-50:]
+                    } for k, v in self._tag_stats.items()
+                },
+                "edges": {
+                    f"{k[0]}_{k[1]}": {
+                        "count": len(obs),
+                        "latest_T": obs[-1].T_a_b.tolist() if obs else None
+                    } for k, obs in self._edge_observations.items()
+                }
+            }
+            tmp = filepath + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, filepath)
+            return True
+        except Exception:
+            return False
+
+    def load_from_json(self, filepath: str) -> bool:
+        """Load graph state from json file."""
+        if not os.path.exists(filepath):
+            return False
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self._adj.clear()
+            for k, v in data.get("adj", {}).items():
+                self._adj[int(k)] = set(int(x) for x in v)
+            for k, v in data.get("tag_stats", {}).items():
+                tid = int(k)
+                self._tag_stats[tid]["obs_count"] = v.get("obs_count", 0)
+                self._tag_stats[tid]["reproj_errs"] = v.get("reproj_errs", [])
+                self._tag_stats[tid]["view_angles"] = v.get("view_angles", [])
+                self._tag_stats[tid]["robot_positions"] = v.get("robot_positions", [])
+            return True
+        except Exception:
+            return False

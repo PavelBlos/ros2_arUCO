@@ -147,8 +147,35 @@ def test_full_calibration_flow_to_completion():
         t += 0.12
         state, cmd, msg = wizard.update([det_centered], True, (1.0, 2.0, 0.0), K, dist, T_base_cam, now=t)
 
-    assert state == WizardState.COMPLETED
+    assert state == WizardState.REVIEW
     assert wizard.calibrated_tag_result is not None
     assert wizard.calibrated_tag_result["tag_id"] == 99
     assert wizard.calibrated_tag_result["state"] == "provisional"
     assert wizard.calibrated_tag_result["diagnostics"]["samples_count"] >= 5
+    assert "covariance" in wizard.calibrated_tag_result
+
+    # 5. Confirm review
+    ok_conf, msg_conf = wizard.confirm_review()
+    assert ok_conf is True
+    assert wizard.state == WizardState.COMPLETED
+
+
+def test_motion_authority_estop():
+    mgr = MotionAuthorityManager()
+    mgr.request_lease(MotionAuthorityMode.MANUAL, duration_sec=5.0)
+    assert mgr.current_mode == MotionAuthorityMode.MANUAL
+
+    # ESTOP preempts manual
+    ok, _ = mgr.request_lease(MotionAuthorityMode.ESTOP)
+    assert ok is True
+    assert mgr.current_mode == MotionAuthorityMode.ESTOP
+
+    # Other requests must be blocked
+    ok_man, _ = mgr.request_lease(MotionAuthorityMode.MANUAL)
+    assert ok_man is False
+    ok_cal, _ = mgr.request_lease(MotionAuthorityMode.CALIBRATION)
+    assert ok_cal is False
+
+    # Clear ESTOP
+    assert mgr.clear_estop() is True
+    assert mgr.current_mode == MotionAuthorityMode.IDLE

@@ -265,3 +265,149 @@ def test_exact_se2_fusion_cycle(mock_node):
     assert abs(mock_node.fused_x - 3.0) < 1e-4
     assert abs(mock_node.fused_y - 3.5) < 1e-4
     assert abs(mock_node.fused_yaw - 0.1) < 1e-4
+
+
+def test_api_settings_get_and_post(mock_node, tmp_path):
+    handler = WebServerHandler.__new__(WebServerHandler)
+    mock_server = MagicMock()
+    mock_server.node = mock_node
+    handler.server = mock_server
+
+    sent_responses = []
+    written_data = []
+    handler.send_response = lambda code: sent_responses.append(code)
+    handler.send_header = lambda k, v: None
+    handler.end_headers = lambda: None
+    handler.wfile = MagicMock()
+    handler.wfile.write = lambda d: written_data.append(d)
+
+    # 1. GET /api/settings
+    handler.path = "/api/settings"
+    handler.do_GET()
+    assert sent_responses[-1] == 200
+    res = json.loads(written_data[-1].decode('utf-8'))
+    assert res["status"] == "ok"
+    assert "filter_alpha" in res["settings"]
+
+    # 2. POST /api/settings
+    update_payload = json.dumps({
+        "settings": {
+            "filter_alpha": 0.28,
+            "ap_cruise_speed": 0.12
+        }
+    }).encode('utf-8')
+    handler.rfile = MagicMock()
+    handler.rfile.read = lambda n: update_payload
+    handler.headers = {'Content-Length': str(len(update_payload))}
+    handler.path = "/api/settings"
+    handler.do_POST()
+
+    assert sent_responses[-1] == 200
+    res_post = json.loads(written_data[-1].decode('utf-8'))
+    assert res_post["status"] == "ok"
+    assert abs(res_post["settings"]["filter_alpha"] - 0.28) < 1e-4
+    assert abs(mock_node.filter_alpha - 0.28) < 1e-4
+    assert abs(mock_node.ap_cruise_speed - 0.12) < 1e-4
+
+def test_api_anchor_wizard_status_and_confirm(mock_node):
+    handler = WebServerHandler.__new__(WebServerHandler)
+    mock_server = MagicMock()
+    mock_server.node = mock_node
+    handler.server = mock_server
+
+    sent_responses = []
+    written_data = []
+    handler.send_response = lambda code: sent_responses.append(code)
+    handler.send_header = lambda k, v: None
+    handler.end_headers = lambda: None
+    handler.wfile = MagicMock()
+    handler.wfile.write = lambda d: written_data.append(d)
+
+    # Mock visible detection
+    mock_node.latest_detections = [{
+        "tag_id": 17,
+        "distance_m": 2.45,
+        "reproj_err": 0.42,
+        "viewing_angle_deg": 4.5
+    }]
+    mock_node.camera_extrinsics_status = "verified"
+
+    # 1. GET /api/anchor/wizard_status
+    handler.path = "/api/anchor/wizard_status"
+    handler.do_GET()
+    assert sent_responses[-1] == 200
+    res = json.loads(written_data[-1].decode('utf-8'))
+    assert res["status"] == "ok"
+    assert res["anchor_tag_id"] == "17"
+    assert res["anchor_confirmed"] is False
+    assert res["ready_for_confirm"] is True
+    assert len(res["visible_candidates"]) == 1
+
+    # 2. POST /api/anchor/confirm
+    confirm_payload = json.dumps({
+        "anchor_tag_id": 17,
+        "size_mm": 100.0,
+        "ceiling_z_m": 2.5
+    }).encode('utf-8')
+    handler.rfile = MagicMock()
+    handler.rfile.read = lambda n: confirm_payload
+    handler.headers = {'Content-Length': str(len(confirm_payload))}
+    handler.path = "/api/anchor/confirm"
+    handler.do_POST()
+
+    assert sent_responses[-1] == 200
+    res_conf = json.loads(written_data[-1].decode('utf-8'))
+    assert res_conf["status"] == "ok"
+    assert mock_node.tag_registry.anchor_confirmed is True
+
+def test_api_calibration_abort_and_confirm(mock_node):
+    handler = WebServerHandler.__new__(WebServerHandler)
+    mock_server = MagicMock()
+    mock_server.node = mock_node
+    handler.server = mock_server
+
+    sent_responses = []
+    written_data = []
+    handler.send_response = lambda code: sent_responses.append(code)
+    handler.send_header = lambda k, v: None
+    handler.end_headers = lambda: None
+    handler.wfile = MagicMock()
+    handler.wfile.write = lambda d: written_data.append(d)
+
+    from tag_calibration_wizard import WizardState, MotionAuthorityMode
+    mock_node.wizard.start(25, 0.100)
+    assert mock_node.wizard.state != WizardState.IDLE
+
+    # POST /api/calibration/abort
+    handler.path = "/api/calibration/abort"
+    handler.rfile = MagicMock()
+    handler.rfile.read = lambda n: b""
+    handler.headers = {'Content-Length': '0'}
+    handler.do_POST()
+
+    assert sent_responses[-1] == 200
+    assert mock_node.wizard.state == WizardState.ABORTED
+    assert mock_node.motion_mgr.current_mode == MotionAuthorityMode.IDLE
+
+    # Simulate reaching REVIEW state and confirm
+    mock_node.wizard.state = WizardState.REVIEW
+    mock_node.wizard.calibrated_tag_result = {
+        "tag_id": 25,
+        "state": "provisional",
+        "enabled": True,
+        "marker_size_m": 0.100,
+        "pose": {"x": 1.0, "y": 2.0, "z": 2.5, "roll": 3.1416, "pitch": 0.0, "yaw": 0.0}
+    }
+    handler.path = "/api/calibration/confirm"
+    handler.do_POST()
+    assert sent_responses[-1] == 200
+    assert mock_node.wizard.state == WizardState.COMPLETED
+    assert "25" in mock_node.tag_registry.get_all_tags()
+
+def test_publish_camera_tf(mock_node):
+    mock_node.tf_broadcaster = MagicMock()
+    mock_node.publish_camera_tf()
+    assert mock_node.tf_broadcaster.sendTransform.called
+    call_args = mock_node.tf_broadcaster.sendTransform.call_args[0][0]
+    assert call_args.header.frame_id == "base_link"
+    assert call_args.child_frame_id == "camera_link"

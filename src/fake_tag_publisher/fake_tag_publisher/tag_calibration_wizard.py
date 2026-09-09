@@ -45,6 +45,7 @@ class MotionAuthorityMode(str, Enum):
     ROUTE = "ROUTE"
     TEST = "TEST"
     CALIBRATION = "CALIBRATION"
+    ESTOP = "ESTOP"
 
 
 class MotionAuthorityManager:
@@ -52,6 +53,7 @@ class MotionAuthorityManager:
     Mutex lease manager for robot motion authority.
     Prevents conflicting autopilot, manual teleop, test drives, and calibration wizard
     from simultaneously publishing cmd_vel.
+    Supports ESTOP override with infinite hold until cleared.
     """
     def __init__(self, default_lease_sec: float = 1.0):
         self._current_mode = MotionAuthorityMode.IDLE
@@ -60,12 +62,22 @@ class MotionAuthorityManager:
 
     @property
     def current_mode(self) -> MotionAuthorityMode:
+        if self._current_mode == MotionAuthorityMode.ESTOP:
+            return MotionAuthorityMode.ESTOP
         if self._current_mode != MotionAuthorityMode.IDLE:
             if time.time() > self._lease_expiry:
                 self._current_mode = MotionAuthorityMode.IDLE
         return self._current_mode
 
     def request_lease(self, mode: MotionAuthorityMode, duration_sec: Optional[float] = None) -> Tuple[bool, str]:
+        if mode == MotionAuthorityMode.ESTOP:
+            self._current_mode = MotionAuthorityMode.ESTOP
+            self._lease_expiry = float('inf')
+            return True, "E-STOP engaged"
+
+        if self._current_mode == MotionAuthorityMode.ESTOP:
+            return False, "Motion authority blocked: E-STOP is active"
+
         now = time.time()
         dur = duration_sec if duration_sec is not None else self._default_lease_sec
         active = self.current_mode
@@ -78,6 +90,8 @@ class MotionAuthorityManager:
             return False, f"Motion authority conflict: currently held by {active.value}"
 
     def renew_lease(self, mode: MotionAuthorityMode, duration_sec: Optional[float] = None) -> Tuple[bool, str]:
+        if self._current_mode == MotionAuthorityMode.ESTOP:
+            return False, "Cannot renew: E-STOP is active"
         now = time.time()
         dur = duration_sec if duration_sec is not None else self._default_lease_sec
         if self._current_mode == mode:
@@ -87,6 +101,13 @@ class MotionAuthorityManager:
 
     def release_lease(self, mode: MotionAuthorityMode) -> bool:
         if self._current_mode == mode:
+            self._current_mode = MotionAuthorityMode.IDLE
+            self._lease_expiry = 0.0
+            return True
+        return False
+
+    def clear_estop(self) -> bool:
+        if self._current_mode == MotionAuthorityMode.ESTOP:
             self._current_mode = MotionAuthorityMode.IDLE
             self._lease_expiry = 0.0
             return True
@@ -103,6 +124,7 @@ class WizardState(str, Enum):
     STOPPED_CHECK = "STOPPED_CHECK"
     STATIONARY_SOLVE = "STATIONARY_SOLVE"
     VERIFYING = "VERIFYING"
+    REVIEW = "REVIEW"
     COMPLETED = "COMPLETED"
     ABORTED = "ABORTED"
 
@@ -122,7 +144,8 @@ class TagCalibrationWizard:
                  min_stationary_frames: int = 30,
                  stationary_duration_sec: float = 1.0,
                  max_lin_vel: float = 0.04,
-                 max_ang_vel: float = 0.15):
+                 max_ang_vel: float = 0.15,
+                 auto_confirm: bool = False):
         self.motion_mgr = motion_manager if motion_manager is not None else MotionAuthorityManager()
         self.cx = cx
         self.cy = cy
@@ -134,6 +157,7 @@ class TagCalibrationWizard:
         self.stationary_duration_sec = stationary_duration_sec
         self.max_lin_vel = max_lin_vel
         self.max_ang_vel = max_ang_vel
+        self.auto_confirm = auto_confirm
 
         # Internal state
         self.state = WizardState.IDLE
@@ -257,23 +281,49 @@ class TagCalibrationWizard:
             dv = v_tag - self.cy
             pixel_dist = math.sqrt(du**2 + dv**2)
 
-            if pixel_dist <= self.centering_tol_px:
+            # Check if 3D base-frame error is available
+            T_c_tag = target_det.get("T_cameraRos_tag")
+            use_3d = False
+            e_fwd = 0.0
+            e_str = 0.0
+            if T_c_tag is not None:
+                try:
+                    T_base_tag = T_base_cam @ T_c_tag
+                    e_fwd = float(T_base_tag[0, 3])
+                    e_str = float(T_base_tag[1, 3])
+                    use_3d = True
+                except Exception:
+                    use_3d = False
+
+            centered_by_pixels = (pixel_dist <= self.centering_tol_px)
+            centered_by_3d = use_3d and (abs(e_fwd) <= 0.015 and abs(e_str) <= 0.015)
+
+            if centered_by_pixels or centered_by_3d:
                 # Centering target reached! Transition to SETTLING
                 self._transition_to(WizardState.SETTLING, t)
                 return self.state, (0.0, 0.0, 0.0), f"Centering error {pixel_dist:.1f}px <= {self.centering_tol_px}px. Entering settling delay."
 
-            # Visual Servoing Velocity Calculation:
-            # Camera optical looking up at ceiling:
-            #   Image -v (UP) corresponds to robot forward (+x)
-            #   Image -u (LEFT) corresponds to robot left (+y)
-            # Therefore:
-            #   vx proportional to (cy - v_tag) = -dv
-            #   vy proportional to (cx - u_tag) = -du
-            kp = 0.0006  # velocity gain m/s per pixel
-            vx = max(-self.max_lin_vel, min(self.max_lin_vel, -dv * kp))
-            vy = max(-self.max_lin_vel, min(self.max_lin_vel, -du * kp))
-            omega = 0.0
+            # Calculate centering velocity in REP-103 (+X forward, +Y left)
+            if use_3d:
+                kp = 0.40
+                vx = max(-self.max_lin_vel, min(self.max_lin_vel, e_fwd * kp))
+                vy = max(-self.max_lin_vel, min(self.max_lin_vel, e_str * kp))
+                # Deadband 10mm
+                if abs(e_fwd) < 0.010:
+                    vx = 0.0
+                if abs(e_str) < 0.010:
+                    vy = 0.0
+            else:
+                # 2D fallback: -dv is forward, -du is left
+                kp = 0.0006
+                vx = max(-self.max_lin_vel, min(self.max_lin_vel, -dv * kp))
+                vy = max(-self.max_lin_vel, min(self.max_lin_vel, -du * kp))
+                if abs(dv) < 5.0:
+                    vx = 0.0
+                if abs(du) < 5.0:
+                    vy = 0.0
 
+            omega = 0.0
             return self.state, (float(vx), float(vy), float(omega)), f"Centering: error={pixel_dist:.1f}px, cmd=({vx:.3f}, {vy:.3f})"
 
         if self.state == WizardState.SETTLING:
@@ -306,7 +356,6 @@ class TagCalibrationWizard:
                 res_pnp = solve_single_tag_ippe(corners, self.marker_size_m, camera_matrix, dist_coeffs)
                 if res_pnp.get("pose_valid", False):
                     # Compute tag pose in map frame using current robot pose
-                    # T_map_base
                     x_r, y_r, yaw_r = current_robot_pose
                     T_map_base = pose_to_matrix(x_r, y_r, 0.0, 0.0, 0.0, yaw_r)
                     T_map_camRos = T_map_base @ T_base_cam
@@ -339,21 +388,58 @@ class TagCalibrationWizard:
             yaws = [s["yaw"] for s in self.collected_samples]
             errs = [s["reproj_err"] for s in self.collected_samples]
             views = [s["viewing_angle_deg"] for s in self.collected_samples]
+            pitches = [s.get("pitch", 0.0) for s in self.collected_samples]
 
+            # Outlier rejection: 3-sigma from median
             med_x = float(np.median(xs))
             med_y = float(np.median(ys))
             med_z = float(np.median(zs))
-            med_yaw = float(np.median(yaws))
-            med_err = float(np.median(errs))
-            med_view = float(np.median(views))
+            std_x = max(1e-4, float(np.std(xs)))
+            std_y = max(1e-4, float(np.std(ys)))
+            std_z = max(1e-4, float(np.std(zs)))
 
-            # Verification criteria
-            if med_err > 2.0:
-                self.abort(f"High reprojection error in calibration: {med_err:.2f}px > 2.0px")
+            inlier_samples = [
+                s for s in self.collected_samples
+                if abs(s["x"] - med_x) <= 3.0 * std_x
+                and abs(s["y"] - med_y) <= 3.0 * std_y
+                and abs(s["z"] - med_z) <= 3.0 * std_z
+            ]
+            if len(inlier_samples) < 3:
+                inlier_samples = self.collected_samples
+
+            i_xs = [s["x"] for s in inlier_samples]
+            i_ys = [s["y"] for s in inlier_samples]
+            i_zs = [s["z"] for s in inlier_samples]
+            i_yaws = [s["yaw"] for s in inlier_samples]
+            i_errs = [s["reproj_err"] for s in inlier_samples]
+            i_views = [s["viewing_angle_deg"] for s in inlier_samples]
+            i_pitches = [s.get("pitch", 0.0) for s in inlier_samples]
+
+            final_x = float(np.mean(i_xs))
+            final_y = float(np.mean(i_ys))
+            final_z = float(np.mean(i_zs))
+            final_yaw = float(np.median(i_yaws))
+            final_err = float(np.mean(i_errs))
+            final_view = float(np.mean(i_views))
+            med_pitch = float(np.median(i_pitches))
+
+            # Quality criteria
+            if final_err > 2.0:
+                self.abort(f"High reprojection error in calibration: {final_err:.2f}px > 2.0px")
                 return self.state, (0.0, 0.0, 0.0), self.abort_reason
-            if med_view > 30.0:
-                self.abort(f"Viewing angle too steep: {med_view:.1f}deg > 30.0deg")
+            if final_view > 35.0:
+                self.abort(f"Viewing angle too steep: {final_view:.1f}deg > 35.0deg")
                 return self.state, (0.0, 0.0, 0.0), self.abort_reason
+            # Ceiling plane check: pitch within +/- 5 deg (0.09 rad)
+            if abs(med_pitch) > 0.09:
+                self.abort(f"Tag out-of-plane pitch: {math.degrees(med_pitch):.1f}deg > 5.0deg")
+                return self.state, (0.0, 0.0, 0.0), self.abort_reason
+
+            cov_3x3 = [
+                [round(float(np.var(i_xs)), 6), 0.0, 0.0],
+                [0.0, round(float(np.var(i_ys)), 6), 0.0],
+                [0.0, 0.0, round(float(np.var(i_yaws)), 6)]
+            ]
 
             self.calibrated_tag_result = {
                 "tag_id": self.target_tag_id,
@@ -361,27 +447,44 @@ class TagCalibrationWizard:
                 "enabled": True,
                 "marker_size_m": self.marker_size_m,
                 "pose": {
-                    "x": round(med_x, 4),
-                    "y": round(med_y, 4),
-                    "z": round(med_z, 4),
+                    "x": round(final_x, 4),
+                    "y": round(final_y, 4),
+                    "z": round(final_z, 4),
                     "roll": round(math.pi, 4),
                     "pitch": 0.0,
-                    "yaw": round(normalize_angle(med_yaw), 4)
+                    "yaw": round(normalize_angle(final_yaw), 4)
                 },
+                "covariance": cov_3x3,
                 "diagnostics": {
                     "samples_count": len(self.collected_samples),
-                    "reproj_rms_px": round(med_err, 3),
-                    "viewing_angle_deg": round(med_view, 1),
-                    "std_x_mm": round(float(np.std(xs) * 1000.0), 2),
-                    "std_y_mm": round(float(np.std(ys) * 1000.0), 2)
+                    "inliers_count": len(inlier_samples),
+                    "reproj_rms_px": round(final_err, 3),
+                    "viewing_angle_deg": round(final_view, 1),
+                    "std_x_mm": round(float(np.std(i_xs) * 1000.0), 2),
+                    "std_y_mm": round(float(np.std(i_ys) * 1000.0), 2)
                 }
             }
 
-            self._transition_to(WizardState.COMPLETED, t)
-            self.motion_mgr.release_lease(MotionAuthorityMode.CALIBRATION)
-            return self.state, (0.0, 0.0, 0.0), f"Calibration successful for tag {self.target_tag_id}"
+            if getattr(self, 'auto_confirm', False):
+                self._transition_to(WizardState.COMPLETED, t)
+                self.motion_mgr.release_lease(MotionAuthorityMode.CALIBRATION)
+                return self.state, (0.0, 0.0, 0.0), f"Calibration successful for tag {self.target_tag_id}"
+            else:
+                self._transition_to(WizardState.REVIEW, t)
+                return self.state, (0.0, 0.0, 0.0), f"Calibration complete, awaiting user review for tag {self.target_tag_id}"
+
+        if self.state == WizardState.REVIEW:
+            return self.state, (0.0, 0.0, 0.0), "Awaiting user confirmation in REVIEW state"
 
         return self.state, (0.0, 0.0, 0.0), f"Unhandled state {self.state.value}"
+
+    def confirm_review(self) -> Tuple[bool, str]:
+        """Confirm calibration result from REVIEW state and transition to COMPLETED."""
+        if self.state != WizardState.REVIEW:
+            return False, f"Cannot confirm calibration in state {self.state.value}"
+        self._transition_to(WizardState.COMPLETED, time.time())
+        self.motion_mgr.release_lease(MotionAuthorityMode.CALIBRATION)
+        return True, "Calibration result confirmed by user"
 
     def _transition_to(self, new_state: WizardState, now: float):
         self.state = new_state

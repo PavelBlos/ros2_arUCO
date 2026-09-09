@@ -282,11 +282,11 @@ class TermitRobotAPI:
 
     def drive(self, vx: float, vy: float, omega: float = 0.0):
         """
-        ВЫСОКИЙ УРОВЕНЬ: Управление вектором движения тела робота (Twist).
-        Плавный разгон и торможение производятся автоматически.
+        ВЫСОКИЙ УРОВЕНЬ: Управление вектором движения тела робота (Twist) по стандарту ROS REP-103.
+        Плавный разгон и торможение производятся автоматически на контроллере.
         
-        :param vx: Линейная скорость вдоль оси робота (вправо > 0, влево < 0) в м/с
-        :param vy: Линейная скорость вперед/назад (вперед > 0, назад < 0) в м/с
+        :param vx: Линейная скорость вперед/назад по REP-103 (вперед > 0, назад < 0) в м/с
+        :param vy: Линейная скорость влево/вправо по REP-103 (влево > 0, вправо < 0) в м/с
         :param omega: Угловая скорость вращения робота (против часовой > 0) в рад/с
         """
         # Ограничение допустимых пределов
@@ -326,9 +326,14 @@ class TermitRobotAPI:
             return self._direct_speeds
         c = self.config
         vx, vy, w = self._target_vx, self._target_vy, self._target_omega
-        wheels = ((vx + w * c.base_radius) * c.inv_m1,
-                  (-c.side_ratio * vx - 0.866025 * vy + w * c.base_radius) * c.inv_m2,
-                  (-c.side_ratio * vx + 0.866025 * vy + w * c.base_radius) * c.inv_m3)
+        # Standard REP-103 3-omni kinematics (+X forward, +Y left, +w CCW):
+        # Wheel 1 (front): drives purely in Y direction.
+        # Wheel 2 (rear right, at -150 deg): -sqrt(3)/2 * vx + 0.5 * vy + w*L
+        # Wheel 3 (rear left, at +150 deg): +sqrt(3)/2 * vx + 0.5 * vy + w*L
+        sqrt3_2 = 0.8660254037844386
+        wheels = ((-vy + w * c.base_radius) * c.inv_m1,
+                  (-sqrt3_2 * vx + c.side_ratio * vy + w * c.base_radius) * c.inv_m2,
+                  (+sqrt3_2 * vx + c.side_ratio * vy + w * c.base_radius) * c.inv_m3)
         steps = [v * self._steps_per_meter for v in wheels]
         # Scale together to preserve the requested direction when saturated.
         scale = max(1.0, max(abs(v) for v in steps) / c.max_motor_speed_steps)
@@ -415,9 +420,13 @@ class TermitRobotAPI:
                 vx=self._odom.vx,
                 vy=self._odom.vy,
                 omega=self._odom.omega,
+                dx_body=self._odom.dx_body,
+                dy_body=self._odom.dy_body,
+                dtheta=self._odom.dtheta,
                 wheel_steps=self._odom.wheel_steps,
                 wheel_speeds=self._odom.wheel_speeds,
-                timestamp=self._odom.timestamp
+                timestamp=self._odom.timestamp,
+                epoch=self._odom.epoch
             )
 
     def reset_odometry(self, x: float = 0.0, y: float = 0.0, theta: float = 0.0):

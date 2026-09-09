@@ -86,7 +86,7 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
         # Configs
         cfg_dir = os.path.join(publisher_dir, 'config')
         if os.path.exists(cfg_dir):
-            for c in ['camera_info.yaml', 'camera_extrinsics.yaml', 'tags_config.yaml']:
+            for c in ['camera_info.yaml', 'camera_extrinsics.yaml', 'tags_config.yaml', 'runtime_settings.yaml']:
                 cp = os.path.join(cfg_dir, c)
                 if os.path.exists(cp):
                     files[f'src/fake_tag_publisher/config/{c}'] = cp
@@ -104,7 +104,7 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
                         files[pyf] = os.path.join(py_dir, pyf)
 
     # 3. Root helper scripts and configuration
-    for root_f in ['start_termit.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml']:
+    for root_f in ['start_termit.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml', 'runtime_settings.yaml']:
         rp = os.path.join(base_dir, root_f)
         if os.path.exists(rp):
             files[root_f] = rp

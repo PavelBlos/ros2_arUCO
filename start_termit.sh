@@ -65,8 +65,7 @@ echo "[+] Active release directory: ${SCRIPT_DIR}"
 echo "[+] Using localization_node:  ${LOC_PY}"
 echo "[+] Using video_tag_detector: ${VID_PY}"
 
-echo "[+] Starting Static TF (base_link -> camera_link)..."
-ros2 run tf2_ros static_transform_publisher --x 0.0 --y 0.0 --z 0.0 --roll 0.0 --pitch -1.570796 --yaw 1.570796 --frame-id base_link --child-frame-id camera_link > /tmp/static_tf.log 2>&1 &
+echo "[+] Dynamic Camera TF (base_link -> camera_link) is broadcast by localization_node from camera_extrinsics.yaml"
 
 echo "[+] Starting Video Tag Detector (CSI Camera via libcamerify)..."
 /usr/local/bin/libcamerify python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &

@@ -82,5 +82,80 @@ class ControlTests(unittest.TestCase):
         self.api._control_tick(2)
         self.assertNotIn('s 500 0 0', self.sent[self.sent.index('x') + 1:])
 
+    def test_rep103_forward_motion(self):
+        self.api.drive(0.10, 0.0, 0.0)
+        s1, s2, s3 = self.api._target_steps_locked()
+        self.assertEqual(s1, 0, "Front wheel should have 0 speed during pure forward motion")
+        self.assertLess(s2, 0, "Rear-right wheel should rotate backwards")
+        self.assertGreater(s3, 0, "Rear-left wheel should rotate forwards")
+        self.assertEqual(abs(s2), abs(s3), "Rear wheels should have equal and opposite speeds")
+
+    def test_rep103_backward_motion(self):
+        self.api.drive(-0.10, 0.0, 0.0)
+        s1, s2, s3 = self.api._target_steps_locked()
+        self.assertEqual(s1, 0, "Front wheel should have 0 speed during pure backward motion")
+        self.assertGreater(s2, 0, "Rear-right wheel should rotate forwards")
+        self.assertLess(s3, 0, "Rear-left wheel should rotate backwards")
+        self.assertEqual(abs(s2), abs(s3))
+
+    def test_rep103_left_motion(self):
+        self.api.drive(0.0, 0.10, 0.0)
+        s1, s2, s3 = self.api._target_steps_locked()
+        self.assertLess(s1, 0, "Front wheel drives robot left")
+        self.assertGreater(s2, 0, "Rear-right wheel supports leftward motion")
+        self.assertGreater(s3, 0, "Rear-left wheel supports leftward motion")
+        self.assertEqual(s2, s3, "Rear wheels should have identical speeds during pure strafe")
+        self.assertEqual(abs(s1), 2 * s2, "Front wheel speed should equal 2 * rear wheel speed")
+
+    def test_rep103_right_motion(self):
+        self.api.drive(0.0, -0.10, 0.0)
+        s1, s2, s3 = self.api._target_steps_locked()
+        self.assertGreater(s1, 0)
+        self.assertLess(s2, 0)
+        self.assertLess(s3, 0)
+        self.assertEqual(s2, s3)
+        self.assertEqual(s1, 2 * abs(s2))
+
+    def test_rep103_ccw_rotation(self):
+        self.api.drive(0.0, 0.0, 0.5)
+        s1, s2, s3 = self.api._target_steps_locked()
+        self.assertGreater(s1, 0)
+        self.assertGreater(s2, 0)
+        self.assertGreater(s3, 0)
+        self.assertEqual(s1, s2)
+        self.assertEqual(s2, s3)
+
+    def test_rep103_cw_rotation(self):
+        self.api.drive(0.0, 0.0, -0.5)
+        s1, s2, s3 = self.api._target_steps_locked()
+        self.assertLess(s1, 0)
+        self.assertLess(s2, 0)
+        self.assertLess(s3, 0)
+        self.assertEqual(s1, s2)
+        self.assertEqual(s2, s3)
+
+    def test_rep103_odometry_consistency(self):
+        # 70mm wheel diameter check
+        self.assertAlmostEqual(self.api.config.wheel_radius, 0.035, places=4)
+        # Test odometry processing: simulate steps resulting from 0.1 m/s forward for 0.1s
+        # Steps per meter:
+        spm = self.api._steps_per_meter
+        # Pure forward 0.1 m/s for 0.1s -> ds = 0.01m
+        # For pure forward: ds1=0, ds2=-0.866025*0.01, ds3=+0.866025*0.01
+        ds = 0.01
+        sqrt3_2 = 0.8660254037844386
+        dp1 = 0
+        dp2 = int(round(-sqrt3_2 * ds * spm))
+        dp3 = int(round(+sqrt3_2 * ds * spm))
+        
+        self.api._last_wheel_steps = (0, 0, 0)
+        self.api._last_odom_time = 1.0
+        self.api._process_odometry_update(dp1, dp2, dp3, 0, 0, 0)
+        odom = self.api.get_odometry()
+        # Robot dx_body should be approximately +0.01m forward, dy_body ~ 0
+        self.assertAlmostEqual(odom.dx_body, ds, delta=0.001)
+        self.assertAlmostEqual(odom.dy_body, 0.0, delta=0.001)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -2,6 +2,7 @@
 test_covisibility_graph.py - Unit tests for CovisibilityGraph.
 """
 
+import math
 import numpy as np
 import pytest
 import os
@@ -88,3 +89,34 @@ def test_viewpoint_diversity_and_confidence():
     diag = graph.get_diagnostics()
     assert "17" in diag["tag_confidences"]
     assert diag["total_tags_tracked"] == 1
+
+
+def test_covisibility_persistence_and_propagation(tmp_path):
+    from geometry_transforms import pose_to_matrix
+    graph = CovisibilityGraph()
+    # Tag 17 at (0, 0, 2.5), Tag 18 at (1.0, 0.0, 2.5)
+    # Camera at (0, 0, 0)
+    T_c_17 = pose_to_matrix(0.0, 0.0, 2.5, math.pi, 0.0, 0.0)
+    T_c_18 = pose_to_matrix(1.0, 0.0, 2.5, math.pi, 0.0, 0.0)
+
+    det17 = {"tag_id": 17, "pose_valid": True, "reproj_err": 0.5, "distance_m": 2.5, "viewing_angle_deg": 5.0, "T_cameraRos_tag": T_c_17}
+    det18 = {"tag_id": 18, "pose_valid": True, "reproj_err": 0.5, "distance_m": 2.5, "viewing_angle_deg": 5.0, "T_cameraRos_tag": T_c_18}
+
+    graph.record_frame_observations([det17, det18], (0.0, 0.0, 0.0), timestamp=1.0)
+    assert graph.get_edge_observations_count(17, 18) == 1
+
+    # Estimate pose of tag 18 from tag 17
+    anchor_pose = {"x": 0.0, "y": 0.0, "z": 2.5, "roll": math.pi, "pitch": 0.0, "yaw": 0.0}
+    est = graph.estimate_tag_pose_from_anchor(18, 17, anchor_pose)
+    assert est is not None
+    assert abs(est["x"] - 1.0) < 0.05
+    assert abs(est["y"] - 0.0) < 0.05
+    assert abs(est["z"] - 2.5) < 0.05
+
+    # Test persistence
+    json_path = str(tmp_path / "covis_test.json")
+    assert graph.save_to_json(json_path) is True
+    graph2 = CovisibilityGraph()
+    assert graph2.load_from_json(json_path) is True
+    assert 17 in graph2._adj
+    assert 18 in graph2._adj[17]
