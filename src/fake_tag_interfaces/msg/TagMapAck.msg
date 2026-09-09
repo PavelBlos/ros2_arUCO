@@ -1,0 +1,7 @@
+builtin_interfaces/Time stamp
+uint32 config_epoch
+uint32 detector_revision
+string detector_sha256
+string node_name
+string status
+string error_message
