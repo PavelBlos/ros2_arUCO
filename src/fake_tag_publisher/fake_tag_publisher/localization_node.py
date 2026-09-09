@@ -466,6 +466,7 @@ class LocalizationNode(Node):
     def on_esp32_odometry(self, odom):
         """Коллбэк прямой одометрии шаговых двигателей от TermitRobotAPI (20-50 Гц)"""
         self.last_esp32_odom_time = time.time()
+        self.last_esp32_odom = odom
         now = self.get_clock().now()
         dt = 0.04
         
@@ -1039,6 +1040,28 @@ class LocalizationNode(Node):
                     q.put_nowait(web_data)
                 except:
                     pass
+
+        if self.active_log_file:
+            rec = {
+                "t": float(stamp_sec),
+                "run_id": self.active_run_id,
+                "rx": float(self.fused_x),
+                "ry": float(self.fused_y),
+                "rz": float(self.fused_z),
+                "ryaw": float(self.fused_yaw),
+                "mode": self.tracking_mode,
+                "dist_filtered": float(self.filtered_path_length),
+                "auto_active": bool(self.autopilot_active),
+                "wp_idx": int(self.current_wp_idx) if self.autopilot_active else None,
+            }
+            if hasattr(self, 'last_esp32_odom') and self.last_esp32_odom:
+                rec["odom_x"] = float(self.last_esp32_odom.x)
+                rec["odom_y"] = float(self.last_esp32_odom.y)
+                rec["odom_theta"] = float(self.last_esp32_odom.theta)
+                rec["odom_vx"] = float(self.last_esp32_odom.vx)
+                rec["odom_vy"] = float(self.last_esp32_odom.vy)
+                rec["odom_w"] = float(self.last_esp32_odom.omega)
+            self.log_record(rec)
 
     def publish_plan(self, points):
         self.get_logger().info(f"Publishing new path plan with {len(points)} waypoints")
