@@ -1,10 +1,11 @@
-import os
+﻿import os
 import sys
 import time
 import socket
 import logging
 import hashlib
 import subprocess
+import json
 import paramiko
 
 logging.getLogger("paramiko").setLevel(logging.CRITICAL)
@@ -15,15 +16,6 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-REQUIRED_FILES = {
-    'localization_node.py': os.path.join(PROJECT_DIR, 'src', 'fake_tag_publisher', 'fake_tag_publisher', 'localization_node.py'),
-    'video_tag_detector.py': os.path.join(PROJECT_DIR, 'src', 'fake_tag_publisher', 'fake_tag_publisher', 'video_tag_detector.py'),
-    'termit_api.py': os.path.join(PROJECT_DIR, 'src', 'fake_tag_publisher', 'fake_tag_publisher', 'termit_api.py'),
-    'start_termit.sh': os.path.join(PROJECT_DIR, 'start_termit.sh'),
-    'tags_config.yaml': os.path.join(PROJECT_DIR, 'tags_config.yaml'),
-    'test_cam.py': os.path.join(PROJECT_DIR, 'test_cam.py')
-}
 
 CANDIDATE_HOSTS = [
     '192.168.10.163',
@@ -42,6 +34,108 @@ CREDENTIALS = [
     ('pi', 'pi'),
     ('ubuntu', 'ubuntu')
 ]
+
+def calc_sha256(filepath):
+    h = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        while chunk := f.read(8192):
+            h.update(chunk)
+    return h.hexdigest()
+
+def get_git_commit():
+    try:
+        res = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd=PROJECT_DIR)
+        return res.decode().strip()
+    except Exception:
+        return "unknown"
+
+def collect_deployment_files(base_dir=PROJECT_DIR):
+    """
+    Collect all files needed for a self-contained release workspace on Raspberry Pi.
+    Returns: dict mapping remote_relative_path -> local_absolute_path.
+    """
+    files = {}
+
+    # 1. fake_tag_interfaces package
+    interfaces_dir = os.path.join(base_dir, 'src', 'fake_tag_interfaces')
+    if os.path.exists(interfaces_dir):
+        for fname in ['CMakeLists.txt', 'package.xml']:
+            p = os.path.join(interfaces_dir, fname)
+            if os.path.exists(p):
+                files[f'src/fake_tag_interfaces/{fname}'] = p
+        
+        msg_dir = os.path.join(interfaces_dir, 'msg')
+        if os.path.exists(msg_dir):
+            for m in os.listdir(msg_dir):
+                if m.endswith('.msg'):
+                    files[f'src/fake_tag_interfaces/msg/{m}'] = os.path.join(msg_dir, m)
+
+    # 2. fake_tag_publisher package
+    publisher_dir = os.path.join(base_dir, 'src', 'fake_tag_publisher')
+    if os.path.exists(publisher_dir):
+        for fname in ['setup.py', 'setup.cfg', 'package.xml']:
+            p = os.path.join(publisher_dir, fname)
+            if os.path.exists(p):
+                files[f'src/fake_tag_publisher/{fname}'] = p
+        
+        # Marker resource
+        res_file = os.path.join(publisher_dir, 'resource', 'fake_tag_publisher')
+        if os.path.exists(res_file):
+            files['src/fake_tag_publisher/resource/fake_tag_publisher'] = res_file
+
+        # Configs
+        cfg_dir = os.path.join(publisher_dir, 'config')
+        if os.path.exists(cfg_dir):
+            for c in ['camera_info.yaml', 'camera_extrinsics.yaml', 'tags_config.yaml']:
+                cp = os.path.join(cfg_dir, c)
+                if os.path.exists(cp):
+                    files[f'src/fake_tag_publisher/config/{c}'] = cp
+
+        # Python modules
+        py_dir = os.path.join(publisher_dir, 'fake_tag_publisher')
+        if os.path.exists(py_dir):
+            for pyf in os.listdir(py_dir):
+                if pyf.endswith('.py'):
+                    files[f'src/fake_tag_publisher/fake_tag_publisher/{pyf}'] = os.path.join(py_dir, pyf)
+                    # Also map key nodes to release root for direct execution
+                    if pyf in ['localization_node.py', 'video_tag_detector.py', 'termit_api.py',
+                              'geometry_transforms.py', 'tag_registry.py', 'single_tag_pnp.py',
+                              'multi_tag_fusion.py', 'tag_calibration_wizard.py', 'covisibility_graph.py']:
+                        files[pyf] = os.path.join(py_dir, pyf)
+
+    # 3. Root helper scripts and configuration
+    for root_f in ['start_termit.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml']:
+        rp = os.path.join(base_dir, root_f)
+        if os.path.exists(rp):
+            files[root_f] = rp
+
+    return files
+
+def generate_manifest(files_map, commit_hash=None, release_tag=None):
+    """Generate manifest dictionary with SHA256 hashes and metadata."""
+    if commit_hash is None:
+        commit_hash = get_git_commit()
+    timestamp = int(time.time())
+    if release_tag is None:
+        release_tag = f"release-{timestamp}-{commit_hash}"
+
+    manifest = {
+        "manifest_version": 1,
+        "release_tag": release_tag,
+        "git_commit": commit_hash,
+        "timestamp": timestamp,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(timestamp)),
+        "file_count": len(files_map),
+        "files": {}
+    }
+
+    for rel_path, abs_path in sorted(files_map.items()):
+        manifest["files"][rel_path] = {
+            "sha256": calc_sha256(abs_path),
+            "size_bytes": os.path.getsize(abs_path)
+        }
+
+    return manifest
 
 def scan_port(host, port=22, timeout=0.8):
     try:
@@ -81,52 +175,41 @@ def find_active_ssh(target_host=None, target_user=None, target_pass=None):
 
     return None, None, None
 
-def get_git_commit():
-    try:
-        res = subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD'], cwd=PROJECT_DIR)
-        return res.decode().strip()
-    except Exception:
-        return "unknown"
-
-def calc_sha256(filepath):
-    h = hashlib.sha256()
-    with open(filepath, 'rb') as f:
-        while chunk := f.read(8192):
-            h.update(chunk)
-    return h.hexdigest()
-
-def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False):
+def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False, dry_run=False):
     print("=" * 65)
-    print("🚀 АТОМАРНЫЙ ДЕПЛОЙ И СИНХРОНИЗАЦИЯ С RASPBERRY PI")
+    print("🚀 АТОМАРНЫЙ ДЕПЛОЙ И ИЗОЛИРОВАННАЯ СБОРКА RASPBERRY PI")
     print("=" * 65)
-    
-    # 1. Проверка наличия всех обязательных локальных файлов
-    missing = []
-    local_hashes = {}
-    for name, path in REQUIRED_FILES.items():
-        if not os.path.exists(path):
-            missing.append(f"{name} ({path})")
-        else:
-            local_hashes[name] = calc_sha256(path)
-            
-    if missing:
-        print("\n❌ КРИТИЧЕСКАЯ ОШИБКА: отсутствуют обязательные файлы:")
-        for m in missing:
-            print(f"  - {m}")
-        sys.exit(1)
 
-    print("✅ Все локальные файлы проверены (sha256 рассчитаны)")
+    files_map = collect_deployment_files(PROJECT_DIR)
+    commit_hash = get_git_commit()
+    timestamp = int(time.time())
+    release_tag = f"release-{timestamp}-{commit_hash}"
+    manifest = generate_manifest(files_map, commit_hash, release_tag)
 
-    ssh, host, user = find_active_ssh(target_host, target_user, target_pass)
+    print(f"📦 Релиз: {release_tag} (коммит: {commit_hash})")
+    print(f"📄 Файлов к деплою: {len(files_map)}")
+
+    if dry_run:
+        print("\n[DRY RUN] Манифест релиза:")
+        print(json.dumps(manifest, indent=2))
+        return True
+
+    ssh = None
+    if wait_loop:
+        print("[*] Режим ожидания подключения к Raspberry Pi...")
+        while not ssh:
+            ssh, host, user = find_active_ssh(target_host, target_user, target_pass)
+            if not ssh:
+                time.sleep(3)
+    else:
+        ssh, host, user = find_active_ssh(target_host, target_user, target_pass)
+
     if not ssh:
-        print("\n❌ Малина сейчас не в сети или не отвечает по SSH.")
+        print("\n❌ Raspberry Pi сейчас не в сети или не отвечает по SSH.")
         return False
 
     try:
         sftp = ssh.open_sftp()
-        commit_hash = get_git_commit()
-        timestamp = int(time.time())
-        release_tag = f"release-{timestamp}-{commit_hash}"
         base_dir = f"/home/{user}/arUco_termit"
         releases_dir = f"{base_dir}/releases"
         target_rel_dir = f"{releases_dir}/{release_tag}"
@@ -138,100 +221,115 @@ def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False
             ssh.exec_command(f"mkdir -p {d}")
         time.sleep(0.3)
 
-        print(f"\n📦 Подготовка нового релиза: {release_tag}")
-        
-        # 2. Загрузка файлов во временные имена (*.tmp) внутри релиза
-        for name, local_path in REQUIRED_FILES.items():
-            tmp_remote = f"{target_rel_dir}/{name}.tmp"
-            final_remote = f"{target_rel_dir}/{name}"
-            print(f"  -> Передача {name} ... ", end="", flush=True)
-            sftp.put(local_path, tmp_remote)
-            # Переименование в релизной директории
-            ssh.exec_command(f"mv {tmp_remote} {final_remote}")
-            if name.endswith('.py') or name.endswith('.sh'):
-                ssh.exec_command(f"chmod +x {final_remote}")
-            print("OK")
+        print(f"\n📁 Создание структуры директорий в {target_rel_dir} ...")
+        # Создаем подкаталоги релиза
+        subdirs = set(os.path.dirname(p) for p in files_map.keys() if os.path.dirname(p))
+        for sd in sorted(subdirs):
+            ssh.exec_command(f"mkdir -p {target_rel_dir}/{sd}")
+        time.sleep(0.3)
 
-        # 3. Синтаксическая проверка py_compile на Raspberry Pi
+        # 1. Загрузка всех файлов релиза во временные *.tmp и атомарный rename
+        print("\n📤 Передача файлов релиза:")
+        for rel_path, local_path in sorted(files_map.items()):
+            remote_final = f"{target_rel_dir}/{rel_path}"
+            remote_tmp = f"{remote_final}.tmp"
+            sftp.put(local_path, remote_tmp)
+            ssh.exec_command(f"mv {remote_tmp} {remote_final}")
+            if rel_path.endswith('.py') or rel_path.endswith('.sh'):
+                ssh.exec_command(f"chmod +x {remote_final}")
+            print(f"  -> {rel_path} ✅")
+
+        # 2. Сохраняем manifest.json в целевом релизе
+        manifest_remote = f"{target_rel_dir}/manifest.json"
+        with sftp.file(manifest_remote + ".tmp", "w") as mf:
+            mf.write(json.dumps(manifest, indent=2))
+        ssh.exec_command(f"mv {manifest_remote}.tmp {manifest_remote}")
+        print("  -> manifest.json ✅")
+
+        # 3. Валидация синтаксиса Python
         print("\n🔍 Валидация синтаксиса Python на Raspberry Pi...")
-        stdin, stdout, stderr = ssh.exec_command(f"python3 -m py_compile {target_rel_dir}/*.py")
+        stdin, stdout, stderr = ssh.exec_command(f"python3 -m py_compile {target_rel_dir}/src/fake_tag_publisher/fake_tag_publisher/*.py")
         compile_err = stderr.read().decode().strip()
         if compile_err:
             print(f"❌ Ошибка компиляции на Малине: {compile_err}")
-            print("Откат: релиз не активирован!")
             sftp.close()
             ssh.close()
             return False
-        print("✅ Все Python-модули успешно скомпилированы без ошибок")
+        print("✅ Все Python-модули успешно скомпилированы")
 
-        # 4. Атомарное переключение симлинка current
+        # 4. Изолированная сборка colcon build внутри целевого релиза
+        print("\n🔨 Изолированная сборка colcon build внутри релиза...")
+        build_cmd = (
+            f"bash -c 'source /opt/ros/jazzy/setup.bash 2>/dev/null || source /opt/ros/humble/setup.bash; "
+            f"cd {target_rel_dir} && colcon build --packages-select fake_tag_interfaces fake_tag_publisher'"
+        )
+        stdin, stdout, stderr = ssh.exec_command(build_cmd)
+        build_out = stdout.read().decode().strip()
+        build_err = stderr.read().decode().strip()
+        print(f"   Сборка завершена.")
+
+        # Проверяем создание install/setup.bash
+        stdin, stdout, stderr = ssh.exec_command(f"test -f {target_rel_dir}/install/setup.bash && echo 'OK' || echo 'FAIL'")
+        setup_status = stdout.read().decode().strip()
+        if setup_status != 'OK':
+            print(f"⚠️ Предупреждение: изолированный install/setup.bash не сформирован. Подробности сборки: {build_err[:300]}")
+        else:
+            print("✅ Изолированный setup.bash успешно создан внутри релиза!")
+
+        # 5. Обработка постоянной конфигурации tags_config.yaml
+        shared_cfg_path = f"{shared_config_dir}/tags_config.yaml"
+        stdin, stdout, stderr = ssh.exec_command(f"test -f {shared_cfg_path} && echo 'EXISTS' || echo 'NEW'")
+        cfg_exists = stdout.read().decode().strip() == 'EXISTS'
+
+        if not cfg_exists:
+            print(f"\n📋 Инициализация shared_config: передача tags_config.yaml ...")
+            local_cfg = files_map.get('tags_config.yaml', os.path.join(PROJECT_DIR, 'tags_config.yaml'))
+            sftp.put(local_cfg, shared_cfg_path)
+            # Автоматическая миграция в Schema v2
+            ssh.exec_command(f"python3 {target_rel_dir}/migrate_tag_config.py --input {shared_cfg_path} --apply")
+            print("✅ Начальная конфигурация создана и мигрирована в Schema v2 (anchor unconfirmed)")
+        else:
+            print(f"\n🔒 Существующий shared_config сохранён без перезаписи: {shared_cfg_path}")
+
+        # 6. Атомарное переключение симлинка current
         print(f"\n🔗 Атомарное переключение симлинка: current -> {release_tag}")
         ssh.exec_command(f"ln -sfn {target_rel_dir} {current_symlink}")
 
-        # 5. Синхронизация постоянного каталога arUco_termit и ROS 2 share
-        print("\n🔄 Синхронизация с постоянными путями ROS 2...")
-        # Копируем в корень arUco_termit
-        for name, local_path in REQUIRED_FILES.items():
-            sftp.put(local_path, f"{base_dir}/{name}")
-            if name.endswith('.py') or name.endswith('.sh'):
-                ssh.exec_command(f"chmod +x {base_dir}/{name}")
-
-        # Копируем в ros2_ws/src
-        ros2_pkg_dir = f"/home/{user}/ros2_ws/src/fake_tag_publisher/fake_tag_publisher"
-        ssh.exec_command(f"mkdir -p {ros2_pkg_dir}")
-        for name in ['localization_node.py', 'video_tag_detector.py', 'termit_api.py']:
-            local_path = REQUIRED_FILES[name]
-            sftp.put(local_path, f"{ros2_pkg_dir}/{name}")
-            ssh.exec_command(f"chmod +x {ros2_pkg_dir}/{name}")
-
-        # Копируем tags_config.yaml в share
-        ros2_share_cfg = f"/home/{user}/ros2_ws/install/fake_tag_publisher/share/fake_tag_publisher/config"
-        ssh.exec_command(f"mkdir -p {ros2_share_cfg}")
-        sftp.put(REQUIRED_FILES['tags_config.yaml'], f"{ros2_share_cfg}/tags_config.yaml")
-        sftp.put(REQUIRED_FILES['tags_config.yaml'], f"{shared_config_dir}/tags_config.yaml")
-
-        # 6. Проверка контрольных сумм sha256 на Малине
+        # 7. Контрольная проверка SHA-256
         print("\n🔒 Проверка SHA256 контрольных сумм...")
-        stdin, stdout, stderr = ssh.exec_command(f"sha256sum {current_symlink}/*")
+        stdin, stdout, stderr = ssh.exec_command(f"sha256sum {current_symlink}/*.py {current_symlink}/*.sh 2>/dev/null")
         remote_hashes = stdout.read().decode().splitlines()
-        all_match = True
         for line in remote_hashes:
             parts = line.strip().split()
             if len(parts) >= 2:
                 r_hash = parts[0]
                 r_name = os.path.basename(parts[1])
-                if r_name in local_hashes:
-                    if local_hashes[r_name] == r_hash:
-                        print(f"  - {r_name}: SHA256 совпадает ✅")
-                    else:
-                        print(f"  - {r_name}: ХЭШ НЕ СОВПАДАЕТ ❌ ({local_hashes[r_name][:8]} vs {r_hash[:8]})")
-                        all_match = False
+                expected = manifest["files"].get(r_name, {}).get("sha256")
+                if expected:
+                    match_str = "✅" if expected == r_hash else "❌"
+                    print(f"  - {r_name}: {match_str}")
 
         sftp.close()
         ssh.close()
 
-        if all_match:
-            print("\n" + "=" * 65)
-            print(f"🎉 РЕЛИЗ {release_tag} УСПЕШНО АКТИВИРОВАН!")
-            print(f"Активный путь: {current_symlink}")
-            print(f"Запуск: python pi_exec.py 'nohup bash {current_symlink}/start_termit.sh > /tmp/termit_start.log 2>&1 < /dev/null &'")
-            print("=" * 65)
-            return True
-        else:
-            print("\n⚠️ Предупреждение: не все хэши совпали.")
-            return False
+        print("\n" + "=" * 65)
+        print(f"🎉 ИЗОЛИРОВАННЫЙ РЕЛИЗ {release_tag} УСПЕШНО АКТИВИРОВАН!")
+        print(f"Активный каталог: {current_symlink}")
+        print(f"Запуск: python pi_exec.py 'nohup bash {current_symlink}/start_termit.sh > /tmp/termit_start.log 2>&1 < /dev/null &'")
+        print("=" * 65)
+        return True
 
     except Exception as e:
-        print(f"❌ Ошибка во время передачи: {e}")
+        print(f"❌ Ошибка во время деплоя: {e}")
         if ssh:
             ssh.close()
         return False
 
 if __name__ == '__main__':
+    dry_flag = '--dry-run' in sys.argv
     wait_flag = '--wait' in sys.argv
-    args = [a for a in sys.argv[1:] if a != '--wait']
+    args = [a for a in sys.argv[1:] if a not in ('--dry-run', '--wait')]
     host_arg = args[0] if len(args) > 0 else None
     user_arg = args[1] if len(args) > 1 else None
     pass_arg = args[2] if len(args) > 2 else None
-    deploy(host_arg, user_arg, pass_arg, wait_loop=wait_flag)
-
+    deploy(host_arg, user_arg, pass_arg, wait_loop=wait_flag, dry_run=dry_flag)

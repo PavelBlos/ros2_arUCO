@@ -348,12 +348,14 @@ class LocalizationNode(Node):
                 with open(ext_path, 'r', encoding='utf-8') as f:
                     data = yaml.safe_load(f) or {}
                 self.camera_extrinsics_status = data.get("status", "unverified")
-                x = float(data.get("x", 0.0))
-                y = float(data.get("y", 0.0))
-                z = float(data.get("z", 0.0))
-                roll = float(data.get("roll", 0.0))
-                pitch = float(data.get("pitch", -np.pi / 2.0))
-                yaw = float(data.get("yaw", np.pi / 2.0))
+                trans = data.get("translation", {}) if isinstance(data.get("translation"), dict) else {}
+                rot = data.get("rotation_rpy_rad", {}) if isinstance(data.get("rotation_rpy_rad"), dict) else {}
+                x = float(data.get("x", trans.get("x", 0.0)))
+                y = float(data.get("y", trans.get("y", 0.0)))
+                z = float(data.get("z", trans.get("z", 0.0)))
+                roll = float(data.get("roll", rot.get("roll", 0.0)))
+                pitch = float(data.get("pitch", rot.get("pitch", -np.pi / 2.0)))
+                yaw = float(data.get("yaw", rot.get("yaw", np.pi / 2.0)))
                 self.T_base_cam = pose_to_matrix(x, y, z, roll, pitch, yaw)
                 self.camera_extrinsics_path = ext_path
                 self.get_logger().info(f"Loaded camera extrinsics from {ext_path} (status: {self.camera_extrinsics_status})")

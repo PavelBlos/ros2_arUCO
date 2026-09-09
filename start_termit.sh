@@ -4,8 +4,19 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/src/fake_tag_publisher/fake_tag_publisher:${PYTHONPATH}"
 
-source /opt/ros/jazzy/setup.bash
-if [ -f /home/raspberry/ros2_ws/install/setup.bash ]; then
+# Source ROS 2 base environment
+if [ -f /opt/ros/jazzy/setup.bash ]; then
+    source /opt/ros/jazzy/setup.bash
+elif [ -f /opt/ros/humble/setup.bash ]; then
+    source /opt/ros/humble/setup.bash
+fi
+
+# Source isolated release install if present, otherwise fallback to global ros2_ws
+if [ -f "${SCRIPT_DIR}/install/setup.bash" ]; then
+    echo "[+] Sourcing isolated release workspace: ${SCRIPT_DIR}/install/setup.bash"
+    source "${SCRIPT_DIR}/install/setup.bash"
+elif [ -f /home/raspberry/ros2_ws/install/setup.bash ]; then
+    echo "[+] Sourcing global ros2_ws: /home/raspberry/ros2_ws/install/setup.bash"
     source /home/raspberry/ros2_ws/install/setup.bash
 fi
 
