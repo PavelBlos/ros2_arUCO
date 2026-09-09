@@ -127,6 +127,7 @@ class LocalizationNode(Node):
         self.ap_max_lin = 0.14
         self.ap_min_lin = 0.03            # Минимальная скорость движения (м/с)
         self.ap_goal_tol = 0.03           # Радиус попадания в цель (м)
+        self.ap_wp_tol = 0.05             # Радиус прохождения вершины угла для переключения сегмента (м)
         self.ap_kp_cross = 1.20           # Пропорциональный коэффициент возврата на траекторию (1/с)
         self.ap_v_cross_max = 0.08        # Максимальная скорость боковой коррекции (м/с)
         self.ap_brake_accel = 0.25        # Тормозное кинематическое замедление (м/с^2)
@@ -135,6 +136,7 @@ class LocalizationNode(Node):
         self.ap_kp_ang = 1.80             # Пропорциональный коэффициент ориентации
         self.ap_yaw_mode = "HOLD_INITIAL" # FREE, HOLD_INITIAL, PATH_TANGENT, FINAL_YAW
         self.ap_final_yaw = 0.0
+        self.current_seg_idx = 0
         self.path_s_accum = [0.0]
         self.path_corner_speeds = []
 
@@ -619,6 +621,7 @@ class LocalizationNode(Node):
     def set_path_plan(self, waypoints):
         """Сохранение путевых точек маршрута, расчет кумулятивных длин и скоростей в углах"""
         self.route_waypoints = [list(pt) for pt in waypoints]
+        self.current_seg_idx = 0
         self.current_wp_idx = 0
         self.route_state = "idle"
         self.path_s_accum = [0.0]
@@ -653,164 +656,25 @@ class LocalizationNode(Node):
         self.notify_ui_event()
         self.get_logger().info(f"Загружен маршрут: {len(waypoints)} точек, общая длина {self.path_s_accum[-1]:.2f}м")
 
-    def project_onto_path(self, rx: float, ry: float, prev_s: float):
-        """Проекция точки на полилинию маршрута с монотонным продвижением вдоль s."""
-        wps = self.route_waypoints
-        if len(wps) < 2:
-            return wps[0], 0.0, np.array([1.0, 0.0]), np.array([0.0, 1.0]), 0.0, 0
-
-        best_dist_sq = float('inf')
-        best_proj = np.array(wps[0])
-        best_s = 0.0
-        best_tangent = np.array([1.0, 0.0])
-        best_normal = np.array([0.0, 1.0])
-        best_e_cross = 0.0
-        best_idx = 0
-
-        p = np.array([rx, ry])
-
-        for i in range(len(wps) - 1):
-            p_a = np.array(wps[i])
-            p_b = np.array(wps[i+1])
-            ab = p_b - p_a
-            seg_len = float(np.linalg.norm(ab))
-            if seg_len < 1e-6:
-                continue
-
-            tangent = ab / seg_len
-            normal = np.array([-tangent[1], tangent[0]])
-
-            ap = p - p_a
-            t_param = float(np.clip(np.dot(ap, tangent) / seg_len, 0.0, 1.0))
-            proj = p_a + t_param * ab
-            dist_sq = float(np.sum((p - proj)**2))
-
-            s_cand = self.path_s_accum[i] + t_param * seg_len
-
-            penalty = 0.0
-            if s_cand < prev_s:
-                if prev_s - s_cand < 0.25:
-                    penalty = (prev_s - s_cand) * 2.0
-
-            effective_score = dist_sq + penalty
-
-            if effective_score < best_dist_sq:
-                best_dist_sq = effective_score
-                best_proj = proj
-                best_s = max(prev_s, s_cand) if (prev_s - s_cand < 0.25) else s_cand
-                best_tangent = tangent
-                best_normal = normal
-                d_vec = p - proj
-                best_e_cross = float(np.dot(d_vec, normal))
-                best_idx = i
-
-        return best_proj, best_s, best_tangent, best_normal, best_e_cross, best_idx
-
-    def calc_target_along_speed(self, s: float):
-        """Расчет допустимой скорости вдоль траектории с учетом углов и торможения на финише"""
-        total_len = self.path_s_accum[-1]
-        d_finish = max(0.0, total_len - s)
-
-        if d_finish <= self.ap_goal_tol:
-            v_finish = self.ap_min_lin
-        else:
-            v_finish = np.sqrt(max(0.0, 2.0 * self.ap_brake_accel * (d_finish - self.ap_goal_tol))) + self.ap_min_lin
-
-        v_corners = []
-        for i in range(1, len(self.route_waypoints) - 1):
-            s_corner = self.path_s_accum[i]
-            if s_corner > s:
-                d_to_corner = s_corner - s
-                v_max_c = self.path_corner_speeds[i]
-                v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
-                v_corners.append(v_brake_c)
-
-        v_limit = min([self.ap_cruise_speed, v_finish] + v_corners)
-        return float(np.clip(v_limit, self.ap_min_lin, self.ap_cruise_speed))
-
-    def start_route(self):
-        """Запуск автономного движения по маршруту (Pure Pursuit)"""
-        if not self.route_waypoints:
-            self.get_logger().warn("Невозможно запустить маршрут: список точек пуст!")
-            return False
-            
-        self.set_motor_power("enable")
-        self.route_state = "running"
-        self.autopilot_active = True
-        
-        if self.autopilot_thread is None or not self.autopilot_thread.is_alive():
-            self.autopilot_thread = threading.Thread(target=self.autopilot_loop, daemon=True, name="Autopilot")
-            self.autopilot_thread.start()
-            
-        self.notify_ui_event()
-        self.get_logger().info(f"▶ Старт автопилота с точки {self.current_wp_idx + 1}/{len(self.route_waypoints)}")
-        return True
-
-    def pause_route(self):
-        """Пауза / Снятие с паузы автопилота"""
-        if self.route_state == "running":
-            self.route_state = "paused"
-            self.autopilot_active = False
-            self.drive_robot(0.0, 0.0, 0.0)
-            self.notify_ui_event()
-            self.get_logger().info(f"⏸ Автопилот на паузе (точка {self.current_wp_idx + 1}/{len(self.route_waypoints)})")
-            return True
-        elif self.route_state == "paused":
-            return self.start_route()
-        return False
-
-    def stop_route(self):
-        """Полная остановка и сброс маршрута с автоматическим снятием тока"""
-        self.route_state = "idle"
-        self.autopilot_active = False
-        self.current_wp_idx = 0
-        self.drive_robot(0.0, 0.0, 0.0)
-        # Allow the ESP32 braking ramp to finish before the 2 s power timer.
-        self.last_motion_cmd_time = time.time()
-        self.notify_ui_event()
-        self.get_logger().info("⏹ Маршрут сброшен; плавная остановка, затем авто-снятие тока.")
-        return True
-
-    def clear_waypoints(self):
-        """Очистка путевых точек"""
-        self.stop_route()
-        self.route_waypoints = []
-        self.publish_plan([])
-        self.notify_ui_event()
-        self.get_logger().info("🗑 Путевые точки очищены.")
-        return True
-
-    def return_to_origin(self):
-        """Автоматическое построение гладкого маршрута и возврат робота в начало координат (0,0)"""
-        rx = float(self.fused_x)
-        ry = float(self.fused_y)
-        dist = np.sqrt(rx*rx + ry*ry)
-        num_pts = max(3, int(np.ceil(dist / 0.05)))
-        points = []
-        for i in range(num_pts + 1):
-            t = i / float(num_pts)
-            points.append([float(rx * (1.0 - t)), float(ry * (1.0 - t))])
-        self.set_path_plan(points)
-        self.get_logger().info(f"🎯 Построен маршрут возврата в (0,0): {len(points)} точек, дистанция {dist:.2f}м")
-        return self.start_route()
-
     def autopilot_loop(self):
         """
         Высокоточный векторный контроллер следования по траектории (20 Гц).
-        - Полилинейная проекция без срезания углов (continuous polyline projection)
-        - Автоматическое торможение перед вершинами и финишем (corner & finish speed profile)
-        - Активная компенсация бокового сноса (v_cross_cmd)
-        - Корректная REP-103 кинематика 3-колесной омни-базы
+        - Посегментное продвижение без срезания углов и без застревания на вершинах
+        - Плавное кинематическое замедление перед каждым углом и перед финишем
+        - Активная компенсация бокового сноса v_cross_cmd
+        - Строгая кинематика Omni REP-103
         """
         import time as pytime
 
-        if not self.route_waypoints:
+        if not self.route_waypoints or len(self.route_waypoints) < 2:
             self.route_state = "idle"
             self.autopilot_active = False
             return
 
-        total_path_len = self.path_s_accum[-1] if hasattr(self, 'path_s_accum') and self.path_s_accum else 0.0
-        current_s = 0.0
+        total_path_len = self.path_s_accum[-1]
+        total_wps = len(self.route_waypoints)
+        seg_idx = 0
+        self.current_seg_idx = 0
         initial_yaw = float(self.fused_yaw)
 
         smooth_forward = 0.0
@@ -828,44 +692,96 @@ class LocalizationNode(Node):
             ry = float(self.fused_y)
             ryaw = float(self.fused_yaw)
 
-            # 1. Проекция робота на полилинию
-            proj_pt, current_s, tangent, normal, e_cross, seg_idx = self.project_onto_path(rx, ry, current_s)
-            self.current_wp_idx = min(seg_idx + 1, len(self.route_waypoints) - 1)
+            # 1. Текущий сегмент пути
+            p_a = np.array(self.route_waypoints[seg_idx])
+            p_b = np.array(self.route_waypoints[seg_idx + 1])
+            ab = p_b - p_a
+            seg_len = float(np.linalg.norm(ab))
+            if seg_len < 1e-6:
+                seg_len = 1e-6
+            tangent = ab / seg_len
+            normal = np.array([-tangent[1], tangent[0]])
 
+            ap = np.array([rx, ry]) - p_a
+            t_param = float(np.dot(ap, tangent) / seg_len)
+            dist_to_next_wp = float(np.hypot(p_b[0] - rx, p_b[1] - ry))
+
+            # 2. Продвижение на следующий сегмент
+            if seg_idx < total_wps - 2:
+                if t_param >= 0.95 or dist_to_next_wp <= self.ap_wp_tol:
+                    seg_idx += 1
+                    self.current_seg_idx = seg_idx
+                    self.current_wp_idx = seg_idx
+                    self.notify_ui_event()
+                    self.get_logger().info(f"📍 Вершина пройдена! Переход на сегмент {seg_idx + 1}/{total_wps - 1}")
+                    p_a = np.array(self.route_waypoints[seg_idx])
+                    p_b = np.array(self.route_waypoints[seg_idx + 1])
+                    ab = p_b - p_a
+                    seg_len = float(np.linalg.norm(ab))
+                    if seg_len < 1e-6:
+                        seg_len = 1e-6
+                    tangent = ab / seg_len
+                    normal = np.array([-tangent[1], tangent[0]])
+                    ap = np.array([rx, ry]) - p_a
+                    t_param = float(np.dot(ap, tangent) / seg_len)
+
+            self.current_wp_idx = seg_idx + 1
+
+            # 3. Проекция на текущий сегмент и боковая ошибка e_cross
+            t_clamped = float(np.clip(t_param, 0.0, 1.0))
+            proj_pt = p_a + t_clamped * ab
+            current_s = self.path_s_accum[seg_idx] + t_clamped * seg_len
+            e_cross = float(np.dot(np.array([rx, ry]) - proj_pt, normal))
+
+            # 4. Проверка достижения финиша
             dist_to_finish = max(0.0, total_path_len - current_s)
             fx, fy = self.route_waypoints[-1]
             finish_euclid = float(np.hypot(fx - rx, fy - ry))
 
-            # 2. Проверка условия завершения маршрута
-            if dist_to_finish <= self.ap_goal_tol or (finish_euclid <= self.ap_goal_tol and current_s >= total_path_len - 0.06):
-                self.drive_robot(0.0, 0.0, 0.0)
-                pytime.sleep(0.3)
-                self.route_state = "finished"
-                self.autopilot_active = False
-                self.notify_ui_event()
-                self.get_logger().info(f"🎉 Маршрут успешно завершен! Финиш достигнут (ошибка {finish_euclid*100:.1f} см)")
-                self.last_motion_cmd_time = pytime.time()
-                break
+            if seg_idx >= total_wps - 2:
+                if dist_to_finish <= self.ap_goal_tol or finish_euclid <= self.ap_goal_tol:
+                    self.drive_robot(0.0, 0.0, 0.0)
+                    pytime.sleep(0.4)
+                    self.route_state = "finished"
+                    self.autopilot_active = False
+                    self.notify_ui_event()
+                    self.get_logger().info(f"🎉 Маршрут полностью выполнен! Финиш достигнут (ошибка {finish_euclid*100:.1f} см)")
+                    self.last_motion_cmd_time = pytime.time()
+                    break
 
-            # 3. Скоростной профиль вдоль траектории
-            v_along_target = self.calc_target_along_speed(current_s)
+            # 5. Профиль скорости вдоль траектории (along-track velocity)
+            if dist_to_finish <= self.ap_goal_tol:
+                v_finish = self.ap_min_lin
+            else:
+                v_finish = np.sqrt(max(0.0, 2.0 * self.ap_brake_accel * max(0.0, dist_to_finish - self.ap_goal_tol))) + self.ap_min_lin
 
-            # 4. Векторное боковое управление (cross-track velocity)
+            v_corners = []
+            for i in range(seg_idx + 1, total_wps - 1):
+                d_to_corner = self.path_s_accum[i] - current_s
+                if d_to_corner > 0:
+                    v_max_c = self.path_corner_speeds[i]
+                    v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
+                    v_corners.append(v_brake_c)
+
+            v_along_target = min([self.ap_cruise_speed, v_finish] + v_corners)
+            v_along_target = float(np.clip(v_along_target, self.ap_min_lin, self.ap_cruise_speed))
+
+            # 6. Векторное боковое управление (cross-track velocity)
             v_cross_cmd = -float(np.clip(self.ap_kp_cross * e_cross, -self.ap_v_cross_max, self.ap_v_cross_max))
 
-            # 5. Результирующий вектор скорости в СК карты
+            # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
             v_norm = float(np.linalg.norm(v_map))
             if v_norm > self.ap_cruise_speed:
                 v_map = v_map * (self.ap_cruise_speed / v_norm)
 
-            # 6. Кинематика Omni REP-103: проекция на продольную и поперечную оси робота
+            # 8. Кинематика Omni REP-103: проекция вектора v_map на оси робота
             # v_forward = v_map_x * cos(yaw) + v_map_y * sin(yaw)
             # v_strafe_right = v_map_x * sin(yaw) - v_map_y * cos(yaw)
             v_forward = float(v_map[0] * np.cos(ryaw) + v_map[1] * np.sin(ryaw))
             v_strafe_right = float(v_map[0] * np.sin(ryaw) - v_map[1] * np.cos(ryaw))
 
-            # 7. Контроллер ориентации (4 режима yaw)
+            # 9. Контроллер ориентации (4 режима yaw)
             if self.ap_yaw_mode == "HOLD_INITIAL":
                 target_yaw = initial_yaw
             elif self.ap_yaw_mode == "PATH_TANGENT":
@@ -875,7 +791,7 @@ class LocalizationNode(Node):
                     target_yaw = self.ap_final_yaw
                 else:
                     target_yaw = float(np.arctan2(tangent[1], tangent[0]))
-            else: # FREE
+            else:
                 target_yaw = ryaw
 
             yaw_err = float((target_yaw - ryaw + np.pi) % (2.0 * np.pi) - np.pi)
@@ -884,20 +800,21 @@ class LocalizationNode(Node):
             else:
                 w = float(np.clip(self.ap_kp_ang * yaw_err, -self.ap_max_ang, self.ap_max_ang))
 
-            # 8. Плавная фильтрация скоростей (EMA)
+            # 10. Плавная фильтрация скоростей (EMA)
             smooth_forward = smooth_forward * (1.0 - alpha) + v_forward * alpha
             smooth_strafe = smooth_strafe * (1.0 - alpha) + v_strafe_right * alpha
             smooth_w = smooth_w * (1.0 - alpha) + w * alpha
 
-            # 9. Отправка команды движения
+            # 11. Отправка команды движения
             self.drive_robot(smooth_forward, smooth_strafe, smooth_w)
 
-            # 10. Логирование телеметрии забега
+            # 12. Логирование телеметрии забега
             rec = {
                 "t": t_loop_start,
                 "run_id": self.active_run_id,
                 "s": round(float(current_s), 4),
                 "total_s": round(float(total_path_len), 4),
+                "seg_idx": int(seg_idx),
                 "wp_idx": int(self.current_wp_idx),
                 "rx": round(rx, 4),
                 "ry": round(ry, 4),
@@ -917,7 +834,7 @@ class LocalizationNode(Node):
 
             elapsed = pytime.time() - t_loop_start
             pytime.sleep(max(0.01, 0.05 - elapsed))
-            
+
         self.drive_robot(0.0, 0.0, 0.0)
 
     def notify_ui_event(self):
