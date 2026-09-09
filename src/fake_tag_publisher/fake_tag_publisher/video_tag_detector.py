@@ -30,7 +30,7 @@ class VideoTagDetector(Node):
         from rcl_interfaces.msg import ParameterDescriptor
         self.declare_parameter('video_path', 'config/robot_drive.mp4', ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter('calibration_path', '/home/raspberry/arUco_termit/shared_config/camera_info.yaml', ParameterDescriptor(dynamic_typing=True))
-        self.declare_parameter('tag_map_path', '/home/raspberry/arUco_termit/shared_config/tag_map.yaml', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('tag_map_path', '/home/raspberry/arUco_termit/shared_config/tags_config.yaml', ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter('marker_length', 0.100, ParameterDescriptor(dynamic_typing=True))  # Default 100 mm (0.100 m)
         self.declare_parameter('detection_rate', 30.0, ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter('aruco_dictionary', 'DICT_4X4_100', ParameterDescriptor(dynamic_typing=True))
@@ -43,7 +43,7 @@ class VideoTagDetector(Node):
         self.calibration_path = str(calib_param.value) if calib_param.value is not None else '/home/raspberry/arUco_termit/shared_config/camera_info.yaml'
 
         tag_map_param = self.get_parameter('tag_map_path')
-        self.tag_map_path = str(tag_map_param.value) if tag_map_param.value is not None else '/home/raspberry/arUco_termit/shared_config/tag_map.yaml'
+        self.tag_map_path = str(tag_map_param.value) if tag_map_param.value is not None else '/home/raspberry/arUco_termit/shared_config/tags_config.yaml'
 
         marker_param = self.get_parameter('marker_length')
         try:
@@ -104,14 +104,14 @@ class VideoTagDetector(Node):
         # 5. ROS Publishers & Subscribers
         self.publisher_ = self.create_publisher(TagDetectionArray, '/fake_tag', 10)
         self.image_pub = self.create_publisher(CompressedImage, '/camera/annotated_image/compressed', 10)
-        self.ack_pub = self.create_publisher(TagMapAck, '/tag_map/ack', 10)
 
-        # Transient-local QoS for receiving tag map updates
+        # Transient-local QoS for receiving tag map updates and sending acks
         transient_qos = QoSProfile(
             depth=1,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
             reliability=ReliabilityPolicy.RELIABLE
         )
+        self.ack_pub = self.create_publisher(TagMapAck, '/tag_map/ack', transient_qos)
         self.update_sub = self.create_subscription(
             TagMapUpdate, '/tag_map/updated', self.tag_map_update_callback, transient_qos
         )
@@ -122,14 +122,22 @@ class VideoTagDetector(Node):
     def load_tag_registry(self):
         resolved_path = self.tag_map_path
         if not os.path.exists(resolved_path):
-            # Fallback to local config
+            candidates = [
+                '/home/raspberry/arUco_termit/shared_config/tags_config.yaml',
+                '/home/raspberry/arUco_termit/shared_config/tag_map.yaml'
+            ]
             try:
                 share_dir = get_package_share_directory('fake_tag_publisher')
-                candidate = os.path.join(share_dir, 'config', 'tag_map.yaml')
-                if os.path.exists(candidate):
-                    resolved_path = candidate
+                candidates.extend([
+                    os.path.join(share_dir, 'config', 'tags_config.yaml'),
+                    os.path.join(share_dir, 'config', 'tag_map.yaml')
+                ])
             except Exception:
                 pass
+            for c in candidates:
+                if os.path.exists(c):
+                    resolved_path = c
+                    break
         
         if os.path.exists(resolved_path):
             try:

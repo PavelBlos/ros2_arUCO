@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import time
 import socket
@@ -285,11 +285,19 @@ def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False
             print(f"\n📋 Инициализация shared_config: передача tags_config.yaml ...")
             local_cfg = files_map.get('tags_config.yaml', os.path.join(PROJECT_DIR, 'tags_config.yaml'))
             sftp.put(local_cfg, shared_cfg_path)
-            # Автоматическая миграция в Schema v2
-            ssh.exec_command(f"python3 {target_rel_dir}/migrate_tag_config.py --input {shared_cfg_path} --apply")
-            print("✅ Начальная конфигурация создана и мигрирована в Schema v2 (anchor unconfirmed)")
-        else:
-            print(f"\n🔒 Существующий shared_config сохранён без перезаписи: {shared_cfg_path}")
+            print("✅ Создан начальный shared_config/tags_config.yaml")
+
+        print(f"\n🔄 Проверка и миграция конфигурации меток в Schema v2...")
+        stdin, stdout, stderr = ssh.exec_command(f"python3 {target_rel_dir}/migrate_tag_config.py --input {shared_cfg_path} --apply")
+        mig_out = stdout.read().decode().strip()
+        print(f"   {mig_out.splitlines()[-1] if mig_out else 'OK'}")
+
+        # Проверяем наличие camera_extrinsics.yaml в shared_config
+        shared_cam_ext = f"{shared_config_dir}/camera_extrinsics.yaml"
+        stdin, stdout, stderr = ssh.exec_command(f"test -f {shared_cam_ext} && echo 'EXISTS' || echo 'NEW'")
+        if stdout.read().decode().strip() != 'EXISTS':
+            sftp.put(files_map.get('camera_extrinsics.yaml', os.path.join(PROJECT_DIR, 'camera_extrinsics.yaml')), shared_cam_ext)
+            print("✅ Скопирован базовый camera_extrinsics.yaml в shared_config")
 
         # 6. Атомарное переключение симлинка current
         print(f"\n🔗 Атомарное переключение симлинка: current -> {release_tag}")

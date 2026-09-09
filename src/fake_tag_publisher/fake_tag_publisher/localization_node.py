@@ -1,5 +1,11 @@
 import rclpy
 from rclpy.node import Node
+try:
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+except (ImportError, AttributeError):
+    QoSProfile = None
+    DurabilityPolicy = None
+    ReliabilityPolicy = None
 from geometry_msgs.msg import PoseStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry, Path
 try:
@@ -80,13 +86,22 @@ class LocalizationNode(Node):
         self.covis_graph = CovisibilityGraph()
 
         # Hot-reload Handshake
+        if QoSProfile and DurabilityPolicy and ReliabilityPolicy:
+            transient_qos = QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                reliability=ReliabilityPolicy.RELIABLE
+            )
+        else:
+            transient_qos = 10
+
         if TagMapUpdate:
-            self.tag_map_pub = self.create_publisher(TagMapUpdate, '/tag_map/updated', 10)
+            self.tag_map_pub = self.create_publisher(TagMapUpdate, '/tag_map/updated', transient_qos)
         else:
             self.tag_map_pub = None
 
         if TagMapAck:
-            self.tag_map_ack_sub = self.create_subscription(TagMapAck, '/tag_map/ack', self.tag_map_ack_callback, 10)
+            self.tag_map_ack_sub = self.create_subscription(TagMapAck, '/tag_map/ack', self.tag_map_ack_callback, transient_qos)
         else:
             self.tag_map_ack_sub = None
         self.last_tag_map_ack = None

@@ -18,7 +18,7 @@ from tag_registry import TagRegistry
 
 # Mock ROS 2 if rclpy is not fully initialized in standard python test environment
 for mod in [
-    'rclpy', 'rclpy.node',
+    'rclpy', 'rclpy.node', 'rclpy.qos',
     'geometry_msgs', 'geometry_msgs.msg',
     'nav_msgs', 'nav_msgs.msg',
     'sensor_msgs', 'sensor_msgs.msg',
