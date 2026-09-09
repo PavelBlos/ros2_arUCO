@@ -147,24 +147,24 @@ def solve_single_tag_ippe(corner_pts_2d: np.ndarray,
         for k in range(len(rvecs)):
             rv = rvecs[k].ravel()
             tv = tvecs[k].ravel()
-            if tv[2] <= 0.05:
+            if tv[2] <= 0.05 or np.linalg.norm(rv) > 10.0:
                 continue
             proj, _ = cv2.projectPoints(obj_pts, rv, tv, camera_matrix, dist_coeffs)
             err = float(np.sqrt(np.mean(np.sum((corner_pts - proj.reshape(-1, 2)) ** 2, axis=1))))
             candidate_list.append({"rvec": rv, "tvec": tv, "reproj_err": err})
 
-    # 2. Check if IPPE was degenerate (e.g. parallel singularity where IPPE err > 5 px)
-    use_iterative_fallback = (not candidate_list) or (min(c["reproj_err"] for c in candidate_list) > 5.0)
-    if use_iterative_fallback:
+    # 2. Also evaluate SOLVEPNP_ITERATIVE to guard against planar homography ambiguity
+    try:
         ret_it, rv_it, tv_it = cv2.solvePnP(
             obj_pts, corner_pts, camera_matrix, dist_coeffs,
             flags=cv2.SOLVEPNP_ITERATIVE
         )
-        if ret_it and tv_it[2] > 0.05:
+        if ret_it and tv_it[2] > 0.05 and np.linalg.norm(rv_it) < 10.0:
             proj_it, _ = cv2.projectPoints(obj_pts, rv_it, tv_it, camera_matrix, dist_coeffs)
             err_it = float(np.sqrt(np.mean(np.sum((corner_pts - proj_it.reshape(-1, 2)) ** 2, axis=1))))
-            if not candidate_list or err_it < min(c["reproj_err"] for c in candidate_list):
-                candidate_list = [{"rvec": rv_it.ravel(), "tvec": tv_it.ravel(), "reproj_err": err_it}]
+            candidate_list.append({"rvec": rv_it.ravel(), "tvec": tv_it.ravel(), "reproj_err": err_it})
+    except Exception:
+        pass
 
     if not candidate_list:
         return {
