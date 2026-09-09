@@ -431,8 +431,33 @@ class LocalizationNode(Node):
         }
 
     def update_runtime_settings(self, new_settings: dict):
+        if not isinstance(new_settings, dict):
+            return
+        if "settings" in new_settings and isinstance(new_settings["settings"], dict):
+            new_settings = new_settings["settings"]
+
+        float_keys = {
+            'filter_alpha', 'ap_cruise_speed', 'ap_max_lin', 'ap_min_lin',
+            'ap_goal_tol', 'ap_wp_tol', 'ap_kp_cross', 'ap_v_cross_max',
+            'ap_turn_factor', 'ap_max_ang', 'ap_kp_ang'
+        }
+        str_keys = {'ap_yaw_mode'}
+
         for k, v in new_settings.items():
-            if hasattr(self, k):
+            if k in float_keys:
+                try:
+                    val = float(v)
+                    setattr(self, k, val)
+                    try:
+                        import rclpy.parameter
+                        self.set_parameters([rclpy.parameter.Parameter(k, rclpy.parameter.Parameter.Type.DOUBLE, val)])
+                    except Exception:
+                        pass
+                except (ValueError, TypeError):
+                    pass
+            elif k in str_keys:
+                setattr(self, k, str(v))
+            elif hasattr(self, k):
                 val_type = type(getattr(self, k))
                 try:
                     setattr(self, k, val_type(v))

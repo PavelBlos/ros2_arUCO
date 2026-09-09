@@ -91,6 +91,7 @@ def mock_node(tmp_path):
     with patch.object(LocalizationNode, 'start_web_server'):
         with patch.object(LocalizationNode, 'init_robot_api'):
             node = LocalizationNode()
+            node.runtime_settings_path = str(tmp_path / "runtime_settings.yaml")
             node.tag_registry = TagRegistry(str(cfg_file))
             node.tags_db = node.tag_registry.get_active_confirmed_tags()
             yield node
@@ -308,6 +309,23 @@ def test_api_settings_get_and_post(mock_node, tmp_path):
     assert abs(res_post["settings"]["filter_alpha"] - 0.28) < 1e-4
     assert abs(mock_node.filter_alpha - 0.28) < 1e-4
     assert abs(mock_node.ap_cruise_speed - 0.12) < 1e-4
+
+    # 3. POST /api/settings flat payload
+    update_payload_flat = json.dumps({
+        "filter_alpha": 0.45,
+        "ap_yaw_mode": "FACE_GOAL"
+    }).encode('utf-8')
+    handler.rfile.read = lambda n: update_payload_flat
+    handler.headers = {'Content-Length': str(len(update_payload_flat))}
+    handler.path = "/api/settings"
+    handler.do_POST()
+
+    assert sent_responses[-1] == 200
+    res_flat = json.loads(written_data[-1].decode('utf-8'))
+    assert abs(res_flat["settings"]["filter_alpha"] - 0.45) < 1e-4
+    assert res_flat["settings"]["ap_yaw_mode"] == "FACE_GOAL"
+    assert abs(mock_node.filter_alpha - 0.45) < 1e-4
+    assert mock_node.ap_yaw_mode == "FACE_GOAL"
 
 def test_api_anchor_wizard_status_and_confirm(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)
