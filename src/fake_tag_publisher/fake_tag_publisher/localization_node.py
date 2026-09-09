@@ -656,6 +656,72 @@ class LocalizationNode(Node):
         self.notify_ui_event()
         self.get_logger().info(f"Загружен маршрут: {len(waypoints)} точек, общая длина {self.path_s_accum[-1]:.2f}м")
 
+    def start_route(self):
+        """Запуск автономного движения по маршруту"""
+        if not self.route_waypoints or len(self.route_waypoints) < 2:
+            self.get_logger().warn("Невозможно запустить маршрут: список точек пуст или содержит менее 2 точек!")
+            return False
+            
+        self.set_motor_power("enable")
+        self.route_state = "running"
+        self.autopilot_active = True
+        
+        if self.autopilot_thread is None or not self.autopilot_thread.is_alive():
+            self.autopilot_thread = threading.Thread(target=self.autopilot_loop, daemon=True, name="Autopilot")
+            self.autopilot_thread.start()
+            
+        self.notify_ui_event()
+        self.get_logger().info(f"▶ Старт векторного автопилота: сегмент 1/{len(self.route_waypoints) - 1}")
+        return True
+
+    def pause_route(self):
+        """Пауза / Снятие с паузы автопилота"""
+        if self.route_state == "running":
+            self.route_state = "paused"
+            self.autopilot_active = False
+            self.drive_robot(0.0, 0.0, 0.0)
+            self.notify_ui_event()
+            self.get_logger().info(f"⏸ Автопилот на паузе (точка {self.current_wp_idx + 1}/{len(self.route_waypoints)})")
+            return True
+        elif self.route_state == "paused":
+            return self.start_route()
+        return False
+
+    def stop_route(self):
+        """Полная остановка и сброс маршрута с автоматическим снятием тока"""
+        self.route_state = "idle"
+        self.autopilot_active = False
+        self.current_wp_idx = 0
+        self.current_seg_idx = 0
+        self.drive_robot(0.0, 0.0, 0.0)
+        self.last_motion_cmd_time = time.time()
+        self.notify_ui_event()
+        self.get_logger().info("⏹ Маршрут сброшен; плавная остановка, затем авто-снятие тока.")
+        return True
+
+    def clear_waypoints(self):
+        """Очистка путевых точек"""
+        self.stop_route()
+        self.route_waypoints = []
+        self.publish_plan([])
+        self.notify_ui_event()
+        self.get_logger().info("🗑 Путевые точки очищены.")
+        return True
+
+    def return_to_origin(self):
+        """Автоматическое построение гладкого маршрута и возврат робота в начало координат (0,0)"""
+        rx = float(self.fused_x)
+        ry = float(self.fused_y)
+        dist = np.sqrt(rx*rx + ry*ry)
+        num_pts = max(3, int(np.ceil(dist / 0.05)))
+        points = []
+        for i in range(num_pts + 1):
+            t = i / float(num_pts)
+            points.append([float(rx * (1.0 - t)), float(ry * (1.0 - t))])
+        self.set_path_plan(points)
+        self.get_logger().info(f"🎯 Построен маршрут возврата в (0,0): {len(points)} точек, дистанция {dist:.2f}м")
+        return self.start_route()
+
     def autopilot_loop(self):
         """
         Высокоточный векторный контроллер следования по траектории (20 Гц).
