@@ -386,23 +386,32 @@ class LocalizationNode(Node):
         if getattr(self, 'tag_map_pub', None) and TagMapUpdate:
             try:
                 msg = TagMapUpdate()
+                now_t = time.time()
+                sec = int(now_t)
+                nanosec = int((now_t - sec) * 1e9)
+                msg.stamp.sec = sec
+                msg.stamp.nanosec = nanosec
                 msg.config_epoch = int(self.tag_registry.config_epoch)
-                msg.tag_map_revision = int(self.tag_registry.revision)
-                msg.tag_map_sha256 = str(self.tag_registry.sha256)
-                msg.timestamp.sec = int(time.time())
+                msg.revision = int(self.tag_registry.revision)
+                msg.sha256 = str(self.tag_registry.sha256)
+                msg.node_name = "localization_node"
+                msg.config_type = "tags_config"
                 self.tag_map_pub.publish(msg)
-                self.get_logger().info(f"Published /tag_map/updated (rev: {msg.tag_map_revision})")
+                self.get_logger().info(f"Published /tag_map/updated (rev: {msg.revision})")
             except Exception as e:
                 self.get_logger().warn(f"Failed to publish /tag_map/updated: {e}")
 
     def tag_map_ack_callback(self, msg):
+        rev = getattr(msg, 'detector_revision', getattr(msg, 'tag_map_revision', 0))
+        status = getattr(msg, 'status', getattr(msg, 'ack_status', 'unknown'))
+        err = getattr(msg, 'error_message', getattr(msg, 'error_msg', ''))
         self.last_tag_map_ack = {
-            "config_epoch": msg.config_epoch,
-            "tag_map_revision": msg.tag_map_revision,
-            "ack_status": msg.ack_status,
-            "error_msg": msg.error_msg
+            "config_epoch": getattr(msg, 'config_epoch', 0),
+            "detector_revision": rev,
+            "status": status,
+            "error_message": err
         }
-        self.get_logger().info(f"Received /tag_map/ack (rev: {msg.tag_map_revision}, status: {msg.ack_status})")
+        self.get_logger().info(f"Received /tag_map/ack (rev: {rev}, status: {status})")
 
     def load_tags_config(self):
         try:
