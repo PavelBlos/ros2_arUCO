@@ -1,0 +1,74 @@
+{
+  "test_type": "square_0.35m_repeatability_3x",
+  "controller": "vector_polyline_follower_v2",
+  "criteria": {
+    "max_rms_cte_m": 0.02,
+    "max_finish_err_m": 0.03
+  },
+  "runs": [
+    {
+      "run_id": "phase5_run_1",
+      "duration_s": 14.8,
+      "trajectory_length_m": 1.4431,
+      "rms_cte_m": 0.0046,
+      "rms_cte_mm": 4.6,
+      "max_cte_m": 0.0246,
+      "max_cte_mm": 24.6,
+      "finish_error_m": 0.0083,
+      "finish_error_mm": 8.3,
+      "final_position": [
+        -0.0005,
+        -0.0083
+      ],
+      "target_finish": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "run_id": "phase5_run_2",
+      "records": 931,
+      "duration_s": 14.1,
+      "trajectory_length_m": 1.4467,
+      "rms_cte_m": 0.0121,
+      "rms_cte_mm": 12.1,
+      "max_cte_m": 0.0327,
+      "max_cte_mm": 32.7,
+      "finish_error_m": 0.0082,
+      "finish_error_mm": 8.2,
+      "final_position": [
+        -0.0007,
+        -0.0082
+      ],
+      "target_finish": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "run_id": "phase5_run_3",
+      "records": 925,
+      "duration_s": 14.02,
+      "trajectory_length_m": 1.4354,
+      "rms_cte_m": 0.0104,
+      "rms_cte_mm": 10.4,
+      "max_cte_m": 0.0283,
+      "max_cte_mm": 28.3,
+      "finish_error_m": 0.0083,
+      "finish_error_mm": 8.3,
+      "final_position": [
+        -0.0012,
+        -0.0082
+      ],
+      "target_finish": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "mean_rms_cte_mm": 9.0,
+  "mean_max_cte_mm": 28.5,
+  "mean_finish_error_mm": 8.3,
+  "mean_trajectory_length_m": 1.4417,
+  "all_passed": true
+}
