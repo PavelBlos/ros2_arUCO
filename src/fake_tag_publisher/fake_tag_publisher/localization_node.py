@@ -73,9 +73,19 @@ class LocalizationNode(Node):
         self.last_odom_msg_time = None
         self.last_detected_tags = []
 
-        # Подписка на колесную одометрию
-        self.odom_sub = self.create_subscription(
-            Odometry, '/wheel_odom', self.odom_callback, 10)
+        # Очередь и кольцевой буфер одометрии (Single UART owner -> ROS queue fusion)
+        import queue
+        import collections
+        self.odom_queue = queue.Queue(maxsize=200)
+        self.odom_history = collections.deque(maxlen=200)  # [(timestamp, odom_x, odom_y, odom_yaw)]
+        self.delta_map_odom_x = 0.0
+        self.delta_map_odom_y = 0.0
+        self.delta_map_odom_yaw = 0.0
+        self.map_odom_initialized = False
+        self.outlier_count = 0
+
+        # Таймер высокочастотного слияния одометрии и публикации позы (50 Гц)
+        self.fusion_timer = self.create_timer(0.02, self.fusion_cycle)
 
         # Буферы для записи траекторий (сырая и отфильтрованная)
         self.raw_trajectory_x = []
@@ -112,18 +122,21 @@ class LocalizationNode(Node):
         self.autopilot_thread = None
         self.autopilot_active = False
 
-        # Параметры автопилота Pure Pursuit (плавный ход без зависаний)
-        self.ap_look_ahead = 0.15
+        # Параметры векторного контроллера (Cross-track follower & Corner speed profile)
+        self.ap_cruise_speed = 0.14       # Крейсерская скорость по прямой (м/с)
         self.ap_max_lin = 0.14
-        self.ap_max_ang = 0.70
-        self.ap_kp_lin = 0.80
-        self.ap_kp_ang = 1.50
-        self.ap_goal_tol = 0.04
-        self.ap_decel_dist = 0.30
-        self.ap_min_lin = 0.03
-        self.ap_yaw_deadzone = 0.05
-        self.ap_wp_tol = 0.08
-        self.ap_turn_decel = 0.20
+        self.ap_min_lin = 0.03            # Минимальная скорость движения (м/с)
+        self.ap_goal_tol = 0.03           # Радиус попадания в цель (м)
+        self.ap_kp_cross = 1.20           # Пропорциональный коэффициент возврата на траекторию (1/с)
+        self.ap_v_cross_max = 0.08        # Максимальная скорость боковой коррекции (м/с)
+        self.ap_brake_accel = 0.25        # Тормозное кинематическое замедление (м/с^2)
+        self.ap_turn_factor = 0.65        # Множитель скорости прохождения углов
+        self.ap_max_ang = 0.60            # Предельная угловая скорость вращения (рад/с)
+        self.ap_kp_ang = 1.80             # Пропорциональный коэффициент ориентации
+        self.ap_yaw_mode = "HOLD_INITIAL" # FREE, HOLD_INITIAL, PATH_TANGENT, FINAL_YAW
+        self.ap_final_yaw = 0.0
+        self.path_s_accum = [0.0]
+        self.path_corner_speeds = []
 
         # Состояние слияния и фильтрации выбросов
         self.outlier_count = 0
@@ -348,47 +361,50 @@ class LocalizationNode(Node):
                     self.get_logger().error(f"Rotation averaging failed: {str(rot_mean_err)}")
                     avg_rot = rotations[0]
 
-            # 4. Применяем слияние датчиков (Комплементарный фильтр + Outlier Rejection)
+            # 4. Применяем слияние датчиков с компенсацией задержки камеры через кольцевой буфер
             avg_yaw = self.quaternion_to_yaw_from_quat(avg_rot)
-            
-            if not self.fused_initialized:
-                self.fused_x = avg_pos[0]
-                self.fused_y = avg_pos[1]
+            stamp_sec = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+            # Извлекаем позу одометрии на точный момент съемки кадра камеры
+            odom_at_cam = self.lookup_odom_at(stamp_sec)
+            if odom_at_cam is None:
+                odom_x_c, odom_y_c, odom_yaw_c = self.fused_x, self.fused_y, self.fused_yaw
+            else:
+                odom_x_c, odom_y_c, odom_yaw_c = odom_at_cam
+
+            # Поправка map-to-odom: разность между абсолютной меткой и одометрией на момент кадра
+            target_delta_x = float(avg_pos[0] - odom_x_c)
+            target_delta_y = float(avg_pos[1] - odom_y_c)
+            target_delta_yaw = float((avg_yaw - odom_yaw_c + np.pi) % (2.0 * np.pi) - np.pi)
+
+            if not self.map_odom_initialized:
+                self.delta_map_odom_x = target_delta_x
+                self.delta_map_odom_y = target_delta_y
+                self.delta_map_odom_yaw = target_delta_yaw
                 self.fused_z = avg_pos[2]
-                self.fused_yaw = avg_yaw
-                self.fused_initialized = True
+                self.map_odom_initialized = True
                 self.outlier_count = 0
             else:
-                # Проверка на пространственный выброс (Outlier Gating)
-                spatial_jump = np.sqrt((avg_pos[0] - self.fused_x)**2 + (avg_pos[1] - self.fused_y)**2)
-                # Если скачок больше 0.40 м за один кадр:
-                if spatial_jump > 0.40:
+                diff_jump = float(np.hypot(target_delta_x - self.delta_map_odom_x, target_delta_y - self.delta_map_odom_y))
+                if diff_jump > 0.40:
                     self.outlier_count += 1
                     if self.outlier_count < 4:
-                        self.get_logger().warn(
-                            f"⚠️ Игнорируем выброс ArUco: скачок {spatial_jump:.2f}м (порог 0.40м). Выбросов подряд: {self.outlier_count}"
-                        )
+                        self.get_logger().warn(f"⚠️ Игнорируем выброс ArUco: скачок {diff_jump:.2f}м. Выбросов подряд: {self.outlier_count}")
                         return
                     else:
-                        # Если 4 кадра подряд фиксируют новую позицию (робота переставили руками)
                         self.get_logger().info(f"🔄 Смена позиции робота подтверждена (4 кадра): X={avg_pos[0]:.2f}, Y={avg_pos[1]:.2f}")
-                        self.fused_x = avg_pos[0]
-                        self.fused_y = avg_pos[1]
-                        self.fused_yaw = avg_yaw
+                        self.delta_map_odom_x = target_delta_x
+                        self.delta_map_odom_y = target_delta_y
+                        self.delta_map_odom_yaw = target_delta_yaw
                         self.outlier_count = 0
                 else:
                     self.outlier_count = 0
-
-                # Коэффициент доверия к визуальной метке (filter_alpha)
-                K = self.filter_alpha
-                self.fused_x += K * (avg_pos[0] - self.fused_x)
-                self.fused_y += K * (avg_pos[1] - self.fused_y)
-                self.fused_z += K * (avg_pos[2] - self.fused_z)
-                
-                yaw_diff = avg_yaw - self.fused_yaw
-                yaw_diff = np.arctan2(np.sin(yaw_diff), np.cos(yaw_diff))
-                self.fused_yaw += K * yaw_diff
-                self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
+                    K = self.filter_alpha
+                    self.delta_map_odom_x += K * (target_delta_x - self.delta_map_odom_x)
+                    self.delta_map_odom_y += K * (target_delta_y - self.delta_map_odom_y)
+                    yaw_err = (target_delta_yaw - self.delta_map_odom_yaw + np.pi) % (2.0 * np.pi) - np.pi
+                    self.delta_map_odom_yaw = (self.delta_map_odom_yaw + K * yaw_err + np.pi) % (2.0 * np.pi) - np.pi
+                    self.fused_z += K * (avg_pos[2] - self.fused_z)
 
             self.tracking_mode = "aruco_fused"
             self.last_valid_tag_time = time.time()
@@ -464,42 +480,72 @@ class LocalizationNode(Node):
             self.robot = None
 
     def on_esp32_odometry(self, odom):
-        """Коллбэк прямой одометрии шаговых двигателей от TermitRobotAPI (20-50 Гц)"""
+        """Коллбэк прямой одометрии шаговых двигателей от TermitRobotAPI (UART-поток -> неблокирующая очередь)"""
         self.last_esp32_odom_time = time.time()
         self.last_esp32_odom = odom
-        now = self.get_clock().now()
-        dt = 0.04
-        
-        if not self.fused_initialized:
-            self.fused_x = odom.x
-            self.fused_y = odom.y
-            self.fused_yaw = odom.theta
-            self.fused_initialized = True
+        try:
+            self.odom_queue.put_nowait(odom)
+        except Exception:
+            pass
+
+    def lookup_odom_at(self, target_time: float):
+        """Интерполяция позы одометрии по кольцевому буферу на момент времени target_time кадра камеры."""
+        if not self.odom_history:
+            return None
+        if target_time <= self.odom_history[0][0]:
+            return self.odom_history[0][1], self.odom_history[0][2], self.odom_history[0][3]
+        if target_time >= self.odom_history[-1][0]:
+            return self.odom_history[-1][1], self.odom_history[-1][2], self.odom_history[-1][3]
+
+        hist = list(self.odom_history)
+        for i in range(len(hist) - 1):
+            t1, x1, y1, th1 = hist[i]
+            t2, x2, y2, th2 = hist[i + 1]
+            if t1 <= target_time <= t2:
+                ratio = (target_time - t1) / max(1e-6, t2 - t1)
+                ix = x1 + ratio * (x2 - x1)
+                iy = y1 + ratio * (y2 - y1)
+                dth = (th2 - th1 + np.pi) % (2.0 * np.pi) - np.pi
+                ith = (th1 + ratio * dth + np.pi) % (2.0 * np.pi) - np.pi
+                return ix, iy, ith
+        return hist[-1][1], hist[-1][2], hist[-1][3]
+
+    def fusion_cycle(self):
+        """Высокочастотный цикл обработки одометрии и слияния с картой (50 Гц) в главном потоке ROS."""
+        while not self.odom_queue.empty():
+            try:
+                odom = self.odom_queue.get_nowait()
+                self.odom_history.append((odom.timestamp, odom.x, odom.y, odom.theta))
+            except Exception:
+                break
+
+        if not self.odom_history:
             return
 
-        # В termit_api:
-        # odom.vy = продольная скорость тела робота (вперед > 0, назад < 0)
-        # odom.vx = боковая скорость тела робота (вправо > 0, влево < 0)
-        # В СК робота base_link (REP 103):
-        # X_base = вперед = odom.vy
-        # Y_base = влево = -odom.vx
-        v_forward = odom.vy
-        v_left = -odom.vx
-        w = odom.omega
+        latest_odom = self.odom_history[-1]
+        raw_odom_x = latest_odom[1]
+        raw_odom_y = latest_odom[2]
+        raw_odom_yaw = latest_odom[3]
 
-        self.fused_yaw += w * dt
-        self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
-
-        # Точное преобразование движения из ПСК робота в СК карты
-        dx_global = (v_forward * np.cos(self.fused_yaw) - v_left * np.sin(self.fused_yaw)) * dt
-        dy_global = (v_forward * np.sin(self.fused_yaw) + v_left * np.cos(self.fused_yaw)) * dt
-
-        self.fused_x += dx_global
-        self.fused_y += dy_global
+        if not self.fused_initialized:
+            self.fused_x = raw_odom_x
+            self.fused_y = raw_odom_y
+            self.fused_yaw = raw_odom_yaw
+            self.delta_map_odom_x = 0.0
+            self.delta_map_odom_y = 0.0
+            self.delta_map_odom_yaw = 0.0
+            self.fused_initialized = True
+            self.map_odom_initialized = True
+        else:
+            # Преобразование: поза на карте = одометрия + сглаженная поправка карты
+            self.fused_x = raw_odom_x + self.delta_map_odom_x
+            self.fused_y = raw_odom_y + self.delta_map_odom_y
+            self.fused_yaw = (raw_odom_yaw + self.delta_map_odom_yaw + np.pi) % (2.0 * np.pi) - np.pi
 
         if time.time() - self.last_valid_tag_time > 0.6:
             self.tracking_mode = "dead_reckoning"
 
+        now = self.get_clock().now()
         self.publish_fused_pose(now.to_msg())
 
     def check_motor_power_watchdog(self):
@@ -571,13 +617,116 @@ class LocalizationNode(Node):
         self.cmd_vel_pub.publish(msg)
 
     def set_path_plan(self, waypoints):
-        """Сохранение путевых точек маршрута и публикация Path в ROS"""
-        self.route_waypoints = list(waypoints)
+        """Сохранение путевых точек маршрута, расчет кумулятивных длин и скоростей в углах"""
+        self.route_waypoints = [list(pt) for pt in waypoints]
         self.current_wp_idx = 0
         self.route_state = "idle"
+        self.path_s_accum = [0.0]
+        self.path_corner_speeds = [self.ap_cruise_speed] * len(self.route_waypoints)
+        
+        for i in range(len(self.route_waypoints) - 1):
+            p1 = self.route_waypoints[i]
+            p2 = self.route_waypoints[i+1]
+            seg_len = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+            self.path_s_accum.append(self.path_s_accum[-1] + seg_len)
+
+        for i in range(1, len(self.route_waypoints) - 1):
+            p_prev = np.array(self.route_waypoints[i-1])
+            p_curr = np.array(self.route_waypoints[i])
+            p_next = np.array(self.route_waypoints[i+1])
+            
+            v_in = p_curr - p_prev
+            v_out = p_next - p_curr
+            l_in = float(np.linalg.norm(v_in))
+            l_out = float(np.linalg.norm(v_out))
+            
+            if l_in > 1e-4 and l_out > 1e-4:
+                u_in = v_in / l_in
+                u_out = v_out / l_out
+                cos_turn = float(np.clip(np.dot(u_in, u_out), -1.0, 1.0))
+                turn_angle = float(np.arccos(cos_turn))
+                if turn_angle > np.radians(15.0):
+                    v_c = self.ap_cruise_speed * np.cos(turn_angle / 2.0) * self.ap_turn_factor
+                    self.path_corner_speeds[i] = max(self.ap_min_lin, float(v_c))
+
         self.publish_plan(waypoints)
         self.notify_ui_event()
-        self.get_logger().info(f"Загружен новый маршрут из {len(waypoints)} точек")
+        self.get_logger().info(f"Загружен маршрут: {len(waypoints)} точек, общая длина {self.path_s_accum[-1]:.2f}м")
+
+    def project_onto_path(self, rx: float, ry: float, prev_s: float):
+        """Проекция точки на полилинию маршрута с монотонным продвижением вдоль s."""
+        wps = self.route_waypoints
+        if len(wps) < 2:
+            return wps[0], 0.0, np.array([1.0, 0.0]), np.array([0.0, 1.0]), 0.0, 0
+
+        best_dist_sq = float('inf')
+        best_proj = np.array(wps[0])
+        best_s = 0.0
+        best_tangent = np.array([1.0, 0.0])
+        best_normal = np.array([0.0, 1.0])
+        best_e_cross = 0.0
+        best_idx = 0
+
+        p = np.array([rx, ry])
+
+        for i in range(len(wps) - 1):
+            p_a = np.array(wps[i])
+            p_b = np.array(wps[i+1])
+            ab = p_b - p_a
+            seg_len = float(np.linalg.norm(ab))
+            if seg_len < 1e-6:
+                continue
+
+            tangent = ab / seg_len
+            normal = np.array([-tangent[1], tangent[0]])
+
+            ap = p - p_a
+            t_param = float(np.clip(np.dot(ap, tangent) / seg_len, 0.0, 1.0))
+            proj = p_a + t_param * ab
+            dist_sq = float(np.sum((p - proj)**2))
+
+            s_cand = self.path_s_accum[i] + t_param * seg_len
+
+            penalty = 0.0
+            if s_cand < prev_s:
+                if prev_s - s_cand < 0.25:
+                    penalty = (prev_s - s_cand) * 2.0
+
+            effective_score = dist_sq + penalty
+
+            if effective_score < best_dist_sq:
+                best_dist_sq = effective_score
+                best_proj = proj
+                best_s = max(prev_s, s_cand) if (prev_s - s_cand < 0.25) else s_cand
+                best_tangent = tangent
+                best_normal = normal
+                d_vec = p - proj
+                best_e_cross = float(np.dot(d_vec, normal))
+                best_idx = i
+
+        return best_proj, best_s, best_tangent, best_normal, best_e_cross, best_idx
+
+    def calc_target_along_speed(self, s: float):
+        """Расчет допустимой скорости вдоль траектории с учетом углов и торможения на финише"""
+        total_len = self.path_s_accum[-1]
+        d_finish = max(0.0, total_len - s)
+
+        if d_finish <= self.ap_goal_tol:
+            v_finish = self.ap_min_lin
+        else:
+            v_finish = np.sqrt(max(0.0, 2.0 * self.ap_brake_accel * (d_finish - self.ap_goal_tol))) + self.ap_min_lin
+
+        v_corners = []
+        for i in range(1, len(self.route_waypoints) - 1):
+            s_corner = self.path_s_accum[i]
+            if s_corner > s:
+                d_to_corner = s_corner - s
+                v_max_c = self.path_corner_speeds[i]
+                v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
+                v_corners.append(v_brake_c)
+
+        v_limit = min([self.ap_cruise_speed, v_finish] + v_corners)
+        return float(np.clip(v_limit, self.ap_min_lin, self.ap_cruise_speed))
 
     def start_route(self):
         """Запуск автономного движения по маршруту (Pure Pursuit)"""
@@ -647,142 +796,121 @@ class LocalizationNode(Node):
 
     def autopilot_loop(self):
         """
-        Высокоточный цикл автономного движения Lookahead Pure Pursuit (20 Гц).
-        Прямое управление через ESP32 API с плавным круиз-контролем.
-        Исключает рывки, зависания на промежуточных точках и разворот векторов назад.
+        Высокоточный векторный контроллер следования по траектории (20 Гц).
+        - Полилинейная проекция без срезания углов (continuous polyline projection)
+        - Автоматическое торможение перед вершинами и финишем (corner & finish speed profile)
+        - Активная компенсация бокового сноса (v_cross_cmd)
+        - Корректная REP-103 кинематика 3-колесной омни-базы
         """
         import time as pytime
+
+        if not self.route_waypoints:
+            self.route_state = "idle"
+            self.autopilot_active = False
+            return
+
+        total_path_len = self.path_s_accum[-1] if hasattr(self, 'path_s_accum') and self.path_s_accum else 0.0
+        current_s = 0.0
+        initial_yaw = float(self.fused_yaw)
+
         smooth_forward = 0.0
         smooth_strafe = 0.0
         smooth_w = 0.0
+        alpha = 0.40
+
+        self.get_logger().info(f"▶ Старт векторного контроллера: длина пути {total_path_len:.2f}м, режим курса: {self.ap_yaw_mode}")
 
         while self.autopilot_active and self.route_state == "running":
             t_loop_start = pytime.time()
             self.last_motion_cmd_time = t_loop_start
-            
-            if not self.route_waypoints or self.current_wp_idx >= len(self.route_waypoints):
-                self.route_state = "finished"
-                self.autopilot_active = False
-                self.drive_robot(0.0, 0.0, 0.0)
-                self.notify_ui_event()
-                self.get_logger().info("🎉 Маршрут полностью выполнен! Робот на финише.")
-                # Power watchdog releases coils after braking, not mid-ramp.
-                self.last_motion_cmd_time = pytime.time()
-                break
 
             rx = float(self.fused_x)
             ry = float(self.fused_y)
             ryaw = float(self.fused_yaw)
 
-            fx, fy = self.route_waypoints[-1]
-            dist_to_finish = float(np.hypot(fx - rx, fy - ry))
+            # 1. Проекция робота на полилинию
+            proj_pt, current_s, tangent, normal, e_cross, seg_idx = self.project_onto_path(rx, ry, current_s)
+            self.current_wp_idx = min(seg_idx + 1, len(self.route_waypoints) - 1)
 
-            # Проверка достижения финальной цели
-            if dist_to_finish < self.ap_goal_tol and self.current_wp_idx >= len(self.route_waypoints) - 2:
+            dist_to_finish = max(0.0, total_path_len - current_s)
+            fx, fy = self.route_waypoints[-1]
+            finish_euclid = float(np.hypot(fx - rx, fy - ry))
+
+            # 2. Проверка условия завершения маршрута
+            if dist_to_finish <= self.ap_goal_tol or (finish_euclid <= self.ap_goal_tol and current_s >= total_path_len - 0.06):
+                self.drive_robot(0.0, 0.0, 0.0)
+                pytime.sleep(0.3)
                 self.route_state = "finished"
                 self.autopilot_active = False
-                self.drive_robot(0.0, 0.0, 0.0)
                 self.notify_ui_event()
-                self.get_logger().info(f"🎉 Финиш достигнут (дистанция {dist_to_finish*100:.1f} см)!")
-                # Power watchdog releases coils after braking, not mid-ramp.
+                self.get_logger().info(f"🎉 Маршрут успешно завершен! Финиш достигнут (ошибка {finish_euclid*100:.1f} см)")
                 self.last_motion_cmd_time = pytime.time()
                 break
 
-            # 1. Продвижение по точкам вперед (Dynamic Waypoint Advancement)
-            # Робот никогда не зависает на пройденной точке: переключается, если ближе к следующей
-            # или если проекция позиции находится впереди текущего сегмента
-            while self.current_wp_idx < len(self.route_waypoints) - 1:
-                c_wp = self.route_waypoints[self.current_wp_idx]
-                n_wp = self.route_waypoints[self.current_wp_idx + 1]
-                d_c = np.hypot(c_wp[0] - rx, c_wp[1] - ry)
-                d_n = np.hypot(n_wp[0] - rx, n_wp[1] - ry)
-                s_dx = n_wp[0] - c_wp[0]
-                s_dy = n_wp[1] - c_wp[1]
-                s_len_sq = s_dx**2 + s_dy**2
+            # 3. Скоростной профиль вдоль траектории
+            v_along_target = self.calc_target_along_speed(current_s)
 
-                if d_c < max(0.10, self.ap_wp_tol) or d_n < d_c:
-                    self.current_wp_idx += 1
-                    self.notify_ui_event()
-                    self.get_logger().info(f"📍 Пройдена точка! Следующая: {self.current_wp_idx + 1}/{len(self.route_waypoints)}")
-                elif s_len_sq > 1e-6:
-                    proj = ((rx - c_wp[0]) * s_dx + (ry - c_wp[1]) * s_dy) / s_len_sq
-                    if proj > 0.75:
-                        self.current_wp_idx += 1
-                        self.notify_ui_event()
-                        self.get_logger().info(f"📍 Пройдена точка! Следующая: {self.current_wp_idx + 1}/{len(self.route_waypoints)}")
-                    else:
-                        break
+            # 4. Векторное боковое управление (cross-track velocity)
+            v_cross_cmd = -float(np.clip(self.ap_kp_cross * e_cross, -self.ap_v_cross_max, self.ap_v_cross_max))
+
+            # 5. Результирующий вектор скорости в СК карты
+            v_map = v_along_target * tangent + v_cross_cmd * normal
+            v_norm = float(np.linalg.norm(v_map))
+            if v_norm > self.ap_cruise_speed:
+                v_map = v_map * (self.ap_cruise_speed / v_norm)
+
+            # 6. Кинематика Omni REP-103: проекция на продольную и поперечную оси робота
+            # v_forward = v_map_x * cos(yaw) + v_map_y * sin(yaw)
+            # v_strafe_right = v_map_x * sin(yaw) - v_map_y * cos(yaw)
+            v_forward = float(v_map[0] * np.cos(ryaw) + v_map[1] * np.sin(ryaw))
+            v_strafe_right = float(v_map[0] * np.sin(ryaw) - v_map[1] * np.cos(ryaw))
+
+            # 7. Контроллер ориентации (4 режима yaw)
+            if self.ap_yaw_mode == "HOLD_INITIAL":
+                target_yaw = initial_yaw
+            elif self.ap_yaw_mode == "PATH_TANGENT":
+                target_yaw = float(np.arctan2(tangent[1], tangent[0]))
+            elif self.ap_yaw_mode == "FINAL_YAW":
+                if dist_to_finish < 0.20:
+                    target_yaw = self.ap_final_yaw
                 else:
-                    break
+                    target_yaw = float(np.arctan2(tangent[1], tangent[0]))
+            else: # FREE
+                target_yaw = ryaw
 
-            # 2. Расчет точки упреждения (Lookahead Carrot Point) вдоль маршрута
-            # Carrot point всегда находится на расстоянии lookahead вперед по пути
-            lookahead_dist = max(0.14, self.ap_look_ahead)
-            accum_dist = 0.0
-            carrot_pt = self.route_waypoints[self.current_wp_idx]
-            
-            for idx in range(self.current_wp_idx, len(self.route_waypoints) - 1):
-                p_a = self.route_waypoints[idx]
-                p_b = self.route_waypoints[idx + 1]
-                seg_len = np.hypot(p_b[0] - p_a[0], p_b[1] - p_a[1])
-                if accum_dist + seg_len >= lookahead_dist:
-                    rem = lookahead_dist - accum_dist
-                    t_seg = rem / max(0.001, seg_len)
-                    carrot_pt = [p_a[0] + t_seg * (p_b[0] - p_a[0]), p_a[1] + t_seg * (p_b[1] - p_a[1])]
-                    break
-                accum_dist += seg_len
-                carrot_pt = p_b
-
-            tx, ty = carrot_pt
-            dx = tx - rx
-            dy = ty - ry
-            dist_to_target = np.hypot(dx, dy)
-            if dist_to_target < 0.001:
-                dist_to_target = 0.001
-
-            # 3. Скорость: постоянная крейсерская по трассе, плавное торможение только перед финишем
-            if dist_to_finish > self.ap_decel_dist:
-                linear_speed = self.ap_max_lin
+            yaw_err = float((target_yaw - ryaw + np.pi) % (2.0 * np.pi) - np.pi)
+            if abs(yaw_err) < 0.03:
+                w = 0.0
             else:
-                ratio = (dist_to_finish - self.ap_goal_tol) / max(0.01, self.ap_decel_dist - self.ap_goal_tol)
-                ratio = np.clip(ratio, 0.0, 1.0)
-                linear_speed = self.ap_min_lin + ratio * (self.ap_max_lin - self.ap_min_lin)
+                w = float(np.clip(self.ap_kp_ang * yaw_err, -self.ap_max_ang, self.ap_max_ang))
 
-            # 4. Кинематика Omni: проекция вектора скорости на систему координат робота
-            # v_forward: проекция на продольную ось робота (вперед)
-            # v_left:    проекция на поперечную ось робота (влево)
-            v_forward = linear_speed * (dx * np.cos(ryaw) + dy * np.sin(ryaw)) / dist_to_target
-            v_left    = linear_speed * (-dx * np.sin(ryaw) + dy * np.cos(ryaw)) / dist_to_target
-
-            # 5. Мягкая угловая ориентация (ограничена 0.35 рад/с для стабильности ArUco)
-            target_yaw = np.arctan2(dy, dx)
-            yaw_err = target_yaw - ryaw
-            yaw_err = np.arctan2(np.sin(yaw_err), np.cos(yaw_err))
-            w = np.clip(0.8 * yaw_err, -0.35, 0.35)
-
-            strafe_right = -v_left
-
-            # EMA-фильтр векторов скорости (исключает ступенчатые рывки между путевыми точками)
-            alpha = 0.35
+            # 8. Плавная фильтрация скоростей (EMA)
             smooth_forward = smooth_forward * (1.0 - alpha) + v_forward * alpha
-            smooth_strafe  = smooth_strafe  * (1.0 - alpha) + strafe_right * alpha
-            smooth_w       = smooth_w       * (1.0 - alpha) + w * alpha
+            smooth_strafe = smooth_strafe * (1.0 - alpha) + v_strafe_right * alpha
+            smooth_w = smooth_w * (1.0 - alpha) + w * alpha
 
+            # 9. Отправка команды движения
             self.drive_robot(smooth_forward, smooth_strafe, smooth_w)
 
+            # 10. Логирование телеметрии забега
             rec = {
                 "t": t_loop_start,
                 "run_id": self.active_run_id,
+                "s": round(float(current_s), 4),
+                "total_s": round(float(total_path_len), 4),
                 "wp_idx": int(self.current_wp_idx),
                 "rx": round(rx, 4),
                 "ry": round(ry, 4),
                 "ryaw": round(ryaw, 4),
-                "tx": round(tx, 4),
-                "ty": round(ty, 4),
-                "dist_finish": round(dist_to_finish, 4),
-                "cmd_fwd": round(smooth_forward, 4),
-                "cmd_strafe": round(smooth_strafe, 4),
-                "cmd_w": round(smooth_w, 4),
+                "proj_x": round(float(proj_pt[0]), 4),
+                "proj_y": round(float(proj_pt[1]), 4),
+                "e_cross": round(float(e_cross), 4),
+                "dist_finish": round(float(dist_to_finish), 4),
+                "v_along": round(float(v_along_target), 4),
+                "v_cross": round(float(v_cross_cmd), 4),
+                "cmd_fwd": round(float(smooth_forward), 4),
+                "cmd_strafe": round(float(smooth_strafe), 4),
+                "cmd_w": round(float(smooth_w), 4),
                 "mode": self.tracking_mode
             }
             self.log_record(rec)
@@ -921,50 +1049,7 @@ class LocalizationNode(Node):
         pytime.sleep(0.3)
         self.set_motor_power("disable")
 
-    def odom_callback(self, msg):
-        """Интеграция одометрии шаговых двигателей для экстраполяции позы"""
-        now = self.get_clock().now()
-        if self.last_odom_msg_time is None:
-            self.last_odom_msg_time = now
-            return
-            
-        dt = (now - self.last_odom_msg_time).nanoseconds / 1e9
-        self.last_odom_msg_time = now
-        
-        if dt <= 0 or dt > 0.5:
-            dt = 0.04
-            
-        if not self.fused_initialized:
-            self.fused_x = msg.pose.pose.position.x
-            self.fused_y = msg.pose.pose.position.y
-            self.fused_z = msg.pose.pose.position.z
-            
-            q = msg.pose.pose.orientation
-            q_arr = [q.x, q.y, q.z, q.w]
-            self.fused_yaw = self.quaternion_to_yaw_from_quat(q_arr)
-            self.fused_initialized = True
-            return
 
-        vx_local = msg.twist.twist.linear.x
-        vy_local = msg.twist.twist.linear.y
-        w = msg.twist.twist.angular.z
-
-        self.fused_yaw += w * dt
-        self.fused_yaw = np.arctan2(np.sin(self.fused_yaw), np.cos(self.fused_yaw))
-
-        dx_local = vx_local * dt
-        dy_local = vy_local * dt
-
-        dx_global = dx_local * np.cos(self.fused_yaw) - dy_local * np.sin(self.fused_yaw)
-        dy_global = dx_local * np.sin(self.fused_yaw) + dy_local * np.cos(self.fused_yaw)
-
-        self.fused_x += dx_global
-        self.fused_y += dy_global
-
-        if time.time() - self.last_valid_tag_time > 0.6:
-            self.tracking_mode = "dead_reckoning"
-
-        self.publish_fused_pose(now.to_msg())
 
     def publish_fused_pose(self, stamp):
         self.last_pose_publish_time = time.time()

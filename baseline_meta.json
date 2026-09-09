@@ -1,0 +1,7 @@
+{
+  "baseline_commit": "257366de3ff925170079d9508d12b0a8b9049534",
+  "timestamp": 1788976628.56474,
+  "firmware": "TERMIT_FASTACCEL_V2",
+  "config_sha256": "7ce09346593e9e9ea0f877c31fdea4dcf452e8c18fcdf8c86668a57ec078c106",
+  "description": "Baseline instrumentation with release symlinks, run logger, and health checks"
+}

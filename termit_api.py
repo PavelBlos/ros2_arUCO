@@ -64,6 +64,17 @@ class RobotConfig:
     inv_m2: int = 1                      # Мотор 2 (R, правый)
     inv_m3: int = 1                      # Мотор 3 (L, левый)
     side_ratio: float = 0.50             # Калибровочный коэффициент бокового хода (0.5 для 120 град)
+    k1: float = 1.0                      # Масштаб колеса 1
+    k2: float = 1.0                      # Масштаб колеса 2
+    k3: float = 1.0                      # Масштаб колеса 3
+
+
+def _diff_int32(curr: int, prev: int) -> int:
+    """Вычисляет разность двух 32-битных знаковых счетчиков с учетом переполнения."""
+    d = (curr - prev) & 0xFFFFFFFF
+    if d >= 0x80000000:
+        d -= 0x100000000
+    return d
 
 
 @dataclass
@@ -73,13 +84,18 @@ class OdometryData:
     y: float = 0.0                       # Позиция Y в мировой системе координат (м)
     theta: float = 0.0                   # Ориентация робота (рад) [-pi, pi]
     
-    vx: float = 0.0                      # Линейная скорость Vx (м/с) в системе робота
-    vy: float = 0.0                      # Линейная скорость Vy (м/с) в системе робота
+    vx: float = 0.0                      # Продольная скорость тела робота (вперед > 0) в м/с
+    vy: float = 0.0                      # Боковая скорость тела робота (влево > 0) в м/с
     omega: float = 0.0                   # Угловая скорость (рад/с)
+    
+    dx_body: float = 0.0                 # Линейное шаговое смещение вперед за такт (м)
+    dy_body: float = 0.0                 # Линейное шаговое смещение влево за такт (м)
+    dtheta: float = 0.0                  # Угловое шаговое смещение за такт (рад)
     
     wheel_steps: Tuple[int, int, int] = (0, 0, 0)   # Текущие абсолютные шаги (M1, M2, M3)
     wheel_speeds: Tuple[int, int, int] = (0, 0, 0)  # Текущие скорости моторов (шаги/сек)
     timestamp: float = 0.0               # Временная метка измерения (сек)
+    epoch: int = 0                       # Эпоха соединения (защита от скачков при перезагрузке)
 
 
 class TermitRobotAPI:
@@ -129,6 +145,7 @@ class TermitRobotAPI:
         self._last_wheel_steps: Optional[Tuple[int, int, int]] = None
         self._last_odom_time: float = 0.0
         self._odom_callbacks: List[Callable[[OdometryData], None]] = []
+        self._connection_epoch: int = 0
 
         self._is_moving = False
         self._last_telemetry_time = 0.0
@@ -535,37 +552,52 @@ class TermitRobotAPI:
             if dt <= 0:
                 dt = 0.05
 
-            # Дельты шагов за такт
-            dp1 = (p1 - self._last_wheel_steps[0]) * self.config.inv_m1
-            dp2 = (p2 - self._last_wheel_steps[1]) * self.config.inv_m2
-            dp3 = (p3 - self._last_wheel_steps[2]) * self.config.inv_m3
+            # Дельты шагов за такт с корректной обработкой int32 wrap-around
+            dp1 = _diff_int32(p1, self._last_wheel_steps[0]) * self.config.inv_m1
+            dp2 = _diff_int32(p2, self._last_wheel_steps[1]) * self.config.inv_m2
+            dp3 = _diff_int32(p3, self._last_wheel_steps[2]) * self.config.inv_m3
 
             self._last_wheel_steps = (p1, p2, p3)
             self._last_odom_time = now
 
-            # Перевод шагов в линейное смещение колес (метры)
-            ds1 = dp1 * self._meters_per_step
-            ds2 = dp2 * self._meters_per_step
-            ds3 = dp3 * self._meters_per_step
+            # Защита от перезагрузки ESP32 / скачков шагов (более 2000 шагов за ~50 мс)
+            if abs(dp1) > 2000 or abs(dp2) > 2000 or abs(dp3) > 2000:
+                self._connection_epoch += 1
+                return
+
+            # Перевод шагов в линейное смещение колес (метры) с учетом индивидуальных масштабов
+            ds1 = dp1 * self._meters_per_step * getattr(self.config, 'k1', 1.0)
+            ds2 = dp2 * self._meters_per_step * getattr(self.config, 'k2', 1.0)
+            ds3 = dp3 * self._meters_per_step * getattr(self.config, 'k3', 1.0)
 
             # Прямая кинематика для 3-колесной Omni базы:
-            # Матрица перехода от смещения колес (ds1, ds2, ds3) к смещению робота (dx, dy, dtheta)
             L = self.config.base_radius
             
-            # Локальные смещения в СК робота:
-            dx = (2.0 / 3.0) * ds1 - (1.0 / 3.0) * ds2 - (1.0 / 3.0) * ds3
-            dy = (1.0 / math.sqrt(3.0)) * (ds3 - ds2)
+            # Локальные смещения в СК робота (REP-103: X=вперед, Y=влево):
+            # ds_strafe_right = (2/3)*ds1 - (1/3)*ds2 - (1/3)*ds3
+            # ds_forward = (1 / sqrt(3)) * (ds3 - ds2)
+            ds_strafe_right = (2.0 / 3.0) * ds1 - (1.0 / 3.0) * ds2 - (1.0 / 3.0) * ds3
+            ds_forward = (1.0 / math.sqrt(3.0)) * (ds3 - ds2)
             dtheta = (1.0 / (3.0 * L)) * (ds1 + ds2 + ds3)
 
-            # Мгновенные скорости тела робота
-            self._odom.vx = dx / dt
-            self._odom.vy = dy / dt
-            self._odom.omega = dtheta / dt
+            dx_body = ds_forward
+            dy_body = -ds_strafe_right
 
-            # Интегрирование позы в мировой системе координат:
+            # Скорости тела робота в REP-103
+            self._odom.vx = dx_body / dt
+            self._odom.vy = dy_body / dt
+            self._odom.omega = dtheta / dt
+            self._odom.dx_body = dx_body
+            self._odom.dy_body = dy_body
+            self._odom.dtheta = dtheta
+
+            # Высокоточное интегрирование методом средней точки (Midpoint Euler)
             th_mid = self._odom.theta + (dtheta / 2.0)
-            self._odom.x += dx * math.cos(th_mid) - dy * math.sin(th_mid)
-            self._odom.y += dx * math.sin(th_mid) + dy * math.cos(th_mid)
+            delta_x_world = dx_body * math.cos(th_mid) - dy_body * math.sin(th_mid)
+            delta_y_world = dx_body * math.sin(th_mid) + dy_body * math.cos(th_mid)
+
+            self._odom.x += delta_x_world
+            self._odom.y += delta_y_world
             self._odom.theta = (self._odom.theta + dtheta + math.pi) % (2.0 * math.pi) - math.pi
 
             odom_snapshot = OdometryData(
@@ -575,9 +607,13 @@ class TermitRobotAPI:
                 vx=self._odom.vx,
                 vy=self._odom.vy,
                 omega=self._odom.omega,
+                dx_body=dx_body,
+                dy_body=dy_body,
+                dtheta=dtheta,
                 wheel_steps=self._odom.wheel_steps,
                 wheel_speeds=self._odom.wheel_speeds,
-                timestamp=now
+                timestamp=now,
+                epoch=self._connection_epoch
             )
 
         # Вызов внешних коллбэков (например, для публикации в ROS 2)
