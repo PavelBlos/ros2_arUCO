@@ -43,7 +43,7 @@ class HoldMode(Enum):
 @dataclass
 class RobotConfig:
     """Физические и кинематические параметры робота Termit Omni."""
-    wheel_radius: float = 0.030          # Радиус колеса (м) = 30 мм (диаметр 60 мм)
+    wheel_radius: float = 0.035          # Радиус колеса (м), диаметр по умолчанию 70 мм
     base_radius: float = 0.122           # Радиус базы робота от центра до колеса (м) = 122 мм
     steps_per_rev: int = 1600            # Микрошагов на 1 полный оборот вала (1/8 шага)
     gear_ratio: float = 1.0              # Передаточное число редуктора (1.0 для прямого привода)
@@ -280,6 +280,17 @@ class TermitRobotAPI:
     # Кинематика и управление движением
     # =========================================================================
 
+    def set_wheel_diameter_mm(self, diameter_mm: float):
+        """Atomically update wheel geometry used by commands and odometry."""
+        diameter_mm = float(diameter_mm)
+        if not 20.0 <= diameter_mm <= 300.0:
+            raise ValueError("wheel diameter must be between 20 and 300 mm")
+        with self._vel_lock:
+            self.config.wheel_radius = diameter_mm / 2000.0
+            self._wheel_circumference = 2.0 * math.pi * self.config.wheel_radius
+            self._steps_per_meter = (self.config.steps_per_rev * self.config.gear_ratio) / self._wheel_circumference
+            self._meters_per_step = 1.0 / self._steps_per_meter
+
     def drive(self, vx: float, vy: float, omega: float = 0.0):
         """
         ВЫСОКИЙ УРОВЕНЬ: Управление вектором движения тела робота (Twist).
@@ -415,9 +426,13 @@ class TermitRobotAPI:
                 vx=self._odom.vx,
                 vy=self._odom.vy,
                 omega=self._odom.omega,
+                dx_body=self._odom.dx_body,
+                dy_body=self._odom.dy_body,
+                dtheta=self._odom.dtheta,
                 wheel_steps=self._odom.wheel_steps,
                 wheel_speeds=self._odom.wheel_speeds,
-                timestamp=self._odom.timestamp
+                timestamp=self._odom.timestamp,
+                epoch=self._connection_epoch,
             )
 
     def reset_odometry(self, x: float = 0.0, y: float = 0.0, theta: float = 0.0):

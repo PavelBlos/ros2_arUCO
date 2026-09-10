@@ -1,2 +1,13 @@
 int32 tag_id
+bool pose_valid
 geometry_msgs/Pose pose
+float64[8] corners_px
+float64 reproj_err
+float64 marker_area_px
+float64 marker_perimeter_px
+float64 distance_m
+float64 viewing_angle_deg
+int32 ambiguity_status
+float64 ambiguity_ratio
+float64 marker_size_mm
+string rejection_reason

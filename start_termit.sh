@@ -3,9 +3,23 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/src/fake_tag_publisher/fake_tag_publisher:${PYTHONPATH}"
+if [ -f "${SCRIPT_DIR}/manifest.json" ]; then
+    export ROBOT_RELEASE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("git_commit", "unknown"))' "${SCRIPT_DIR}/manifest.json")"
+fi
 
-source /opt/ros/jazzy/setup.bash
-if [ -f /home/raspberry/ros2_ws/install/setup.bash ]; then
+# Source ROS 2 base environment
+if [ -f /opt/ros/jazzy/setup.bash ]; then
+    source /opt/ros/jazzy/setup.bash
+elif [ -f /opt/ros/humble/setup.bash ]; then
+    source /opt/ros/humble/setup.bash
+fi
+
+# Source isolated release install if present, otherwise fallback to global ros2_ws
+if [ -f "${SCRIPT_DIR}/install/setup.bash" ]; then
+    echo "[+] Sourcing isolated release workspace: ${SCRIPT_DIR}/install/setup.bash"
+    source "${SCRIPT_DIR}/install/setup.bash"
+elif [ -f /home/raspberry/ros2_ws/install/setup.bash ]; then
+    echo "[+] Sourcing global ros2_ws: /home/raspberry/ros2_ws/install/setup.bash"
     source /home/raspberry/ros2_ws/install/setup.bash
 fi
 
@@ -54,8 +68,7 @@ echo "[+] Active release directory: ${SCRIPT_DIR}"
 echo "[+] Using localization_node:  ${LOC_PY}"
 echo "[+] Using video_tag_detector: ${VID_PY}"
 
-echo "[+] Starting Static TF (base_link -> camera_link)..."
-ros2 run tf2_ros static_transform_publisher --x 0.0 --y 0.0 --z 0.0 --roll 0.0 --pitch -1.570796 --yaw 1.570796 --frame-id base_link --child-frame-id camera_link > /tmp/static_tf.log 2>&1 &
+echo "[+] Dynamic Camera TF (base_link -> camera_link) is broadcast by localization_node from camera_extrinsics.yaml"
 
 echo "[+] Starting Video Tag Detector (CSI Camera via libcamerify)..."
 /usr/local/bin/libcamerify python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &
