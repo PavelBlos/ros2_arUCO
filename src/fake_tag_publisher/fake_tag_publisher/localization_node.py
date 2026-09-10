@@ -20,7 +20,7 @@ try:
     from .geometry_transforms import (
         normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
         compute_map_to_odom_se2, compute_fused_pose_se2, smooth_map_to_odom_se2,
-        optical_to_ros_matrix, ros_to_optical_matrix
+        optical_to_ros_matrix, ros_to_optical_matrix, map_velocity_to_body
     )
     from .tag_registry import TagRegistry
     from .multi_tag_fusion import MultiTagFusion, propagate_odometry_covariance
@@ -30,7 +30,7 @@ except ImportError:
     from geometry_transforms import (
         normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
         compute_map_to_odom_se2, compute_fused_pose_se2, smooth_map_to_odom_se2,
-        optical_to_ros_matrix, ros_to_optical_matrix
+        optical_to_ros_matrix, ros_to_optical_matrix, map_velocity_to_body
     )
     from tag_registry import TagRegistry
     from multi_tag_fusion import MultiTagFusion, propagate_odometry_covariance
@@ -76,7 +76,8 @@ class LocalizationNode(Node):
         self.load_camera_calibration()
 
         self.camera_extrinsics_status = "unverified"
-        self.T_base_cam = pose_to_matrix(0.0, 0.0, 0.0, 0.0, -np.pi/2.0, np.pi/2.0)
+        # The original working mounting has image bottom toward robot +X.
+        self.T_base_cam = pose_to_matrix(0.0, 0.0, 0.0, 0.0, -np.pi/2.0, 0.0)
         self.load_camera_extrinsics()
 
         # Fusion, Motion Mutex, Wizard, and Co-Visibility Graph
@@ -1312,11 +1313,9 @@ class LocalizationNode(Node):
             if v_norm > self.ap_cruise_speed:
                 v_map = v_map * (self.ap_cruise_speed / v_norm)
 
-            # 8. Кинематика Omni REP-103: проекция вектора v_map на оси робота
-            # v_forward = v_map_x * cos(yaw) + v_map_y * sin(yaw)
-            # v_strafe_right = v_map_x * sin(yaw) - v_map_y * cos(yaw)
-            v_forward = float(v_map[0] * np.cos(ryaw) + v_map[1] * np.sin(ryaw))
-            v_strafe_right = float(v_map[0] * np.sin(ryaw) - v_map[1] * np.cos(ryaw))
+            # 8. Проекция скорости карты в REP-103 оси робота:
+            # +X вперед, +Y влево.
+            v_forward, v_strafe_left = map_velocity_to_body(v_map[0], v_map[1], ryaw)
 
             # 9. Контроллер ориентации (4 режима yaw)
             if self.ap_yaw_mode == "HOLD_INITIAL":
@@ -1339,7 +1338,7 @@ class LocalizationNode(Node):
 
             # 10. Плавная фильтрация скоростей (EMA)
             smooth_forward = smooth_forward * (1.0 - alpha) + v_forward * alpha
-            smooth_strafe = smooth_strafe * (1.0 - alpha) + v_strafe_right * alpha
+            smooth_strafe = smooth_strafe * (1.0 - alpha) + v_strafe_left * alpha
             smooth_w = smooth_w * (1.0 - alpha) + w * alpha
 
             # 11. Отправка команды движения
@@ -2017,7 +2016,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                     "z": float(payload.get('z', 0.0)),
                     "roll": float(payload.get('roll', 0.0)),
                     "pitch": float(payload.get('pitch', -np.pi/2.0)),
-                    "yaw": float(payload.get('yaw', np.pi/2.0))
+                    "yaw": float(payload.get('yaw', 0.0))
                 }
                 if not all(math.isfinite(v) for k, v in data.items() if k != 'status'):
                     raise ValueError("extrinsics values must be finite")

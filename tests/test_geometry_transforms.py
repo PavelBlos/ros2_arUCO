@@ -25,8 +25,23 @@ from geometry_transforms import (
     base_pose_from_camera,
     compute_map_to_odom_se2,
     compute_fused_pose_se2,
-    smooth_map_to_odom_se2
+    smooth_map_to_odom_se2,
+    map_velocity_to_body
 )
+
+@pytest.mark.parametrize(
+    "map_velocity,yaw,expected_body",
+    [
+        ((1.0, 0.0), 0.0, (1.0, 0.0)),
+        ((0.0, 1.0), 0.0, (0.0, 1.0)),
+        ((1.0, 0.0), math.pi / 2.0, (0.0, -1.0)),
+        ((0.0, 1.0), math.pi / 2.0, (1.0, 0.0)),
+    ],
+)
+def test_map_velocity_to_rep103_body(map_velocity, yaw, expected_body):
+    forward, left = map_velocity_to_body(*map_velocity, yaw)
+    assert forward == pytest.approx(expected_body[0], abs=1e-9)
+    assert left == pytest.approx(expected_body[1], abs=1e-9)
 
 def test_angle_normalization():
     assert abs(normalize_angle(0.0)) < 1e-9
@@ -65,6 +80,20 @@ def test_optical_ros_roundtrip():
     p_opt_right = np.array([1.5, 0.0, 0.0, 1.0])
     p_ros_right = T_opt_ros @ p_opt_right
     assert np.allclose(p_ros_right[:3], [0.0, -1.5, 0.0], atol=1e-9)
+
+
+def test_original_robot_camera_mounting_axes():
+    """The real mounting has image bottom forward and image right to robot right."""
+    T_base_camera = pose_to_matrix(0.0, 0.0, 0.0, 0.0, -math.pi / 2.0, 0.0)
+    T_base_optical = T_base_camera @ optical_to_ros_matrix()
+
+    image_bottom = T_base_optical @ np.array([0.0, 1.0, 0.0, 1.0])
+    image_right = T_base_optical @ np.array([1.0, 0.0, 0.0, 1.0])
+    optical_axis = T_base_optical @ np.array([0.0, 0.0, 1.0, 1.0])
+
+    assert np.allclose(image_bottom[:3], [1.0, 0.0, 0.0], atol=1e-9)
+    assert np.allclose(image_right[:3], [0.0, -1.0, 0.0], atol=1e-9)
+    assert np.allclose(optical_axis[:3], [0.0, 0.0, 1.0], atol=1e-9)
 
 def test_se3_pose_matrix_roundtrip():
     x, y, z = 1.25, -0.75, 2.50

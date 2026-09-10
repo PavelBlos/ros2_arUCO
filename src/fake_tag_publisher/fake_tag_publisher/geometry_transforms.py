@@ -20,6 +20,14 @@ def normalize_angle(angle: float) -> float:
     """Normalize angle in radians to [-pi, pi)."""
     return math.atan2(math.sin(angle), math.cos(angle))
 
+def map_velocity_to_body(v_map_x: float, v_map_y: float, body_yaw: float):
+    """Rotate map velocity into REP-103 body axes as (forward, left)."""
+    cos_yaw = math.cos(body_yaw)
+    sin_yaw = math.sin(body_yaw)
+    forward = v_map_x * cos_yaw + v_map_y * sin_yaw
+    left = -v_map_x * sin_yaw + v_map_y * cos_yaw
+    return float(forward), float(left)
+
 def circular_mean(angles, weights=None) -> float:
     """Compute weighted circular mean of angles in radians."""
     angles = np.asarray(angles, dtype=np.float64)

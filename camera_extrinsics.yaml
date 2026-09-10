@@ -3,7 +3,8 @@
 #   base_link:   x forward, y left, z up (REP-103)
 #   camera_link: x right, y down, z optical axis (looking straight up at ceiling)
 #
-# Nominal mounting rotation: roll=0, pitch=-pi/2, yaw=pi/2
+# Original working mounting: image bottom points toward robot +X.
+# roll=0, pitch=-pi/2, yaw=0
 # Status is 'unverified' until calibrated physically on robot.
 status: 'unverified'
 description: 'Upward-facing CSI camera relative to robot base_link'
@@ -16,10 +17,10 @@ translation:
 rotation_rpy_rad:
   roll: 0.0
   pitch: -1.57079632679
-  yaw: 1.57079632679
+  yaw: 0.0
 
 rotation_quaternion_xyzw:
-  x: -0.5
-  y: 0.5
-  z: 0.5
-  w: 0.5
+  x: 0.0
+  y: -0.7071067812
+  z: 0.0
+  w: 0.7071067812
