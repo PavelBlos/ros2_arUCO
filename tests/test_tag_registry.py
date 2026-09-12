@@ -106,7 +106,7 @@ def test_anchor_wizard_and_protection():
         # Cannot delete active anchor
         with pytest.raises(AnchorProtectionError):
             reg.delete_tag(17)
-            
+
         # Cannot disable active anchor
         with pytest.raises(AnchorProtectionError):
             reg.set_tag(17, {
@@ -114,6 +114,11 @@ def test_anchor_wizard_and_protection():
                 "state": "confirmed",
                 "pose": anchor_tag["pose"]
             })
+
+        # Explicit anchor deletion is atomic: both the tag and anchor pointer go.
+        reg.delete_tag(17, allow_anchor_delete=True)
+        assert reg.anchor_tag_id is None
+        assert reg.get_tag(17) is None
 
 def test_legacy_migration_without_auto_anchor():
     """

@@ -171,6 +171,14 @@ class TagCalibrationWizard:
         self.state_enter_time: float = 0.0
         self.abort_reason: str = ""
 
+        # Closed-loop centering diagnostics and divergence protection.
+        self.centering_axis: Optional[str] = None
+        self.centering_error_px: Optional[float] = None
+        self.centering_axis_error_px: Optional[float] = None
+        self.centering_command: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self._axis_best_error_px: Optional[float] = None
+        self._axis_last_progress_time: float = 0.0
+
         # Stationary frame collection
         self.collected_samples: List[Dict[str, Any]] = []
         self.calibrated_tag_result: Optional[Dict[str, Any]] = None
@@ -186,6 +194,12 @@ class TagCalibrationWizard:
         self.last_detection_time = t
         self.state_enter_time = t
         self.abort_reason = ""
+        self.centering_axis = None
+        self.centering_error_px = None
+        self.centering_axis_error_px = None
+        self.centering_command = (0.0, 0.0, 0.0)
+        self._axis_best_error_px = None
+        self._axis_last_progress_time = t
         self.collected_samples.clear()
         self.calibrated_tag_result = None
 
@@ -229,6 +243,17 @@ class TagCalibrationWizard:
           cmd_vel_tuple is (vx, vy, omega) in robot REP-103 frame (+x forward, +y left, +w CCW).
         """
         t = now if now is not None else time.monotonic()
+
+        # Always use the calibrated optical centre. The old 320x240 defaults
+        # are wrong for the 640x600 camera (current cy is about 293 px).
+        try:
+            if camera_matrix is not None and np.asarray(camera_matrix).shape == (3, 3):
+                cx = float(camera_matrix[0, 2])
+                cy = float(camera_matrix[1, 2])
+                if math.isfinite(cx) and math.isfinite(cy) and cx > 1.0 and cy > 1.0:
+                    self.cx, self.cy = cx, cy
+        except (TypeError, ValueError, IndexError):
+            pass
 
         # Check heartbeat timeout
         if self.state not in (WizardState.IDLE, WizardState.COMPLETED, WizardState.ABORTED):
@@ -283,6 +308,7 @@ class TagCalibrationWizard:
             du = u_tag - self.cx
             dv = v_tag - self.cy
             pixel_dist = math.sqrt(du**2 + dv**2)
+            self.centering_error_px = float(pixel_dist)
 
             # Check if 3D base-frame error is available
             T_c_tag = target_det.get("T_cameraRos_tag")
@@ -308,13 +334,51 @@ class TagCalibrationWizard:
             # Calculate centering velocity in REP-103 (+X forward, +Y left)
             if use_3d:
                 kp = 0.40
-                vx = max(-self.max_lin_vel, min(self.max_lin_vel, e_fwd * kp))
-                vy = max(-self.max_lin_vel, min(self.max_lin_vel, e_str * kp))
-                # Deadband 10mm
-                if abs(e_fwd) < 0.010:
+                # The physical three-wheel base distorts low-speed diagonal
+                # commands. Centre one image axis at a time so the observed
+                # motion remains predictable and cannot steer away diagonally.
+                if self.centering_axis is None:
+                    self.centering_axis = "horizontal" if abs(du) >= abs(dv) else "vertical"
+                    self._axis_best_error_px = None
+                    self._axis_last_progress_time = t
+                elif self.centering_axis == "horizontal" and abs(e_str) <= 0.015:
+                    self.centering_axis = "vertical"
+                    self._axis_best_error_px = None
+                    self._axis_last_progress_time = t
+                elif self.centering_axis == "vertical" and abs(e_fwd) <= 0.015:
+                    self.centering_axis = "horizontal"
+                    self._axis_best_error_px = None
+                    self._axis_last_progress_time = t
+
+                if self.centering_axis == "horizontal":
                     vx = 0.0
-                if abs(e_str) < 0.010:
+                    vy = max(-self.max_lin_vel, min(self.max_lin_vel, e_str * kp))
+                    if abs(e_str) < 0.010:
+                        vy = 0.0
+                    axis_error_px = abs(du)
+                else:
+                    vx = max(-self.max_lin_vel, min(self.max_lin_vel, e_fwd * kp))
                     vy = 0.0
+                    if abs(e_fwd) < 0.010:
+                        vx = 0.0
+                    axis_error_px = abs(dv)
+
+                self.centering_axis_error_px = float(axis_error_px)
+                if self._axis_best_error_px is None or axis_error_px < self._axis_best_error_px - 1.0:
+                    self._axis_best_error_px = float(axis_error_px)
+                    self._axis_last_progress_time = t
+                elif (t - self._axis_last_progress_time) > 1.25 and axis_error_px > self._axis_best_error_px + 6.0:
+                    self.abort(
+                        f"Centering divergence on {self.centering_axis} axis: "
+                        f"error grew from {self._axis_best_error_px:.1f}px to {axis_error_px:.1f}px"
+                    )
+                    self.centering_command = (0.0, 0.0, 0.0)
+                    return self.state, self.centering_command, self.abort_reason
+
+                if (t - self.state_enter_time) > 25.0:
+                    self.abort(f"Centering timeout: target did not converge within 25.0s (error {pixel_dist:.1f}px)")
+                    self.centering_command = (0.0, 0.0, 0.0)
+                    return self.state, self.centering_command, self.abort_reason
             else:
                 # Pixel directions depend on the measured camera mounting.
                 # Moving on a guessed 2-D sign convention can drive away from
@@ -322,7 +386,11 @@ class TagCalibrationWizard:
                 return self.state, (0.0, 0.0, 0.0), "Target has no valid 3-D pose; holding"
 
             omega = 0.0
-            return self.state, (float(vx), float(vy), float(omega)), f"Centering: error={pixel_dist:.1f}px, cmd=({vx:.3f}, {vy:.3f})"
+            self.centering_command = (float(vx), float(vy), float(omega))
+            return self.state, self.centering_command, (
+                f"Centering {self.centering_axis}: error={pixel_dist:.1f}px, "
+                f"cmd=({vx:.3f}, {vy:.3f})"
+            )
 
         if self.state == WizardState.SETTLING:
             # Command zero velocity and wait mechanical settling

@@ -287,8 +287,9 @@ class TagRegistry:
             self.save(comment=f"Updated physical defaults: marker={marker_size_mm}mm, ceiling={ceiling_z_m}m")
             return self.revision, self.sha256
 
-    def delete_tag(self, tag_id: int | str, expected_revision: Optional[int] = None, **kwargs) -> Tuple[int, str]:
-        """Soft-disables tag or removes it if unconfirmed."""
+    def delete_tag(self, tag_id: int | str, expected_revision: Optional[int] = None,
+                   allow_anchor_delete: bool = False, **kwargs) -> Tuple[int, str]:
+        """Permanently remove a tag, optionally clearing the active anchor."""
         if expected_revision is None and "expected_rev" in kwargs:
             expected_revision = kwargs["expected_rev"]
         with self.lock:
@@ -296,21 +297,18 @@ class TagRegistry:
                 raise RevisionConflictError(f"Revision conflict: expected {expected_revision}, got {self.revision}.")
             norm_id = str(int(str(tag_id).replace("tag_", "")))
             
-            if norm_id == self.anchor_tag_id:
-                raise AnchorProtectionError(f"Cannot delete confirmed anchor tag {norm_id}. Designate another anchor first.")
-            
             if norm_id not in self._data.get("tags", {}):
                 raise RegistryError(f"Tag {norm_id} not found in registry.")
-            
-            tag = self._data["tags"][norm_id]
-            if tag.get("state") == "confirmed":
-                tag["enabled"] = False
-                tag["state"] = "disabled"
-                tag["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-                action = f"Disabled confirmed tag {norm_id}"
-            else:
-                del self._data["tags"][norm_id]
-                action = f"Deleted unconfirmed tag {norm_id}"
+
+            if norm_id == self.anchor_tag_id:
+                if not allow_anchor_delete:
+                    raise AnchorProtectionError(
+                        f"Cannot delete confirmed anchor tag {norm_id} without explicit anchor deletion."
+                    )
+                self._data["anchor_tag_id"] = None
+
+            del self._data["tags"][norm_id]
+            action = f"Deleted tag {norm_id}"
             
             self._data["revision"] = self.revision + 1
             self.save(comment=action)

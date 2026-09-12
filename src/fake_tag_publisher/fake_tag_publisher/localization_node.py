@@ -1853,6 +1853,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
 
             tag_id = payload.get('tag_id', query.get('id', [None])[0])
             expected_rev = payload.get('expected_revision', query.get('expected_revision', [None])[0])
+            allow_anchor_delete = bool(payload.get('allow_anchor_delete', False))
             if expected_rev is not None:
                 try:
                     expected_rev = int(expected_rev)
@@ -1864,11 +1865,31 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 return
 
             try:
-                rev, sha = reg.delete_tag(int(tag_id), expected_revision=expected_rev)
+                deleting_anchor = str(int(tag_id)) == reg.anchor_tag_id
+                if deleting_anchor and allow_anchor_delete:
+                    if node.wizard and node.wizard.state not in (WizardState.IDLE, WizardState.COMPLETED, WizardState.ABORTED):
+                        node.wizard.abort("Anchor tag deleted")
+                    node.stop_route()
+                    node.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.MANUAL)
+                    node.set_motor_power("disable")
+
+                rev, sha = reg.delete_tag(
+                    int(tag_id), expected_revision=expected_rev,
+                    allow_anchor_delete=allow_anchor_delete
+                )
                 node.tags_db = reg.get_active_confirmed_tags()
+                if deleting_anchor:
+                    node.map_odom_initialized = False
+                    node.is_nav_locked = True
+                    node.visual_jump_pending = False
                 node.publish_tag_map_update()
                 node.notify_ui_event()
-                self._send_json(200, {"status": "ok", "message": f"Tag {tag_id} deleted", "revision": rev, "sha256": sha})
+                self._send_json(200, {
+                    "status": "ok", "message": f"Tag {tag_id} deleted",
+                    "anchor_cleared": deleting_anchor,
+                    "navigation_locked": deleting_anchor,
+                    "revision": rev, "sha256": sha
+                })
             except Exception as e:
                 err_str = str(e)
                 code = 409 if "conflict" in err_str.lower() else 400
@@ -2476,6 +2497,10 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                     "elapsed_s": round(max(0.0, time.monotonic() - wiz.state_enter_time), 2),
                     "samples_count": len(wiz.collected_samples),
                     "abort_reason": wiz.abort_reason,
+                    "centering_axis": wiz.centering_axis,
+                    "centering_error_px": wiz.centering_error_px,
+                    "centering_axis_error_px": wiz.centering_axis_error_px,
+                    "centering_command": list(wiz.centering_command),
                     "calibrated_result": wiz.calibrated_tag_result
                 }
             self.send_response(200)
@@ -4414,7 +4439,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     for (const [tid, info] of Object.entries(data.tags)) {
                         const p = info.pose || {x: 0, y: 0};
                         const stateColor = info.state === 'confirmed' ? '#2ecc71' : (info.state === 'provisional' ? '#f39c12' : '#888');
-                        const isAnchor = (parseInt(tid) === data.anchor_tag_id);
+                        const isAnchor = (parseInt(tid) === parseInt(data.anchor_tag_id));
                         html += `<tr style="border-bottom:1px solid rgba(255,255,255,0.04);">
                             <td><b>${tid}</b> ${isAnchor ? '⚓' : ''}</td>
                             <td>${p.x.toFixed(2)}</td>
@@ -4422,7 +4447,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <td style="color:${stateColor}">${info.state || 'unconfirmed'}</td>
                             <td>
                                 <button onclick="setAnchorTag(${tid})" style="background:none; border:none; color:#66fcf1; cursor:pointer; font-size:10px;">⚓</button>
-                                <button onclick="deleteTag(${tid})" style="background:none; border:none; color:#e74c3c; cursor:pointer; font-size:10px;">✕</button>
+                                <button onclick="deleteTag(${tid}, ${isAnchor})" style="background:none; border:none; color:#e74c3c; cursor:pointer; font-size:10px;">✕</button>
                             </td>
                         </tr>`;
                     }
@@ -4453,13 +4478,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        async function deleteTag(tagId) {
-            if (!confirm(`Удалить метку ${tagId}?`)) return;
+        async function deleteTag(tagId, isAnchor = false) {
+            const warning = isAnchor
+                ? `Метка ${tagId} — текущий ноль координат. Удалить её и заблокировать навигацию до назначения нового якоря?`
+                : `Полностью удалить метку ${tagId}?`;
+            if (!confirm(warning)) return;
             try {
                 const res = await fetch('/api/tags/delete', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({tag_id: tagId, expected_revision: currentTagMapRevision})
+                    body: JSON.stringify({
+                        tag_id: tagId,
+                        expected_revision: currentTagMapRevision,
+                        allow_anchor_delete: isAnchor
+                    })
                 });
                 const data = await res.json();
                 if (res.ok) {
@@ -4557,7 +4589,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 if (btnWizConfirm) btnWizConfirm.style.display = data.state === 'REVIEW' ? 'block' : 'none';
                 if (diag) {
                     if (data.state === 'FINE_CENTERING') {
-                        diag.textContent = `Идет центрирование кадра... (${data.elapsed_s}s)`;
+                        const axis = data.centering_axis === 'horizontal' ? 'по горизонтали' : 'по вертикали';
+                        const err = Number.isFinite(data.centering_axis_error_px) ? `, ошибка ${data.centering_axis_error_px.toFixed(1)} px` : '';
+                        diag.textContent = `Центрирование ${axis}${err} (${data.elapsed_s}s)`;
                     } else if (data.state === 'STATIONARY_SOLVE') {
                         diag.textContent = `Сбор статических кадров: ${data.samples_count}/30`;
                     } else if (data.state === 'COMPLETED') {
