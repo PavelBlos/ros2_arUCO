@@ -8,6 +8,7 @@ import pytest
 import cv2
 import sys
 import os
+from scipy.spatial.transform import Rotation as R
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src', 'fake_tag_publisher', 'fake_tag_publisher')))
 
@@ -209,3 +210,44 @@ def test_three_tag_consensus_failure_holds_odometry():
     # Should not arbitrarily select tag 1! Must return conflict and None pose.
     assert res["status"] == "multi_tag_conflict"
     assert res["fused_base_pose"] is None
+
+
+def test_two_ambiguous_tags_select_cross_tag_consistent_ippe_branches():
+    """Regression: a wrong detector startup branch must not create a false map conflict."""
+    K = np.array([
+        [794.1084539178851, 0.0, 317.315790702488],
+        [0.0, 798.5070010772675, 293.119497033691],
+        [0.0, 0.0, 1.0],
+    ])
+    dist = np.array([-0.400290237639, -0.065525208002, -0.00375845612, 0.00321790091, 1.10534897572])
+    active_db = {
+        "18": {"enabled": True, "state": "confirmed", "pose": {"x": 0.0, "y": 0.0, "z": 2.4159, "roll": 2.619, "pitch": 0.0474, "yaw": -0.0152}},
+        "19": {"enabled": True, "state": "confirmed", "pose": {"x": 0.3025, "y": -0.0782, "z": 2.476, "roll": 2.6351, "pitch": -0.2135, "yaw": -0.9001}},
+    }
+    live_rows = [
+        (19, [2.1734589053, -0.0885341921, -0.0436827618], [0.6927635576, -0.2485468012, -0.6747079352, 0.0554287211], [358.508789, 284.654816, 373.066467, 318.522614, 341.636475, 332.989746, 325.706177, 300.222229], 0.4306, 1298.96, 2.1757, 14.014),
+        (18, [2.0944055154, -0.1691540655, 0.2534310814], [0.7038040796, 0.2217579108, -0.6634173420, -0.1239381978], [405.810516, 189.877228, 388.386414, 222.848373, 355.778381, 204.375885, 373.819427, 171.525787], 0.1153, 1389.49, 2.11645, 11.5965),
+    ]
+    detections = []
+    for tag_id, position, quaternion, corners, error, area, distance, view in live_rows:
+        T_camera_tag = np.eye(4)
+        T_camera_tag[:3, :3] = R.from_quat(quaternion).as_matrix()
+        T_camera_tag[:3, 3] = position
+        detections.append({
+            "tag_id": tag_id, "pose_valid": True, "ambiguity_status": 1,
+            "marker_size_mm": 100.0, "distance_m": distance,
+            "viewing_angle_deg": view, "reproj_err": error,
+            "marker_area_px": area, "corners_px": corners,
+            "T_cameraRos_tag": T_camera_tag,
+        })
+
+    result = MultiTagFusion().process_frame(
+        detections, active_db, K, dist,
+        pose_to_matrix(0.0, 0.0, 0.0, 0.0, -math.pi / 2.0, 0.0),
+        odom_at_stamp=(0.0, 0.0, 0.0),
+    )
+
+    assert result["status"] == "multi_tag_ok"
+    assert result["pair_diagnostics"]["mahalanobis"] < result["pair_diagnostics"]["threshold"]
+    assert result["fused_base_pose"][0] == pytest.approx(0.12, abs=0.03)
+    assert result["fused_base_pose"][1] == pytest.approx(-0.74, abs=0.03)

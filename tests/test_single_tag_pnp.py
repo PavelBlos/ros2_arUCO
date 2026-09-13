@@ -61,6 +61,8 @@ def test_synthetic_tag_ippe(ideal_camera):
     assert res["reproj_err"] < 0.1
     assert abs(res["distance_m"] - 2.0) < 0.02
     assert abs(res["tvec"][2] - 2.0) < 0.02
+    assert len(res["pose_candidates"]) >= 1
+    assert all("T_cameraRos_tag" in candidate for candidate in res["pose_candidates"])
 
 def test_marker_size_scaling(ideal_camera):
     """

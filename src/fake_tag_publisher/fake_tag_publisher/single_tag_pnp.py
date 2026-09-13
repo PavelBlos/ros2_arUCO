@@ -183,6 +183,37 @@ def solve_single_tag_ippe(corner_pts_2d: np.ndarray,
             "T_cameraRos_tag": np.eye(4, dtype=np.float64)
         }
 
+    # Refine every planar hypothesis, not only the lowest-error one. A square
+    # viewed nearly head-on has two legitimate IPPE minima; downstream
+    # multi-tag fusion needs both to select the map-consistent branch.
+    refined_candidates = []
+    for candidate in candidate_list:
+        rv = candidate["rvec"].copy().reshape(3, 1)
+        tv = candidate["tvec"].copy().reshape(3, 1)
+        try:
+            rv, tv = cv2.solvePnPRefineLM(
+                obj_pts, corner_pts, camera_matrix, dist_coeffs, rv, tv
+            )
+        except Exception:
+            pass
+        rv = rv.ravel()
+        tv = tv.ravel()
+        if tv[2] <= 0.05:
+            continue
+        proj, _ = cv2.projectPoints(obj_pts, rv, tv, camera_matrix, dist_coeffs)
+        err = float(np.sqrt(np.mean(np.sum((corner_pts - proj.reshape(-1, 2)) ** 2, axis=1))))
+        T_cam_opt_tag = np.eye(4, dtype=np.float64)
+        T_cam_opt_tag[:3, :3], _ = cv2.Rodrigues(rv)
+        T_cam_opt_tag[:3, 3] = tv
+        refined_candidates.append({
+            "rvec": rv,
+            "tvec": tv,
+            "reproj_err": err,
+            "T_camOpt_tag": T_cam_opt_tag,
+            "T_cameraRos_tag": optical_to_ros_matrix() @ T_cam_opt_tag,
+        })
+
+    candidate_list = refined_candidates or candidate_list
     candidate_list.sort(key=lambda c: c["reproj_err"])
     ambiguity_ratio = (candidate_list[1]["reproj_err"] / max(1e-6, candidate_list[0]["reproj_err"])) if len(candidate_list) > 1 else 10.0
     
@@ -196,19 +227,8 @@ def solve_single_tag_ippe(corner_pts_2d: np.ndarray,
             if diff1 < diff0 * 0.7:
                 chosen = candidate_list[1]
 
-    # Non-linear refinement using solvePnPRefineLM
-    refined_rvec = chosen["rvec"].copy().reshape(3, 1)
-    refined_tvec = chosen["tvec"].copy().reshape(3, 1)
-    try:
-        refined_rvec, refined_tvec = cv2.solvePnPRefineLM(
-            obj_pts, corner_pts, camera_matrix, dist_coeffs,
-            refined_rvec, refined_tvec
-        )
-    except Exception:
-        pass
-
-    final_rvec = refined_rvec.ravel()
-    final_tvec = refined_tvec.ravel()
+    final_rvec = chosen["rvec"].ravel()
+    final_tvec = chosen["tvec"].ravel()
 
     # Recompute final reprojection error
     final_proj, _ = cv2.projectPoints(obj_pts, final_rvec, final_tvec, camera_matrix, dist_coeffs)
@@ -237,9 +257,11 @@ def solve_single_tag_ippe(corner_pts_2d: np.ndarray,
         rejection_reason = f"unphysical_distance_{final_dist:.2f}m"
 
     # Construct SE(3) in Optical frame
-    T_camOpt_tag = np.eye(4, dtype=np.float64)
-    T_camOpt_tag[:3, :3] = R_final
-    T_camOpt_tag[:3, 3] = final_tvec
+    T_camOpt_tag = chosen.get("T_camOpt_tag")
+    if T_camOpt_tag is None:
+        T_camOpt_tag = np.eye(4, dtype=np.float64)
+        T_camOpt_tag[:3, :3] = R_final
+        T_camOpt_tag[:3, 3] = final_tvec
 
     # Construct SE(3) in ROS REP-103 camera_link frame
     T_cameraRos_tag = optical_to_ros_matrix() @ T_camOpt_tag
@@ -257,5 +279,6 @@ def solve_single_tag_ippe(corner_pts_2d: np.ndarray,
         "rvec": final_rvec,
         "tvec": final_tvec,
         "T_camOpt_tag": T_camOpt_tag,
-        "T_cameraRos_tag": T_cameraRos_tag
+        "T_cameraRos_tag": T_cameraRos_tag,
+        "pose_candidates": candidate_list,
     }

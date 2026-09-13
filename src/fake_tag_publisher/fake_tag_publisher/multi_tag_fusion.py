@@ -217,7 +217,7 @@ class MultiTagFusion:
         x_ob, y_ob, yaw_ob = odom_at_stamp
 
         # 2. Extract independent candidate poses for each valid tag
-        candidate_poses = []
+        candidate_groups = []
         for cand in valid_candidates:
             det = cand["detection"]
             tag_info = cand["tag_info"]
@@ -250,37 +250,106 @@ class MultiTagFusion:
                 res_ippe = solve_single_tag_ippe(corners_2d, marker_size_m, camera_matrix, dist_coeffs)
                 T_cameraRos_tag = res_ippe["T_cameraRos_tag"]
             
-            # T_map_camRos = T_map_tag @ invert_transform(T_cameraRos_tag)
-            T_map_camRos = camera_pose_from_tag(T_map_tag, T_cameraRos_tag)
-            
-            # T_map_camOpt = T_map_camRos @ optical_to_ros_matrix()
-            T_map_camOpt = T_map_camRos @ optical_to_ros_matrix()
-            
-            # T_map_base = T_map_camRos @ invert_transform(T_base_cam)
-            T_map_base = base_pose_from_camera(T_map_camRos, T_base_cam)
-            
-            x_b, y_b, z_b, r_b, p_b, yaw_b = matrix_to_pose(T_map_base)
-            
             cov_vis = compute_visual_covariance(
                 distance_m=det.get("distance_m", 2.0),
                 viewing_angle_deg=det.get("viewing_angle_deg", 0.0),
                 reproj_err_px=det.get("reproj_err", 1.0),
                 marker_area_px=det.get("marker_area_px", 1000.0)
             )
+            # Stationary sample variance only captures short-term jitter. Add
+            # the learned map covariance and a small systematic floor for
+            # print flatness, mounting and camera calibration error.
+            try:
+                map_cov = np.asarray(tag_info.get("covariance", np.zeros((3, 3))), dtype=np.float64)
+                if map_cov.shape == (3, 3) and np.all(np.isfinite(map_cov)):
+                    cov_vis = cov_vis + map_cov
+            except (TypeError, ValueError):
+                pass
+            cov_vis = cov_vis + np.diag([
+                0.015 ** 2,
+                0.015 ** 2,
+                math.radians(1.0) ** 2,
+            ])
             
-            candidate_poses.append({
-                "tag_id": tid,
-                "cand": cand,
-                "T_map_tag": T_map_tag,
-                "T_cameraRos_tag": T_cameraRos_tag,
-                "T_map_camRos": T_map_camRos,
-                "T_map_camOpt": T_map_camOpt,
-                "T_map_base": T_map_base,
-                "base_pose_se2": (x_b, y_b, yaw_b),
-                "cov_vis": cov_vis,
-                "corners_2d": corners_2d,
-                "obj_pts": obj_pts
-            })
+            camera_tag_options = [T_cameraRos_tag]
+            if int(det.get("ambiguity_status", 0)) == 1:
+                ambiguity_result = solve_single_tag_ippe(
+                    corners_2d, marker_size_m, camera_matrix, dist_coeffs
+                )
+                camera_tag_options.extend(
+                    item["T_cameraRos_tag"]
+                    for item in ambiguity_result.get("pose_candidates", [])
+                    if item.get("T_cameraRos_tag") is not None
+                )
+
+            group = []
+            for hypothesis_index, T_camera_tag_option in enumerate(camera_tag_options):
+                T_map_camRos = camera_pose_from_tag(T_map_tag, T_camera_tag_option)
+                T_map_camOpt = T_map_camRos @ optical_to_ros_matrix()
+                T_map_base = base_pose_from_camera(T_map_camRos, T_base_cam)
+                x_b, y_b, z_b, r_b, p_b, yaw_b = matrix_to_pose(T_map_base)
+                if any(
+                    math.hypot(x_b - old["base_pose_se2"][0], y_b - old["base_pose_se2"][1]) < 0.002
+                    and abs(normalize_angle(yaw_b - old["base_pose_se2"][2])) < math.radians(0.2)
+                    for old in group
+                ):
+                    continue
+                group.append({
+                    "tag_id": tid,
+                    "cand": cand,
+                    "T_map_tag": T_map_tag,
+                    "T_cameraRos_tag": T_camera_tag_option,
+                    "T_map_camRos": T_map_camRos,
+                    "T_map_camOpt": T_map_camOpt,
+                    "T_map_base": T_map_base,
+                    "base_pose_se2": (x_b, y_b, yaw_b),
+                    "cov_vis": cov_vis,
+                    "corners_2d": corners_2d,
+                    "obj_pts": obj_pts,
+                    "hypothesis_index": hypothesis_index,
+                })
+            candidate_groups.append(group)
+
+        # Resolve the two-fold pose ambiguity of planar square markers using
+        # cross-tag agreement. This prevents a wrong hypothesis selected at
+        # detector startup from becoming its own temporal prior.
+        if len(candidate_groups) == 2:
+            x_pred, y_pred, yaw_pred = odom_at_stamp
+            best_pair = None
+            best_score = float("inf")
+            for c1 in candidate_groups[0]:
+                for c2 in candidate_groups[1]:
+                    x1, y1, yaw1 = c1["base_pose_se2"]
+                    x2, y2, yaw2 = c2["base_pose_se2"]
+                    disagreement = (
+                        math.hypot(x1 - x2, y1 - y2)
+                        + 0.25 * abs(normalize_angle(yaw1 - yaw2))
+                    )
+                    prior_tiebreak = 0.01 * (
+                        math.hypot(x1 - x_pred, y1 - y_pred)
+                        + math.hypot(x2 - x_pred, y2 - y_pred)
+                        + 0.25 * abs(normalize_angle(yaw1 - yaw_pred))
+                        + 0.25 * abs(normalize_angle(yaw2 - yaw_pred))
+                    )
+                    score = disagreement + prior_tiebreak
+                    if score < best_score:
+                        best_score = score
+                        best_pair = [c1, c2]
+            candidate_poses = best_pair
+        else:
+            # For one tag, or before N-tag consensus, use the current map-pose
+            # prediction to select among equivalent planar hypotheses.
+            x_pred, y_pred, yaw_pred = odom_at_stamp
+            candidate_poses = [
+                min(
+                    group,
+                    key=lambda c: (
+                        math.hypot(c["base_pose_se2"][0] - x_pred, c["base_pose_se2"][1] - y_pred)
+                        + 0.25 * abs(normalize_angle(c["base_pose_se2"][2] - yaw_pred))
+                    ),
+                )
+                for group in candidate_groups
+            ]
 
         # 3. Handle single tag observation
         if len(candidate_poses) == 1:
@@ -318,8 +387,11 @@ class MultiTagFusion:
             }
             
             if d_m12 <= math.sqrt(CHI2_3_95):
-                # Consistent! Proceed to joint refinement across both
-                result = self._solve_joint_pnp(candidate_poses, camera_matrix, dist_coeffs, T_base_cam)
+                # Two individually solved tags provide an observable planar
+                # pose directly. Information-weighted fusion stays inside
+                # that consistent cluster; unconstrained 3-D refinement can
+                # leave it when learned tag planes are not perfectly parallel.
+                result = self._fuse_weighted_candidates(candidate_poses)
                 result["pair_diagnostics"] = pair_diagnostics
                 return result
             else:
@@ -459,6 +531,32 @@ class MultiTagFusion:
 
         # 6. Joint solvePnPRefineLM across all inlier corners
         return self._solve_joint_pnp(inlier_candidates, camera_matrix, dist_coeffs, T_base_cam)
+
+    def _fuse_weighted_candidates(self, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Fuse consistent independent SE(2) tag poses by information weight."""
+        poses = np.asarray([c["base_pose_se2"] for c in candidates], dtype=np.float64)
+        covariances = [np.asarray(c["cov_vis"], dtype=np.float64) for c in candidates]
+        variances = np.asarray([np.maximum(np.diag(cov), 1e-9) for cov in covariances])
+        weights = 1.0 / variances
+
+        fused_x = float(np.sum(weights[:, 0] * poses[:, 0]) / np.sum(weights[:, 0]))
+        fused_y = float(np.sum(weights[:, 1] * poses[:, 1]) / np.sum(weights[:, 1]))
+        yaw_sin = float(np.sum(weights[:, 2] * np.sin(poses[:, 2])))
+        yaw_cos = float(np.sum(weights[:, 2] * np.cos(poses[:, 2])))
+        fused_yaw = float(math.atan2(yaw_sin, yaw_cos))
+        fused_cov = np.diag(1.0 / np.sum(weights, axis=0))
+        reproj_values = [float(c["cand"]["detection"].get("reproj_err", 0.0)) for c in candidates]
+
+        return {
+            "status": "multi_tag_ok",
+            "fused_base_pose": (fused_x, fused_y, fused_yaw),
+            "inlier_ids": [c["tag_id"] for c in candidates],
+            "rejected_ids": [],
+            "rejection_reasons": {},
+            "reproj_rms_px": float(np.sqrt(np.mean(np.square(reproj_values)))),
+            "multi_tag_used": True,
+            "covariance": fused_cov,
+        }
 
     def _solve_joint_pnp(self,
                          inlier_candidates: List[Dict[str, Any]],
