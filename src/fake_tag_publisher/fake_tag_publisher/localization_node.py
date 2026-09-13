@@ -630,8 +630,17 @@ class LocalizationNode(Node):
             res_tag = self.wizard.calibrated_tag_result
             if self.tag_registry:
                 if str(res_tag["tag_id"]) == self.tag_registry.anchor_tag_id:
+                    anchor = self.tag_registry.get_tag(res_tag["tag_id"])
+                    anchored_result = dict(res_tag)
+                    anchored_result["pose"] = dict(res_tag["pose"])
+                    anchored_result["pose"]["x"] = float(anchor["pose"]["x"])
+                    anchored_result["pose"]["y"] = float(anchor["pose"]["y"])
+                    self.tag_registry.set_tag(res_tag["tag_id"], anchored_result)
+                    self.tags_db = self.tag_registry.get_active_confirmed_tags()
+                    self.publish_tag_map_update()
+                    self.notify_ui_event()
                     self.get_logger().info(
-                        f"Anchor tag {res_tag['tag_id']} centered; its fixed map origin was preserved"
+                        f"Anchor tag {res_tag['tag_id']} geometry updated; its fixed X/Y origin was preserved"
                     )
                 else:
                     self.tag_registry.set_tag(res_tag["tag_id"], res_tag)
@@ -2205,13 +2214,15 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 if reg:
                     if str(res_tag["tag_id"]) == reg.anchor_tag_id:
                         anchor = reg.get_tag(res_tag["tag_id"])
-                        diagnostics = res_tag.get("diagnostics")
-                        res_tag = dict(anchor)
-                        res_tag["tag_id"] = wiz.target_tag_id
-                        if diagnostics is not None:
-                            res_tag["diagnostics"] = diagnostics
+                        res_tag["pose"] = dict(res_tag["pose"])
+                        res_tag["pose"]["x"] = float(anchor["pose"]["x"])
+                        res_tag["pose"]["y"] = float(anchor["pose"]["y"])
+                        rev, sha = reg.set_tag(res_tag["tag_id"], res_tag)
+                        node.tags_db = reg.get_active_confirmed_tags()
+                        node.publish_tag_map_update()
+                        node.notify_ui_event()
                         wiz.calibrated_tag_result = res_tag
-                        msg = "Anchor centered; its fixed map origin was preserved"
+                        msg = "Anchor geometry updated; its fixed X/Y origin was preserved"
                     else:
                         rev, sha = reg.set_tag(res_tag["tag_id"], res_tag)
                         node.tags_db = reg.get_active_confirmed_tags()
