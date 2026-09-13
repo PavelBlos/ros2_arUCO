@@ -4582,9 +4582,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const data = await res.json();
                 const badge = document.getElementById('wizard-status-badge');
                 const diag = document.getElementById('wizard-diagnostics');
+                const stoppedByUser = data.state === 'ABORTED' &&
+                    (data.abort_reason || '').toLowerCase().includes('user requested abort');
                 if (badge) {
-                    badge.textContent = data.state || 'IDLE';
-                    badge.style.color = (data.state === 'COMPLETED') ? '#2ecc71' : ((data.state === 'ABORTED') ? '#e74c3c' : '#66fcf1');
+                    badge.textContent = stoppedByUser ? 'ОСТАНОВЛЕНО' : (data.state || 'IDLE');
+                    badge.style.color = (data.state === 'COMPLETED') ? '#2ecc71' :
+                        ((data.state === 'ABORTED' && !stoppedByUser) ? '#e74c3c' : '#66fcf1');
                 }
                 if (btnWizConfirm) btnWizConfirm.style.display = data.state === 'REVIEW' ? 'block' : 'none';
                 if (diag) {
@@ -4598,7 +4601,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         diag.textContent = `Успешно обучена метка ${data.target_tag_id}!`;
                         fetchTagRegistry();
                     } else if (data.state === 'ABORTED') {
-                        diag.textContent = `Ошибка: ${data.abort_reason || 'Отмена'}`;
+                        diag.textContent = stoppedByUser
+                            ? 'Остановлено пользователем'
+                            : `Ошибка: ${data.abort_reason || 'Отмена'}`;
                     } else {
                         diag.textContent = `Режим: ${data.state}`;
                     }
