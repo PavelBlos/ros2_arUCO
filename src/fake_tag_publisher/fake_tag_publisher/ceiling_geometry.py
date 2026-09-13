@@ -9,6 +9,16 @@ import math
 import cv2
 import numpy as np
 
+
+# A 100 mm marker is only about 35-40 pixels wide at the measured ceiling
+# height. Its independently learned map pose can therefore carry roughly a
+# centimetre of corner-equivalent error even when the two per-marker robot
+# poses agree. Keep the strict per-marker fit, then allow that measured map
+# uncertainty in the joint fit. The independent 8 cm / 5 degree pose gate
+# below still rejects a genuinely inconsistent map before this is used.
+SINGLE_TAG_MAX_REPROJ_PX = 2.5
+JOINT_TAG_MAX_REPROJ_PX = 5.0
+
 try:
     from .geometry_transforms import optical_to_ros_rotation
     from .single_tag_pnp import get_marker_object_points
@@ -86,8 +96,10 @@ def solve_ceiling_frame(detections, tags, K, distortion, T_base_cam):
             points = marker_map_corners(info, float(info.get('size_mm', d.get('marker_size_mm', 100.)))/1000.)
             h, rot, camera_xy = fit_similarity(rays, points)
             err = float(np.sqrt(np.mean(np.sum((project_ceiling(points, h, rot, camera_xy, K, distortion, T_base_cam)-pixels)**2, axis=1))))
-            if err > 2.5:
-                raise ValueError('Ceiling reprojection residual exceeds 2.5 px')
+            if err > SINGLE_TAG_MAX_REPROJ_PX:
+                raise ValueError(
+                    f'Ceiling reprojection residual exceeds {SINGLE_TAG_MAX_REPROJ_PX:.1f} px'
+                )
             base_xy = camera_xy - rot @ T_base_cam[:2, 3]
             candidates.append(dict(id=tid, rays=rays, points=points, pixels=pixels,
                                    height=h, rot=rot, camera_xy=camera_xy, base_xy=base_xy, error=err))
@@ -112,10 +124,11 @@ def solve_ceiling_frame(detections, tags, K, distortion, T_base_cam):
     for c in candidates:
         projected = project_ceiling(c['points'], height, rot, camera_xy, K, distortion, T_base_cam)
         per_tag[c['id']] = float(np.sqrt(np.mean(np.sum((projected-c['pixels'])**2, axis=1))))
-    if max(per_tag.values()) > 2.5:
+    if max(per_tag.values()) > JOINT_TAG_MAX_REPROJ_PX:
         return dict(status='multi_tag_conflict', fused_base_pose=None, inlier_ids=[],
                     rejected_ids=list(per_tag), rejection_reasons={k:'joint_ceiling_residual' for k in per_tag},
-                    multi_tag_used=False, reproj_rms_px=max(per_tag.values()))
+                    multi_tag_used=False, reproj_rms_px=max(per_tag.values()),
+                    per_tag_residuals=per_tag)
     xy = camera_xy-rot@T_base_cam[:2, 3]
     yaw = math.atan2(rot[1, 0], rot[0, 0])
     return dict(status='multi_tag_ok' if len(candidates)>1 else 'single_tag_ok',

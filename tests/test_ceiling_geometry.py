@@ -82,6 +82,19 @@ def test_conflicting_known_marker_map_is_rejected(ceiling_scene):
     assert set(result['rejected_ids']) == {'18', '19'}
 
 
+def test_centimetre_scale_learned_map_uncertainty_is_accepted(ceiling_scene):
+    K, distortion, T_base_cam, _, _, tags, detections = ceiling_scene
+    learned = {key: {**value, 'pose': dict(value['pose'])} for key, value in tags.items()}
+    # At this distance 20 mm shifts the joint corners by about 3 px, while
+    # each marker independently still reports a mutually compatible pose.
+    learned['19']['pose']['x'] += 0.020
+
+    result = solve_ceiling_frame(detections, learned, K, distortion, T_base_cam)
+
+    assert result['status'] == 'multi_tag_ok'
+    assert set(result['inlier_ids']) == {'18', '19'}
+
+
 def test_tilted_legacy_marker_is_not_used(ceiling_scene):
     K, distortion, T_base_cam, _, _, tags, detections = ceiling_scene
     tilted = {'18': {**tags['18'], 'pose': dict(tags['18']['pose'])}}

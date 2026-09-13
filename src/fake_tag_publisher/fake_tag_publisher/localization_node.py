@@ -105,6 +105,7 @@ class LocalizationNode(Node):
         self._last_conflict_warn_time = 0.0
         self.last_fusion_diagnostics = {"status": "not_started"}
         self.fusion_conflict_since = None
+        self.fusion_conflict_last_seen = None
         self.detector_revision = 0
 
         # Timers: 25 Hz for Calibration Wizard FSM, 20 Hz for Dynamic Camera TF broadcast
@@ -985,11 +986,10 @@ class LocalizationNode(Node):
                 "ceiling_height_m": fusion_res.get('ceiling_height_m'),
                 "per_tag_residuals": fusion_res.get('per_tag_residuals'),
             }
-            if fusion_res.get('fused_base_pose') is not None:
-                self.fusion_conflict_since = None
-            elif fusion_res.get('status') in ('multi_tag_conflict', 'revision_mismatch'):
-                if self.fusion_conflict_since is None:
-                    self.fusion_conflict_since = time.time()
+            self.update_fusion_conflict_state(
+                fusion_res.get('status'),
+                fusion_res.get('fused_base_pose') is not None,
+            )
 
             # Record in Co-Visibility Graph
             self.covis_graph.record_frame_observations(
@@ -1380,6 +1380,7 @@ class LocalizationNode(Node):
             self.route_state = 'blocked'
             self.route_error = geometry_error
             self.notify_ui_event()
+            self.get_logger().warn(f"Autopilot start rejected: {self.route_error}")
             return False
         if not (self.robot and self.robot.is_connected):
             self.route_state = "blocked"
@@ -1461,10 +1462,34 @@ class LocalizationNode(Node):
                 vertical_target_pixel(self.camera_matrix, self.dist_coeffs, self.T_base_cam, self.ceiling_height_m)
             except (ValueError, np.linalg.LinAlgError):
                 return 'Камера не направлена на плоскость потолочных меток'
-        conflict_since = getattr(self, 'fusion_conflict_since', None)
-        if conflict_since is not None and time.time()-conflict_since > .5:
+        if self.has_sustained_fusion_conflict():
             return 'Метки дают противоречивые координаты; требуется проверка карты'
         return ''
+
+    def update_fusion_conflict_state(self, status, has_pose, now=None):
+        """Track only a current, uninterrupted fusion conflict episode."""
+        now = time.time() if now is None else float(now)
+        is_conflict = not has_pose and status in ('multi_tag_conflict', 'revision_mismatch')
+        last_seen = getattr(self, 'fusion_conflict_last_seen', None)
+        if not is_conflict:
+            self.fusion_conflict_since = None
+            self.fusion_conflict_last_seen = None
+            return
+        if last_seen is None or now - last_seen > .35:
+            self.fusion_conflict_since = now
+        self.fusion_conflict_last_seen = now
+
+    def has_sustained_fusion_conflict(self, now=None):
+        """Return true only while conflicting frames are still arriving."""
+        now = time.time() if now is None else float(now)
+        since = getattr(self, 'fusion_conflict_since', None)
+        last_seen = getattr(self, 'fusion_conflict_last_seen', None)
+        return bool(
+            since is not None
+            and last_seen is not None
+            and now - last_seen <= .35
+            and last_seen - since > .5
+        )
 
     def autopilot_loop(self):
         """
@@ -1877,7 +1902,8 @@ class LocalizationNode(Node):
             "total_wps": int(len(self.route_waypoints)),
             "tracking_mode": self.tracking_mode,
             "esp32_connected": bool(self.robot and self.robot.is_connected),
-            "motor_power": self.motor_power_state
+            "motor_power": self.motor_power_state,
+            "route_error": getattr(self, 'route_error', '')
         }
         with sse_clients_lock:
             for q in sse_clients:

@@ -428,6 +428,25 @@ def test_autopilot_refuses_to_claim_running_state_while_navigation_locked(mock_n
     assert mock_node.route_state == "blocked"
     assert mock_node.route_error == "Waiting for new anchor"
 
+
+def test_fusion_conflict_must_be_continuous_and_current(mock_node):
+    mock_node.fusion_conflict_since = None
+    mock_node.fusion_conflict_last_seen = None
+
+    mock_node.update_fusion_conflict_state('multi_tag_conflict', False, now=10.0)
+    mock_node.update_fusion_conflict_state('multi_tag_conflict', False, now=10.2)
+    mock_node.update_fusion_conflict_state('multi_tag_conflict', False, now=10.4)
+    mock_node.update_fusion_conflict_state('multi_tag_conflict', False, now=10.6)
+    assert mock_node.has_sustained_fusion_conflict(now=10.7)
+
+    # The episode must no longer block after detections stop arriving.
+    assert not mock_node.has_sustained_fusion_conflict(now=11.0)
+
+    # Any ordinary frame clears the episode as well.
+    mock_node.update_fusion_conflict_state('ceiling_no_valid_tags', False, now=11.0)
+    assert mock_node.fusion_conflict_since is None
+    assert not mock_node.has_sustained_fusion_conflict(now=11.0)
+
 def test_api_calibration_abort_and_confirm(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)
     mock_server = MagicMock()
