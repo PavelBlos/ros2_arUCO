@@ -140,7 +140,7 @@ class TagCalibrationWizard:
                  motion_manager: Optional[MotionAuthorityManager] = None,
                  cx: float = 320.0,
                  cy: float = 240.0,
-                 centering_tol_px: float = 18.0,
+                 centering_tol_px: float = 6.0,
                  target_loss_timeout_sec: float = 0.45,
                  heartbeat_timeout_sec: float = 1.0,
                  settling_delay_sec: float = 0.8,
@@ -361,10 +361,10 @@ class TagCalibrationWizard:
                 self.centering_axis = None
                 self.centering_axis_error_px = max(abs(du), abs(dv))
                 self.centering_command = (0.0, 0.0, 0.0)
-                if (t - self._centered_since) >= 0.20:
+                if (t - self._centered_since) >= 0.35:
                     self._transition_to(WizardState.SETTLING, t)
                     return self.state, self.centering_command, (
-                        f"Target held inside +/-{self.centering_tol_px:.0f}px for 0.2s. Entering settling delay."
+                        f"Target held inside +/-{self.centering_tol_px:.0f}px for 0.35s. Entering settling delay."
                     )
                 return self.state, self.centering_command, "Target is centered; verifying stability..."
             self._centered_since = None
@@ -401,10 +401,10 @@ class TagCalibrationWizard:
                     self.abort("Invalid visual-servo command from measured response")
                     return self.state, (0.0, 0.0, 0.0), self.abort_reason
                 body_direction = body_coeff / max_coeff
-                speed = min(
-                    self.max_lin_vel,
-                    0.018 + max(0.0, pixel_dist - self.centering_tol_px) * 0.00025
-                )
+                # Slow down continuously near the cross. The former 0.018 m/s
+                # floor made the robot enter an 18 px window with too much
+                # residual motion and stop visibly short of the exact centre.
+                speed = min(self.max_lin_vel, max(0.008, pixel_dist * 0.00065))
                 vx = float(body_direction[0] * speed)
                 vy = float(body_direction[1] * speed)
 
@@ -543,10 +543,18 @@ class TagCalibrationWizard:
             if final_view > 35.0:
                 self.abort(f"Viewing angle too steep: {final_view:.1f}deg > 35.0deg")
                 return self.state, (0.0, 0.0, 0.0), self.abort_reason
-            # Ceiling plane check: pitch within +/- 5 deg (0.09 rad)
-            if abs(med_pitch) > 0.09:
-                self.abort(f"Tag out-of-plane pitch: {math.degrees(med_pitch):.1f}deg > 5.0deg")
+            pitch_deg = math.degrees(med_pitch)
+            # IPPE pitch around 5-8 degrees is normal with small printed tags
+            # and a wide-angle view. Reject only a clearly non-planar target;
+            # retain a warning for review above the preferred 5 degree band.
+            if abs(pitch_deg) > 15.0:
+                self.abort(f"Tag out-of-plane pitch: {pitch_deg:.1f}deg > 15.0deg")
                 return self.state, (0.0, 0.0, 0.0), self.abort_reason
+            quality_warnings = []
+            if abs(pitch_deg) > 5.0:
+                quality_warnings.append(
+                    f"Measured tag pitch {pitch_deg:.1f}deg is outside the preferred +/-5deg band"
+                )
 
             cov_3x3 = [
                 [round(float(np.var(i_xs)), 6), 0.0, 0.0],
@@ -573,6 +581,8 @@ class TagCalibrationWizard:
                     "inliers_count": len(inlier_samples),
                     "reproj_rms_px": round(final_err, 3),
                     "viewing_angle_deg": round(final_view, 1),
+                    "tag_pitch_deg": round(pitch_deg, 1),
+                    "warnings": quality_warnings,
                     "std_x_mm": round(float(np.std(i_xs) * 1000.0), 2),
                     "std_y_mm": round(float(np.std(i_ys) * 1000.0), 2)
                 }

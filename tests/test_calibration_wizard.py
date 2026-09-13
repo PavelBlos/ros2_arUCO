@@ -241,7 +241,7 @@ def test_full_calibration_flow_to_completion():
     t += 0.05
     state, cmd, msg = wizard.update([det_centered], False, (1.0, 2.0, 0.0), K, dist, T_base_cam, now=t)
     assert state == WizardState.FINE_CENTERING
-    t += 0.25
+    t += 0.40
     state, cmd, msg = wizard.update([det_centered], False, (1.0, 2.0, 0.0), K, dist, T_base_cam, now=t)
     assert state == WizardState.SETTLING
     assert cmd == (0.0, 0.0, 0.0)
@@ -272,6 +272,34 @@ def test_full_calibration_flow_to_completion():
     ok_conf, msg_conf = wizard.confirm_review()
     assert ok_conf is True
     assert wizard.state == WizardState.COMPLETED
+
+
+def test_moderate_tag_pitch_is_reported_as_warning_instead_of_abort():
+    wizard = TagCalibrationWizard(heartbeat_timeout_sec=5.0)
+    wizard.start(target_tag_id=18, now=100.0)
+    wizard.state = WizardState.VERIFYING
+    wizard.state_enter_time = 100.0
+    wizard.collected_samples = [
+        {
+            "x": 1.0 + index * 0.0001,
+            "y": 2.0 - index * 0.0001,
+            "z": 2.1,
+            "yaw": 0.1,
+            "pitch": math.radians(6.7),
+            "reproj_err": 0.2,
+            "viewing_angle_deg": 7.0,
+        }
+        for index in range(30)
+    ]
+
+    state, _, _ = wizard.update(
+        [], True, (0.0, 0.0, 0.0), np.eye(3), np.zeros(5), np.eye(4), now=100.1
+    )
+
+    assert state == WizardState.REVIEW
+    diagnostics = wizard.calibrated_tag_result["diagnostics"]
+    assert diagnostics["tag_pitch_deg"] == pytest.approx(6.7)
+    assert diagnostics["warnings"]
 
 
 def test_motion_authority_estop():
