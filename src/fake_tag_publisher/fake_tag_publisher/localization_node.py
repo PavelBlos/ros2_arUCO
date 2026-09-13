@@ -2100,7 +2100,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
 
         elif self.path.startswith('/api/calibration/abort'):
             wiz = getattr(node, 'wizard', None)
-            if wiz:
+            if wiz and wiz.state not in (WizardState.ABORTED, WizardState.COMPLETED):
                 wiz.abort("User requested abort via API")
             node.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.CALIBRATION)
             if hasattr(node, 'motion_mgr') and node.motion_mgr:
@@ -2689,6 +2689,9 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                     "centering_forward_error_m": wiz.centering_forward_error_m,
                     "centering_strafe_error_m": wiz.centering_strafe_error_m,
                     "centering_direction_corrections": wiz.centering_direction_corrections,
+                    "centering_phase": wiz.centering_phase,
+                    "centering_response_matrix": wiz.centering_response_matrix,
+                    "centering_trace": wiz.centering_trace[-25:],
                     "calibrated_result": wiz.calibrated_tag_result
                 }
             self.send_response(200)
@@ -4911,12 +4914,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 if (btnWizConfirm) btnWizConfirm.style.display = data.state === 'REVIEW' ? 'block' : 'none';
                 if (diag) {
                     if (data.state === 'FINE_CENTERING') {
-                        const axis = data.centering_axis === 'horizontal' ? 'по горизонтали' : 'по вертикали';
+                        const phaseNames = {
+                            probe_forward: 'измерение движения вперёд',
+                            probe_forward_settle: 'остановка после движения вперёд',
+                            probe_strafe: 'измерение движения влево',
+                            probe_strafe_settle: 'остановка после движения влево',
+                            servo: 'точное наведение по двум осям'
+                        };
+                        const axis = phaseNames[data.centering_phase] || 'подготовка';
                         const err = Number.isFinite(data.centering_axis_error_px) ? `, ошибка ${data.centering_axis_error_px.toFixed(1)} px` : '';
                         const du = Number.isFinite(data.centering_du_px) ? data.centering_du_px.toFixed(1) : '—';
                         const dv = Number.isFinite(data.centering_dv_px) ? data.centering_dv_px.toFixed(1) : '—';
                         const corrected = data.centering_direction_corrections ? `, коррекций направления: ${data.centering_direction_corrections}` : '';
-                        diag.textContent = `Центрирование ${axis}${err}; dx=${du}, dy=${dv} px${corrected} (${data.elapsed_s}s)`;
+                        diag.textContent = `${axis}${err}; dx=${du}, dy=${dv} px${corrected} (${data.elapsed_s}s)`;
                     } else if (data.state === 'STATIONARY_SOLVE') {
                         diag.textContent = `Сбор статических кадров: ${data.samples_count}/30`;
                     } else if (data.state === 'COMPLETED') {

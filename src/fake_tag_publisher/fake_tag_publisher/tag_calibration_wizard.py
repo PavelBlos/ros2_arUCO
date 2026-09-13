@@ -141,7 +141,7 @@ class TagCalibrationWizard:
                  cx: float = 320.0,
                  cy: float = 240.0,
                  centering_tol_px: float = 18.0,
-                 target_loss_timeout_sec: float = 0.25,
+                 target_loss_timeout_sec: float = 0.45,
                  heartbeat_timeout_sec: float = 1.0,
                  settling_delay_sec: float = 0.8,
                  min_stationary_frames: int = 30,
@@ -181,19 +181,22 @@ class TagCalibrationWizard:
         self.centering_forward_error_m: Optional[float] = None
         self.centering_strafe_error_m: Optional[float] = None
         self.centering_direction_corrections: int = 0
-        self._axis_best_error_px: Optional[float] = None
-        self._axis_last_progress_time: float = 0.0
+        self.centering_phase: str = "idle"
+        self.centering_response_matrix: Optional[List[List[float]]] = None
+        self.centering_trace: List[Dict[str, Any]] = []
         self._best_total_error_px: Optional[float] = None
         self._last_total_progress_time: float = 0.0
         self._centered_since: Optional[float] = None
-        # Image bottom is robot +X and image right is robot -Y for the
-        # verified mounting. A short observed-error check can correct either
-        # sign once per run if the physical mounting does not match it.
-        self._axis_motion_sign = {"horizontal": -1.0, "vertical": 1.0}
-        self._axis_probe_axis: Optional[str] = None
-        self._axis_probe_error: Optional[float] = None
-        self._axis_probe_time: float = 0.0
-        self._axis_reversed_this_run = set()
+        # The camera can be rotated relative to the robot. Measure the full
+        # 2x2 mapping from body translation to image motion at the start of a
+        # run instead of assuming that image and body axes are parallel.
+        self._response_matrix: Optional[np.ndarray] = None
+        self._probe_start_uv: Optional[np.ndarray] = None
+        self._probe_forward_delta: Optional[np.ndarray] = None
+        self._probe_phase_start: float = 0.0
+        self._probe_speed: float = min(0.030, self.max_lin_vel)
+        self._probe_motion_sec: float = 0.65
+        self._probe_settle_sec: float = 0.35
 
         # Stationary frame collection
         self.collected_samples: List[Dict[str, Any]] = []
@@ -219,15 +222,16 @@ class TagCalibrationWizard:
         self.centering_forward_error_m = None
         self.centering_strafe_error_m = None
         self.centering_direction_corrections = 0
-        self._axis_best_error_px = None
-        self._axis_last_progress_time = t
+        self.centering_phase = "probe_forward"
+        self.centering_response_matrix = None
+        self.centering_trace.clear()
         self._best_total_error_px = None
         self._last_total_progress_time = t
         self._centered_since = None
-        self._axis_probe_axis = None
-        self._axis_probe_error = None
-        self._axis_probe_time = t
-        self._axis_reversed_this_run.clear()
+        self._response_matrix = None
+        self._probe_start_uv = None
+        self._probe_forward_delta = None
+        self._probe_phase_start = t
         self.collected_samples.clear()
         self.calibrated_tag_result = None
 
@@ -365,66 +369,44 @@ class TagCalibrationWizard:
                 return self.state, self.centering_command, "Target is centered; verifying stability..."
             self._centered_since = None
 
-            # Calculate centering velocity in REP-103 (+X forward, +Y left)
+            # Calculate centering velocity in REP-103 (+X forward, +Y left).
             if use_3d:
-                # Centre one image axis at a time. Select and finish axes by
-                # the same pixel errors that define success. If wheel
-                # asymmetry couples the axes, switch to whichever error is now
-                # dominant instead of blindly continuing the old command.
-                horizontal_error = abs(du)
-                vertical_error = abs(dv)
-                desired_axis = "horizontal" if horizontal_error >= vertical_error else "vertical"
-                current_error = horizontal_error if self.centering_axis == "horizontal" else vertical_error
-                other_error = vertical_error if self.centering_axis == "horizontal" else horizontal_error
-                if (self.centering_axis is None
-                        or current_error <= self.centering_tol_px
-                        or other_error > max(self.centering_tol_px, current_error * 1.35)):
-                    self.centering_axis = desired_axis
-                    self._axis_best_error_px = None
-                    self._axis_last_progress_time = t
+                if self._response_matrix is None:
+                    cmd, probe_message = self._update_response_probe(u_tag, v_tag, t)
+                    self.centering_command = cmd
+                    self.centering_axis = self.centering_phase
+                    self.centering_axis_error_px = max(abs(du), abs(dv))
+                    self._append_trace(t, u_tag, v_tag, du, dv, cmd)
+                    if self.state == WizardState.ABORTED:
+                        return self.state, (0.0, 0.0, 0.0), self.abort_reason
+                    return self.state, cmd, probe_message
 
-                signed_axis_error = du if self.centering_axis == "horizontal" else dv
-                axis_error_px = abs(signed_axis_error)
-
-                # Learn a reversed camera/motion sign from the real response.
-                # The check is delayed until the base has overcome its ramp.
-                if self._axis_probe_axis != self.centering_axis:
-                    self._axis_probe_axis = self.centering_axis
-                    self._axis_probe_error = float(signed_axis_error)
-                    self._axis_probe_time = t
-                elif (t - self._axis_probe_time) >= 0.75:
-                    probe = self._axis_probe_error
-                    same_side = probe is not None and signed_axis_error * probe > 0.0
-                    if (same_side and axis_error_px > abs(probe) + 5.0
-                            and self.centering_axis not in self._axis_reversed_this_run):
-                        self._axis_motion_sign[self.centering_axis] *= -1.0
-                        self._axis_reversed_this_run.add(self.centering_axis)
-                        self.centering_direction_corrections += 1
-                        self._axis_best_error_px = axis_error_px
-                        self._axis_last_progress_time = t
-                    self._axis_probe_error = float(signed_axis_error)
-                    self._axis_probe_time = t
-
-                # A minimum usable speed avoids the stepper dead zone; speed
-                # then increases smoothly with pixel error and remains capped.
-                speed = min(self.max_lin_vel, 0.018 + max(0.0, axis_error_px - self.centering_tol_px) * 0.00030)
-                direction = self._axis_motion_sign[self.centering_axis] * (1.0 if signed_axis_error > 0.0 else -1.0)
-                if self.centering_axis == "horizontal":
-                    vx, vy = 0.0, direction * speed
-                else:
-                    vx, vy = direction * speed, 0.0
-
-                self.centering_axis_error_px = float(axis_error_px)
-                if self._axis_best_error_px is None or axis_error_px < self._axis_best_error_px - 1.0:
-                    self._axis_best_error_px = float(axis_error_px)
-                    self._axis_last_progress_time = t
-                elif (t - self._axis_last_progress_time) > 1.25 and axis_error_px > self._axis_best_error_px + 6.0:
-                    self.abort(
-                        f"Centering divergence on {self.centering_axis} axis: "
-                        f"error grew from {self._axis_best_error_px:.1f}px to {axis_error_px:.1f}px"
+                self.centering_phase = "servo"
+                self.centering_axis = "combined"
+                self.centering_axis_error_px = max(abs(du), abs(dv))
+                try:
+                    # Columns describe image motion caused by positive robot
+                    # forward and positive robot-left motion. Solve for the
+                    # body direction which moves the observed error to zero.
+                    body_coeff = np.linalg.solve(
+                        self._response_matrix,
+                        np.array([-du, -dv], dtype=np.float64)
                     )
-                    self.centering_command = (0.0, 0.0, 0.0)
-                    return self.state, self.centering_command, self.abort_reason
+                except np.linalg.LinAlgError:
+                    self.abort("Measured camera/body response matrix became singular")
+                    return self.state, (0.0, 0.0, 0.0), self.abort_reason
+
+                max_coeff = float(np.max(np.abs(body_coeff)))
+                if not math.isfinite(max_coeff) or max_coeff < 1e-9:
+                    self.abort("Invalid visual-servo command from measured response")
+                    return self.state, (0.0, 0.0, 0.0), self.abort_reason
+                body_direction = body_coeff / max_coeff
+                speed = min(
+                    self.max_lin_vel,
+                    0.018 + max(0.0, pixel_dist - self.centering_tol_px) * 0.00025
+                )
+                vx = float(body_direction[0] * speed)
+                vy = float(body_direction[1] * speed)
 
                 if self._best_total_error_px is None or pixel_dist < self._best_total_error_px - 1.5:
                     self._best_total_error_px = float(pixel_dist)
@@ -438,8 +420,8 @@ class TagCalibrationWizard:
                     self.centering_command = (0.0, 0.0, 0.0)
                     return self.state, self.centering_command, self.abort_reason
 
-                if (t - self.state_enter_time) > 25.0:
-                    self.abort(f"Centering timeout: target did not converge within 25.0s (error {pixel_dist:.1f}px)")
+                if (t - self.state_enter_time) > 35.0:
+                    self.abort(f"Centering timeout: target did not converge within 35.0s (error {pixel_dist:.1f}px)")
                     self.centering_command = (0.0, 0.0, 0.0)
                     return self.state, self.centering_command, self.abort_reason
             else:
@@ -450,8 +432,9 @@ class TagCalibrationWizard:
 
             omega = 0.0
             self.centering_command = (float(vx), float(vy), float(omega))
+            self._append_trace(t, u_tag, v_tag, du, dv, self.centering_command)
             return self.state, self.centering_command, (
-                f"Centering {self.centering_axis}: error={pixel_dist:.1f}px, "
+                f"Centering with measured 2-D response: error={pixel_dist:.1f}px, "
                 f"cmd=({vx:.3f}, {vy:.3f})"
             )
 
@@ -615,6 +598,80 @@ class TagCalibrationWizard:
         self._transition_to(WizardState.COMPLETED, time.monotonic())
         self.motion_mgr.release_lease(MotionAuthorityMode.CALIBRATION)
         return True, "Calibration result confirmed by user"
+
+    def _update_response_probe(self, u_tag: float, v_tag: float, now: float):
+        """Measure image response to two short orthogonal robot motions."""
+        uv = np.array([u_tag, v_tag], dtype=np.float64)
+        zero = (0.0, 0.0, 0.0)
+
+        if self.centering_phase == "probe_forward":
+            if self._probe_start_uv is None:
+                self._probe_start_uv = uv.copy()
+                self._probe_phase_start = now
+            if (now - self._probe_phase_start) < self._probe_motion_sec:
+                return (self._probe_speed, 0.0, 0.0), "Measuring camera response: short forward motion"
+            self.centering_phase = "probe_forward_settle"
+            self._probe_phase_start = now
+            return zero, "Forward probe complete; waiting for image to settle"
+
+        if self.centering_phase == "probe_forward_settle":
+            if (now - self._probe_phase_start) < self._probe_settle_sec:
+                return zero, "Waiting after forward response probe"
+            delta = uv - self._probe_start_uv
+            if float(np.linalg.norm(delta)) < 3.0:
+                self.abort("Forward response probe moved the tag by less than 3 px")
+                return zero, self.abort_reason
+            self._probe_forward_delta = delta
+            self._probe_start_uv = uv.copy()
+            self._probe_phase_start = now
+            self.centering_phase = "probe_strafe"
+            return zero, "Forward response measured; starting left-motion probe"
+
+        if self.centering_phase == "probe_strafe":
+            if (now - self._probe_phase_start) < self._probe_motion_sec:
+                return (0.0, self._probe_speed, 0.0), "Measuring camera response: short left motion"
+            self.centering_phase = "probe_strafe_settle"
+            self._probe_phase_start = now
+            return zero, "Left-motion probe complete; waiting for image to settle"
+
+        if self.centering_phase == "probe_strafe_settle":
+            if (now - self._probe_phase_start) < self._probe_settle_sec:
+                return zero, "Waiting after left-motion response probe"
+            strafe_delta = uv - self._probe_start_uv
+            if float(np.linalg.norm(strafe_delta)) < 3.0:
+                self.abort("Left-motion response probe moved the tag by less than 3 px")
+                return zero, self.abort_reason
+            forward_unit = self._probe_forward_delta / np.linalg.norm(self._probe_forward_delta)
+            strafe_unit = strafe_delta / np.linalg.norm(strafe_delta)
+            response = np.column_stack((forward_unit, strafe_unit))
+            determinant = float(np.linalg.det(response))
+            if not math.isfinite(determinant) or abs(determinant) < 0.25:
+                self.abort(
+                    f"Camera/body response probes are not independent (det={determinant:.2f})"
+                )
+                return zero, self.abort_reason
+            self._response_matrix = response
+            self.centering_response_matrix = response.tolist()
+            self.centering_phase = "servo"
+            self._best_total_error_px = None
+            self._last_total_progress_time = now
+            return zero, "Camera/body response measured; starting closed-loop centering"
+
+        self.abort(f"Unknown centering phase: {self.centering_phase}")
+        return zero, self.abort_reason
+
+    def _append_trace(self, now, u_tag, v_tag, du, dv, command):
+        self.centering_trace.append({
+            "t": round(float(now - self.state_enter_time), 3),
+            "phase": self.centering_phase,
+            "u": round(float(u_tag), 2),
+            "v": round(float(v_tag), 2),
+            "du": round(float(du), 2),
+            "dv": round(float(dv), 2),
+            "command": [round(float(value), 4) for value in command],
+        })
+        if len(self.centering_trace) > 250:
+            del self.centering_trace[:-250]
 
     def _transition_to(self, new_state: WizardState, now: float):
         self.state = new_state
