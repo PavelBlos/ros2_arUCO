@@ -266,9 +266,9 @@ class MultiTagFusion:
             except (TypeError, ValueError):
                 pass
             cov_vis = cov_vis + np.diag([
-                0.015 ** 2,
-                0.015 ** 2,
-                math.radians(1.0) ** 2,
+                0.025 ** 2,
+                0.025 ** 2,
+                math.radians(1.5) ** 2,
             ])
             
             camera_tag_options = [T_cameraRos_tag]
