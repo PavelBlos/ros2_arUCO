@@ -1,26 +1,11 @@
-# Camera Extrinsics: base_link -> camera_link
-# Coordinate Frames:
-#   base_link:   x forward, y left, z up (REP-103)
-#   camera_link: x right, y down, z optical axis (looking straight up at ceiling)
-#
-# Original working mounting: image bottom points toward robot +X.
-# roll=0, pitch=-pi/2, yaw=0
-# Status is 'unverified' until calibrated physically on robot.
-status: 'unverified'
-description: 'Upward-facing CSI camera relative to robot base_link'
-
-translation:
-  x: 0.0
-  y: 0.0
-  z: 0.0
-
-rotation_rpy_rad:
-  roll: 0.0
-  pitch: -1.57079632679
-  yaw: 0.0
-
-rotation_quaternion_xyzw:
-  x: 0.0
-  y: -0.7071067812
-  z: 0.0
-  w: 0.7071067812
+# Physically measured base_link -> camera_link rotation for this robot.
+# The ceiling_planar model uses gravity and image corners; it does not consume
+# the unstable out-of-plane rotation returned by a single square marker.
+status: verified
+localization_model: ceiling_planar
+x: 0.0
+y: 0.0
+z: 0.0
+roll: -0.5740434364
+pitch: -1.4643496966
+yaw: -0.3830105929

@@ -488,10 +488,9 @@ def test_api_calibration_abort_and_confirm(mock_node):
 
     assert sent_responses[-1] == 200
     anchor_after = mock_node.tag_registry.get_tag(17)["pose"]
-    assert anchor_after["x"] == anchor_before["x"]
-    assert anchor_after["y"] == anchor_before["y"]
-    assert anchor_after["z"] == pytest.approx(2.2)
-    assert anchor_after["roll"] == pytest.approx(2.6)
+    # In the ceiling profile the anchor defines the complete map frame and
+    # plane. Re-centering it may not import noisy PnP tilt, yaw or height.
+    assert anchor_after == anchor_before
     assert mock_node.wizard.calibrated_tag_result["pose"] == anchor_after
 
 def test_publish_camera_tf(mock_node):

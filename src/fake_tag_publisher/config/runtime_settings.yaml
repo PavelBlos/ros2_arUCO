@@ -13,5 +13,7 @@ ap_wp_tol: 0.05
 ap_yaw_mode: HOLD_INITIAL
 filter_alpha: 0.15
 wheel_diameter_mm: 70.0
+drive_linear_scale: 0.4940752942
+drive_angular_scale: 0.5423793646
 default_marker_size_mm: 100.0
-ceiling_height_m: 2.5
+ceiling_height_m: 2.1677131734
