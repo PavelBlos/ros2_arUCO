@@ -278,6 +278,7 @@ class TagCalibrationWizard:
                camera_matrix: np.ndarray,
                dist_coeffs: np.ndarray,
                T_base_cam: np.ndarray,
+               known_tags: Optional[Dict[str, Any]] = None,
                now: Optional[float] = None) -> Tuple[WizardState, Optional[Tuple[float, float, float]], str]:
         """
         Main FSM update tick.
@@ -479,17 +480,29 @@ class TagCalibrationWizard:
                 corners = np.array(target_det.get("corners_px", []), dtype=np.float64).reshape(4, 2)
                 res_pnp = solve_single_tag_ippe(corners, self.marker_size_m, camera_matrix, dist_coeffs)
                 if res_pnp.get("pose_valid", False):
-                    # Compute tag pose in map frame using current robot pose
-                    x_r, y_r, yaw_r = current_robot_pose
-                    T_map_base = pose_to_matrix(x_r, y_r, 0.0, 0.0, 0.0, yaw_r)
-                    T_map_camRos = T_map_base @ T_base_cam
                     T_camRos_tag = res_pnp["T_cameraRos_tag"]
-                    T_map_tag = T_map_camRos @ T_camRos_tag
+                    # A simultaneously visible known marker gives a direct
+                    # map-to-target transform.  This cancels camera mounting
+                    # error and avoids projecting the camera's 6-DoF pose onto
+                    # the robot's planar SE(2) pose before locating the tag.
+                    T_map_tag, reference_id = self._map_tag_from_covisible_reference(
+                        T_camRos_tag, detections, known_tags or {}
+                    )
+                    mapping_source = "covisible_tag"
+                    if T_map_tag is None:
+                        x_r, y_r, yaw_r = current_robot_pose
+                        T_map_base = pose_to_matrix(x_r, y_r, 0.0, 0.0, 0.0, yaw_r)
+                        T_map_camRos = T_map_base @ T_base_cam
+                        T_map_tag = T_map_camRos @ T_camRos_tag
+                        reference_id = None
+                        mapping_source = "odometry_fallback"
                     x_t, y_t, z_t, r_t, p_t, yaw_t = matrix_to_pose(T_map_tag)
 
                     self.collected_samples.append({
                         "x": x_t, "y": y_t, "z": z_t,
                         "roll": r_t, "pitch": p_t, "yaw": yaw_t,
+                        "mapping_source": mapping_source,
+                        "reference_tag_id": reference_id,
                         "reproj_err": res_pnp.get("reproj_err", 0.0),
                         "distance_m": res_pnp.get("distance_m", 0.0),
                         "viewing_angle_deg": res_pnp.get("viewing_angle_deg", 0.0)
@@ -534,6 +547,7 @@ class TagCalibrationWizard:
             i_xs = [s["x"] for s in inlier_samples]
             i_ys = [s["y"] for s in inlier_samples]
             i_zs = [s["z"] for s in inlier_samples]
+            i_rolls = [s.get("roll", math.pi) for s in inlier_samples]
             i_yaws = [s["yaw"] for s in inlier_samples]
             i_errs = [s["reproj_err"] for s in inlier_samples]
             i_views = [s["viewing_angle_deg"] for s in inlier_samples]
@@ -542,11 +556,14 @@ class TagCalibrationWizard:
             final_x = float(np.mean(i_xs))
             final_y = float(np.mean(i_ys))
             final_z = float(np.mean(i_zs))
+            final_roll = circular_mean(i_rolls)
             final_yaw = circular_mean(i_yaws)
             yaw_residuals = [normalize_angle(y - final_yaw) for y in i_yaws]
             final_err = float(np.mean(i_errs))
             final_view = float(np.mean(i_views))
             med_pitch = float(np.median(i_pitches))
+            mapping_sources = [s.get("mapping_source", "odometry_fallback") for s in inlier_samples]
+            covisible_count = sum(source == "covisible_tag" for source in mapping_sources)
 
             # Quality criteria
             if final_err > 2.0:
@@ -583,8 +600,8 @@ class TagCalibrationWizard:
                     "x": round(final_x, 4),
                     "y": round(final_y, 4),
                     "z": round(final_z, 4),
-                    "roll": round(math.pi, 4),
-                    "pitch": 0.0,
+                    "roll": round(normalize_angle(final_roll), 4),
+                    "pitch": round(med_pitch, 4),
                     "yaw": round(normalize_angle(final_yaw), 4)
                 },
                 "covariance": cov_3x3,
@@ -596,7 +613,9 @@ class TagCalibrationWizard:
                     "tag_pitch_deg": round(pitch_deg, 1),
                     "warnings": quality_warnings,
                     "std_x_mm": round(float(np.std(i_xs) * 1000.0), 2),
-                    "std_y_mm": round(float(np.std(i_ys) * 1000.0), 2)
+                    "std_y_mm": round(float(np.std(i_ys) * 1000.0), 2),
+                    "mapping_source": "covisible_tag" if covisible_count else "odometry_fallback",
+                    "covisible_samples": covisible_count
                 }
             }
 
@@ -620,6 +639,37 @@ class TagCalibrationWizard:
         self._transition_to(WizardState.COMPLETED, time.monotonic())
         self.motion_mgr.release_lease(MotionAuthorityMode.CALIBRATION)
         return True, "Calibration result confirmed by user"
+
+    def _map_tag_from_covisible_reference(self, T_camera_tag, detections, known_tags):
+        """Locate a target from the best known marker visible in the same frame."""
+        candidates = []
+        for det in detections:
+            ref_id = str(det.get("tag_id"))
+            if ref_id == str(self.target_tag_id) or not det.get("pose_valid", False):
+                continue
+            ref_info = known_tags.get(ref_id)
+            T_camera_ref = det.get("T_cameraRos_tag")
+            if not ref_info or T_camera_ref is None:
+                continue
+            pose = ref_info.get("pose", {})
+            try:
+                T_map_ref = pose_to_matrix(
+                    float(pose["x"]), float(pose["y"]), float(pose["z"]),
+                    float(pose["roll"]), float(pose["pitch"]), float(pose["yaw"])
+                )
+                T_map_target = (
+                    T_map_ref
+                    @ invert_transform(np.asarray(T_camera_ref))
+                    @ np.asarray(T_camera_tag)
+                )
+                quality = float(det.get("reproj_err", 999.0))
+                candidates.append((quality, int(ref_id), T_map_target))
+            except (KeyError, TypeError, ValueError, np.linalg.LinAlgError):
+                continue
+        if not candidates:
+            return None, None
+        _, reference_id, result = min(candidates, key=lambda item: item[0])
+        return result, reference_id
 
     def _update_response_probe(self, u_tag: float, v_tag: float, now: float):
         """Measure image response to two short orthogonal robot motions."""

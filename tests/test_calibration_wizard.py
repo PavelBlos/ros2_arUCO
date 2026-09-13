@@ -236,6 +236,32 @@ def test_successful_response_matrix_is_reused_for_next_marker():
     assert wizard._response_matrix == pytest.approx(learned)
 
 
+def test_covisible_known_tag_directly_anchors_new_tag_pose():
+    wizard = TagCalibrationWizard(cx=320.0, cy=240.0)
+    wizard.target_tag_id = 19
+    T_map_ref = pose_to_matrix(1.0, 2.0, 2.5, math.pi, 0.0, 0.2)
+    T_map_target = pose_to_matrix(1.35, 1.9, 2.5, math.pi, 0.0, -0.7)
+    T_camera_ref = pose_to_matrix(2.0, 0.1, 0.5, 0.1, -0.2, 0.3)
+    T_camera_target = T_camera_ref @ np.linalg.inv(T_map_ref) @ T_map_target
+    known = {"18": {"pose": {
+        "x": 1.0, "y": 2.0, "z": 2.5,
+        "roll": math.pi, "pitch": 0.0, "yaw": 0.2,
+    }}}
+    detections = [{
+        "tag_id": 18,
+        "pose_valid": True,
+        "T_cameraRos_tag": T_camera_ref,
+        "reproj_err": 0.4,
+    }]
+
+    actual, reference_id = wizard._map_tag_from_covisible_reference(
+        T_camera_target, detections, known
+    )
+
+    assert reference_id == 18
+    assert actual == pytest.approx(T_map_target, abs=1e-9)
+
+
 def test_full_calibration_flow_to_completion():
     K = np.array([[600., 0., 320.], [0., 600., 240.], [0., 0., 1.]], dtype=np.float64)
     dist = np.zeros(5)
@@ -314,6 +340,7 @@ def test_moderate_tag_pitch_is_reported_as_warning_instead_of_abort():
             "x": 1.0 + index * 0.0001,
             "y": 2.0 - index * 0.0001,
             "z": 2.1,
+            "roll": 2.7,
             "yaw": 0.1,
             "pitch": math.radians(6.7),
             "reproj_err": 0.2,
@@ -330,6 +357,8 @@ def test_moderate_tag_pitch_is_reported_as_warning_instead_of_abort():
     diagnostics = wizard.calibrated_tag_result["diagnostics"]
     assert diagnostics["tag_pitch_deg"] == pytest.approx(6.7)
     assert diagnostics["warnings"]
+    assert wizard.calibrated_tag_result["pose"]["roll"] == pytest.approx(2.7)
+    assert wizard.calibrated_tag_result["pose"]["pitch"] == pytest.approx(math.radians(6.7), abs=1e-4)
 
 
 def test_motion_authority_estop():

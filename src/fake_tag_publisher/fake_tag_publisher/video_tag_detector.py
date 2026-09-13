@@ -27,6 +27,7 @@ except ImportError:
 class VideoTagDetector(Node):
     def __init__(self):
         super().__init__('video_tag_detector')
+        self._tag_pose_priors = {}
         
         from rcl_interfaces.msg import ParameterDescriptor
         self.declare_parameter('video_path', 'config/robot_drive.mp4', ParameterDescriptor(dynamic_typing=True))
@@ -372,9 +373,17 @@ class VideoTagDetector(Node):
 
                 # Solve IPPE PnP
                 if not self.camera_calibration_invalid:
+                    prior = self._tag_pose_priors.get(int(tag_id))
                     res = solve_single_tag_ippe(
-                        corner_pts, marker_len, self.camera_matrix, self.dist_coeffs
+                        corner_pts, marker_len, self.camera_matrix, self.dist_coeffs,
+                        prior_rvec=prior[0] if prior else None,
+                        prior_tvec=prior[1] if prior else None,
                     )
+                    if res.get("pose_valid", False):
+                        self._tag_pose_priors[int(tag_id)] = (
+                            np.asarray(res["rvec"]).copy(),
+                            np.asarray(res["tvec"]).copy(),
+                        )
                 else:
                     res = {
                         "pose_valid": False,

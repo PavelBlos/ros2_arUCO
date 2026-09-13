@@ -619,6 +619,7 @@ class LocalizationNode(Node):
             self.camera_matrix,
             self.dist_coeffs,
             T_base_camera,
+            known_tags=self.tag_registry.get_active_confirmed_tags() if self.tag_registry else {},
             now=now_t
         )
 
@@ -880,6 +881,12 @@ class LocalizationNode(Node):
 
             # Process through MultiTagFusion with revision handshake
             active_tags = self.tag_registry.get_active_confirmed_tags() if self.tag_registry else self.tags_db
+            if self.wizard and self.wizard.state not in (WizardState.IDLE, WizardState.COMPLETED, WizardState.ABORTED):
+                # An existing target may be precisely the bad map entry being
+                # repaired. Exclude it from localization until the new result
+                # has been reviewed and saved.
+                active_tags = dict(active_tags)
+                active_tags.pop(str(self.wizard.target_tag_id), None)
             frame_epoch = int(getattr(msg, 'config_epoch', 0))
             frame_rev = int(getattr(msg, 'tag_map_revision', 0))
             frame_sha = str(getattr(msg, 'tag_map_sha256', ''))
@@ -890,13 +897,17 @@ class LocalizationNode(Node):
                 except Exception:
                     pass
 
+            predicted_map_pose = compute_fused_pose_se2(
+                self.delta_map_odom_x, self.delta_map_odom_y, self.delta_map_odom_yaw,
+                odom_x_c, odom_y_c, odom_yaw_c
+            ) if self.map_odom_initialized else (odom_x_c, odom_y_c, odom_yaw_c)
             fusion_res = self.fusion.process_frame(
                 det_dicts,
                 active_tags,
                 self.camera_matrix,
                 self.dist_coeffs,
                 T_base_camera,
-                (odom_x_c, odom_y_c, odom_yaw_c),
+                predicted_map_pose,
                 pred_odom_cov=self.odom_covariance.copy(),
                 expected_epoch=self.tag_registry.config_epoch if self.tag_registry else None,
                 expected_revision=self.tag_registry.revision if self.tag_registry else None,
@@ -931,7 +942,10 @@ class LocalizationNode(Node):
                     target_x_mo, target_y_mo, target_yaw_mo = compute_map_to_odom_se2(
                         vis_x, vis_y, vis_yaw, odom_x_c, odom_y_c, odom_yaw_c
                     )
-                    if not self.map_odom_initialized:
+                    force_stationary_reanchor = not is_moving and (
+                        self.visual_jump_pending or self.anchor_reinit_pending
+                    )
+                    if not self.map_odom_initialized or force_stationary_reanchor:
                         self.delta_map_odom_x = target_x_mo
                         self.delta_map_odom_y = target_y_mo
                         self.delta_map_odom_yaw = target_yaw_mo
@@ -2129,7 +2143,19 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                     and ack.get('detector_sha256') == node.tag_registry.sha256):
                 blockers.append("tag map is not synchronized with detector")
             if time.monotonic() - node.latest_detections_stamp > 0.25 or visible is None: blockers.append("target tag is not visible with a valid pose")
-            if node.is_nav_locked: blockers.append("navigation is locked")
+            active_tags = node.tag_registry.get_active_confirmed_tags()
+            has_covisible_reference = any(
+                str(d.get('tag_id')) != str(target_id)
+                and str(d.get('tag_id')) in active_tags
+                and d.get('pose_valid', False)
+                for d in node.latest_detections
+            )
+            # Repairing a bad tag is allowed while visual navigation is
+            # locked, provided another confirmed marker anchors the solve.
+            if not node.map_odom_initialized and has_covisible_reference:
+                blockers = [b for b in blockers if b != "robot pose has not been initialized from a known tag"]
+            if node.is_nav_locked and not has_covisible_reference: blockers.append("navigation is locked")
+            if node.motion_mgr.current_mode == MotionAuthorityMode.ESTOP: blockers.append("E-STOP is active")
             if blockers:
                 self._send_json(409, {"error": "; ".join(blockers), "blocking_reasons": blockers})
                 return
