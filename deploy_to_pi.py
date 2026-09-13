@@ -104,7 +104,7 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
                         files[pyf] = os.path.join(py_dir, pyf)
 
     # 3. Root helper scripts and configuration
-    for root_f in ['start_termit.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml', 'runtime_settings.yaml']:
+    for root_f in ['start_termit.sh', 'start_system.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml', 'runtime_settings.yaml']:
         rp = os.path.join(base_dir, root_f)
         if os.path.exists(rp):
             files[root_f] = rp
@@ -320,6 +320,15 @@ def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False
             if stdout.read().decode().strip() != 'EXISTS':
                 sftp.put(local_cfg, remote_cfg)
                 print(f"✅ Создан начальный shared_config/{cfg_name}")
+
+        # Stable launcher outside versioned releases. It always follows the
+        # current symlink, so the user's SSH command survives upgrades.
+        launcher_local = files_map.get('start_system.sh')
+        if launcher_local:
+            launcher_remote = f"{base_dir}/start_system.sh"
+            sftp.put(launcher_local, launcher_remote + '.tmp')
+            ssh.exec_command(f"mv {launcher_remote}.tmp {launcher_remote} && chmod +x {launcher_remote}")
+            print("✅ Установлен стабильный запускатель /home/%s/arUco_termit/start_system.sh" % user)
 
         # 6. Атомарное переключение симлинка current
         print(f"\n🔗 Атомарное переключение симлинка: current -> {release_tag}")
