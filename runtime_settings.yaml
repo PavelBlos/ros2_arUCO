@@ -1,4 +1,6 @@
 ap_cruise_speed: 0.12
+ap_brake_accel: 0.25
+ap_final_yaw: 0.0
 ap_goal_tol: 0.03
 ap_kp_ang: 1.8
 ap_kp_cross: 1.2

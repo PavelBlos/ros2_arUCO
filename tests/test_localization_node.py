@@ -313,7 +313,7 @@ def test_api_settings_get_and_post(mock_node, tmp_path):
     # 3. POST /api/settings flat payload
     update_payload_flat = json.dumps({
         "filter_alpha": 0.45,
-        "ap_yaw_mode": "FACE_GOAL"
+        "ap_yaw_mode": "PATH_TANGENT"
     }).encode('utf-8')
     handler.rfile.read = lambda n: update_payload_flat
     handler.headers = {'Content-Length': str(len(update_payload_flat))}
@@ -323,9 +323,39 @@ def test_api_settings_get_and_post(mock_node, tmp_path):
     assert sent_responses[-1] == 200
     res_flat = json.loads(written_data[-1].decode('utf-8'))
     assert abs(res_flat["settings"]["filter_alpha"] - 0.45) < 1e-4
-    assert res_flat["settings"]["ap_yaw_mode"] == "FACE_GOAL"
+    assert res_flat["settings"]["ap_yaw_mode"] == "PATH_TANGENT"
     assert abs(mock_node.filter_alpha - 0.45) < 1e-4
-    assert mock_node.ap_yaw_mode == "FACE_GOAL"
+    assert mock_node.ap_yaw_mode == "PATH_TANGENT"
+
+
+def test_camera_calibration_status_and_printable_board_endpoints(mock_node):
+    handler = WebServerHandler.__new__(WebServerHandler)
+    mock_server = MagicMock()
+    mock_server.node = mock_node
+    handler.server = mock_server
+    sent_responses = []
+    written_data = []
+    headers = {}
+    handler.send_response = lambda code: sent_responses.append(code)
+    handler.send_header = lambda key, value: headers.__setitem__(key, value)
+    handler.end_headers = lambda: None
+    handler.wfile = MagicMock()
+    handler.wfile.write = lambda data: written_data.append(data)
+
+    handler.path = "/api/camera-calibration/status"
+    handler.do_GET()
+    status = json.loads(written_data[-1].decode("utf-8"))
+    assert sent_responses[-1] == 200
+    assert status["required_frames"] == 25
+    assert status["state"] == "idle"
+    assert len(status["current"]["camera_matrix"]) == 9
+
+    handler.path = "/api/camera-calibration/board.svg?cols=8&rows=6&square_mm=25"
+    handler.do_GET()
+    assert sent_responses[-1] == 200
+    assert headers["Content-Type"].startswith("image/svg+xml")
+    assert b'width="297mm"' in written_data[-1]
+    assert "camera_chessboard_A4.svg" in headers["Content-Disposition"]
 
 def test_api_anchor_wizard_status_and_confirm(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)

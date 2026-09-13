@@ -26,6 +26,7 @@ try:
     from .multi_tag_fusion import MultiTagFusion, propagate_odometry_covariance
     from .tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
     from .covisibility_graph import CovisibilityGraph
+    from .camera_calibration_session import CameraCalibrationSession, make_a4_chessboard_svg
 except ImportError:
     from geometry_transforms import (
         normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
@@ -36,6 +37,7 @@ except ImportError:
     from multi_tag_fusion import MultiTagFusion, propagate_odometry_covariance
     from tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
     from covisibility_graph import CovisibilityGraph
+    from camera_calibration_session import CameraCalibrationSession, make_a4_chessboard_svg
 from sensor_msgs.msg import CompressedImage
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
@@ -136,9 +138,15 @@ class LocalizationNode(Node):
 
         # Буфер и подписка на сжатое видео с камеры
         self.latest_jpeg_frame = None
+        self.latest_frame_seq = 0
+        self.camera_calibration_last_seq = -1
         self.latest_frame_lock = threading.Lock()
         self.image_sub = self.create_subscription(
             CompressedImage, '/camera/annotated_image/compressed', self.image_callback, 10)
+        self.camera_calibration_session = CameraCalibrationSession()
+        self.camera_calibration_timer = self.create_timer(0.25, self.camera_calibration_tick)
+        self.camera_calibration_update_pub = self.create_publisher(
+            String, '/camera_calibration/updated', 10)
 
         # Публикатор оцененного положения робота в топик /estimated_pose
         self.pose_pub = self.create_publisher(
@@ -449,10 +457,12 @@ class LocalizationNode(Node):
                 if "ap_wp_tol" in cfg: self.ap_wp_tol = float(cfg["ap_wp_tol"])
                 if "ap_kp_cross" in cfg: self.ap_kp_cross = float(cfg["ap_kp_cross"])
                 if "ap_v_cross_max" in cfg: self.ap_v_cross_max = float(cfg["ap_v_cross_max"])
+                if "ap_brake_accel" in cfg: self.ap_brake_accel = float(cfg["ap_brake_accel"])
                 if "ap_turn_factor" in cfg: self.ap_turn_factor = float(cfg["ap_turn_factor"])
                 if "ap_max_ang" in cfg: self.ap_max_ang = float(cfg["ap_max_ang"])
                 if "ap_kp_ang" in cfg: self.ap_kp_ang = float(cfg["ap_kp_ang"])
                 if "ap_yaw_mode" in cfg: self.ap_yaw_mode = str(cfg["ap_yaw_mode"])
+                if "ap_final_yaw" in cfg: self.ap_final_yaw = float(cfg["ap_final_yaw"])
                 if "wheel_diameter_mm" in cfg: self.wheel_diameter_mm = float(cfg["wheel_diameter_mm"])
                 if "default_marker_size_mm" in cfg: self.default_marker_size_mm = float(cfg["default_marker_size_mm"])
                 if "ceiling_height_m" in cfg: self.ceiling_height_m = float(cfg["ceiling_height_m"])
@@ -490,10 +500,12 @@ class LocalizationNode(Node):
             "ap_wp_tol": float(getattr(self, 'ap_wp_tol', 0.05)),
             "ap_kp_cross": float(getattr(self, 'ap_kp_cross', 1.20)),
             "ap_v_cross_max": float(getattr(self, 'ap_v_cross_max', 0.08)),
+            "ap_brake_accel": float(getattr(self, 'ap_brake_accel', 0.25)),
             "ap_turn_factor": float(getattr(self, 'ap_turn_factor', 0.65)),
             "ap_max_ang": float(getattr(self, 'ap_max_ang', 0.60)),
             "ap_kp_ang": float(getattr(self, 'ap_kp_ang', 1.80)),
             "ap_yaw_mode": str(getattr(self, 'ap_yaw_mode', 'HOLD_INITIAL')),
+            "ap_final_yaw": float(getattr(self, 'ap_final_yaw', 0.0)),
             "wheel_diameter_mm": float(getattr(self, 'wheel_diameter_mm', 70.0)),
             "default_marker_size_mm": float(getattr(self, 'default_marker_size_mm', 100.0)),
             "ceiling_height_m": float(getattr(self, 'ceiling_height_m', 2.5)),
@@ -508,7 +520,8 @@ class LocalizationNode(Node):
         float_keys = {
             'filter_alpha', 'ap_cruise_speed', 'ap_max_lin', 'ap_min_lin',
             'ap_goal_tol', 'ap_wp_tol', 'ap_kp_cross', 'ap_v_cross_max',
-            'ap_turn_factor', 'ap_max_ang', 'ap_kp_ang', 'wheel_diameter_mm',
+            'ap_brake_accel', 'ap_turn_factor', 'ap_max_ang', 'ap_kp_ang',
+            'ap_final_yaw', 'wheel_diameter_mm',
             'default_marker_size_mm', 'ceiling_height_m'
         }
         str_keys = {'ap_yaw_mode'}
@@ -524,12 +537,32 @@ class LocalizationNode(Node):
                     'default_marker_size_mm': (20.0, 1000.0),
                     'ceiling_height_m': (0.2, 20.0),
                     'filter_alpha': (0.01, 1.0),
+                    'ap_cruise_speed': (0.01, 1.0),
+                    'ap_max_lin': (0.01, 1.0),
+                    'ap_min_lin': (0.0, 0.5),
+                    'ap_goal_tol': (0.005, 1.0),
+                    'ap_wp_tol': (0.005, 1.0),
+                    'ap_kp_cross': (0.0, 10.0),
+                    'ap_v_cross_max': (0.0, 1.0),
+                    'ap_brake_accel': (0.01, 5.0),
+                    'ap_turn_factor': (0.0, 1.0),
+                    'ap_max_ang': (0.0, 5.0),
+                    'ap_kp_ang': (0.0, 10.0),
+                    'ap_final_yaw': (-math.pi, math.pi),
                 }
                 if k in limits and not (limits[k][0] <= val <= limits[k][1]):
                     raise ValueError(f'{k} outside allowed range {limits[k]}')
                 validated[k] = val
             elif k in str_keys:
-                validated[k] = str(v)
+                value = str(v).upper()
+                if value not in {'FREE', 'HOLD_INITIAL', 'PATH_TANGENT', 'FINAL_YAW'}:
+                    raise ValueError('ap_yaw_mode must be FREE, HOLD_INITIAL, PATH_TANGENT or FINAL_YAW')
+                validated[k] = value
+        effective_min = validated.get('ap_min_lin', self.ap_min_lin)
+        effective_cruise = validated.get('ap_cruise_speed', self.ap_cruise_speed)
+        effective_max = validated.get('ap_max_lin', self.ap_max_lin)
+        if not effective_min <= effective_cruise <= effective_max:
+            raise ValueError('speeds must satisfy ap_min_lin <= ap_cruise_speed <= ap_max_lin')
         old_wheel = self.wheel_diameter_mm
         for k, val in validated.items():
             setattr(self, k, val)
@@ -623,6 +656,45 @@ class LocalizationNode(Node):
         self.camera_calibration_path = "built-in fallback"
         self.camera_calibration_valid = False
         self.get_logger().error("No valid camera_info.yaml found; tag calibration is blocked")
+
+    def camera_calibration_tick(self):
+        if self.camera_calibration_session.state != "collecting":
+            return
+        with self.latest_frame_lock:
+            if self.latest_jpeg_frame is None or self.latest_frame_seq == self.camera_calibration_last_seq:
+                return
+            jpeg = self.latest_jpeg_frame
+            self.camera_calibration_last_seq = self.latest_frame_seq
+        try:
+            self.camera_calibration_session.process_jpeg(jpeg)
+        except Exception as exc:
+            self.get_logger().warn(f"Camera calibration frame rejected: {exc}")
+
+    def get_camera_calibration_status(self):
+        status = self.camera_calibration_session.status()
+        status["current"] = {
+            "camera_matrix": self.camera_matrix.reshape(-1).tolist(),
+            "distortion_coefficients": self.dist_coeffs.reshape(-1).tolist(),
+            "path": self.camera_calibration_path,
+        }
+        return status
+
+    def apply_camera_calibration(self):
+        target = self.camera_calibration_path
+        if target == "built-in fallback" or not target:
+            target = '/home/raspberry/arUco_termit/shared_config/camera_info.yaml'
+        data = self.camera_calibration_session.apply(target)
+        self.camera_matrix = np.array(data["camera_matrix"], dtype=np.float64).reshape(3, 3)
+        self.dist_coeffs = np.array(data["distortion_coefficients"], dtype=np.float64)
+        self.camera_calibration_path = os.path.abspath(target)
+        self.camera_calibration_valid = True
+        self.wizard.cx = float(self.camera_matrix[0, 2])
+        self.wizard.cy = float(self.camera_matrix[1, 2])
+        self.map_odom_initialized = False
+        msg = String()
+        msg.data = self.camera_calibration_path
+        self.camera_calibration_update_pub.publish(msg)
+        return data
 
     def load_camera_extrinsics(self):
         curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -730,6 +802,7 @@ class LocalizationNode(Node):
     def image_callback(self, msg):
         with self.latest_frame_lock:
             self.latest_jpeg_frame = bytes(msg.data)
+            self.latest_frame_seq += 1
 
     def tag_callback(self, msg):
         try:
@@ -1133,7 +1206,8 @@ class LocalizationNode(Node):
         self.current_wp_idx = 0
         self.route_state = "idle"
         self.path_s_accum = [0.0]
-        self.path_corner_speeds = [self.ap_cruise_speed] * len(self.route_waypoints)
+        speed_limit = min(self.ap_cruise_speed, self.ap_max_lin)
+        self.path_corner_speeds = [speed_limit] * len(self.route_waypoints)
         
         for i in range(len(self.route_waypoints) - 1):
             p1 = self.route_waypoints[i]
@@ -1157,7 +1231,7 @@ class LocalizationNode(Node):
                 cos_turn = float(np.clip(np.dot(u_in, u_out), -1.0, 1.0))
                 turn_angle = float(np.arccos(cos_turn))
                 if turn_angle > np.radians(15.0):
-                    v_c = self.ap_cruise_speed * np.cos(turn_angle / 2.0) * self.ap_turn_factor
+                    v_c = speed_limit * np.cos(turn_angle / 2.0) * self.ap_turn_factor
                     self.path_corner_speeds[i] = max(self.ap_min_lin, float(v_c))
 
         self.publish_plan(waypoints)
@@ -1262,6 +1336,7 @@ class LocalizationNode(Node):
         smooth_strafe = 0.0
         smooth_w = 0.0
         alpha = 0.40
+        speed_limit = min(self.ap_cruise_speed, self.ap_max_lin)
 
         self.get_logger().info(f"▶ Старт векторного контроллера: длина пути {total_path_len:.2f}м, режим курса: {self.ap_yaw_mode}")
 
@@ -1344,8 +1419,8 @@ class LocalizationNode(Node):
                     v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
                     v_corners.append(v_brake_c)
 
-            v_along_target = min([self.ap_cruise_speed, v_finish] + v_corners)
-            v_along_target = float(np.clip(v_along_target, self.ap_min_lin, self.ap_cruise_speed))
+            v_along_target = min([speed_limit, v_finish] + v_corners)
+            v_along_target = float(np.clip(v_along_target, self.ap_min_lin, speed_limit))
 
             # 6. Векторное боковое управление (cross-track velocity)
             v_cross_cmd = -float(np.clip(self.ap_kp_cross * e_cross, -self.ap_v_cross_max, self.ap_v_cross_max))
@@ -1353,8 +1428,8 @@ class LocalizationNode(Node):
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
             v_norm = float(np.linalg.norm(v_map))
-            if v_norm > self.ap_cruise_speed:
-                v_map = v_map * (self.ap_cruise_speed / v_norm)
+            if v_norm > speed_limit:
+                v_map = v_map * (speed_limit / v_norm)
 
             # 8. Проекция скорости карты в REP-103 оси робота:
             # +X вперед, +Y влево.
@@ -1858,7 +1933,40 @@ class WebServerHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed_url.query)
         request_path = parsed_url.path
 
-        if self.path.startswith('/api/tags/save'):
+        if self.path.startswith('/api/camera-calibration/start'):
+            try:
+                node.stop_route()
+                node.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.MANUAL)
+                node.set_motor_power("disable")
+                result = node.camera_calibration_session.start(
+                    inner_cols=payload.get("inner_cols", 8),
+                    inner_rows=payload.get("inner_rows", 6),
+                    square_mm=payload.get("square_mm", 25.0),
+                    required_frames=payload.get("required_frames", 25),
+                )
+                self._send_json(200, {"status": "ok", "calibration": result})
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"error": str(exc)})
+
+        elif self.path.startswith('/api/camera-calibration/solve'):
+            try:
+                candidate = node.camera_calibration_session.solve()
+                self._send_json(200, {"status": "ok", "candidate": candidate})
+            except (TypeError, ValueError) as exc:
+                self._send_json(409, {"error": str(exc)})
+
+        elif self.path.startswith('/api/camera-calibration/apply'):
+            try:
+                calibration = node.apply_camera_calibration()
+                self._send_json(200, {"status": "ok", "calibration": calibration})
+            except (TypeError, ValueError, OSError) as exc:
+                self._send_json(409, {"error": str(exc)})
+
+        elif self.path.startswith('/api/camera-calibration/cancel'):
+            node.camera_calibration_session.cancel()
+            self._send_json(200, {"status": "ok"})
+
+        elif self.path.startswith('/api/tags/save'):
             reg = getattr(node, 'tag_registry', None)
             if not reg:
                 self._send_json(500, {"error": "Registry not initialized"})
@@ -2119,6 +2227,24 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.send_header('Expires', '0')
             self.end_headers()
             self.wfile.write(HTML_TEMPLATE.encode('utf-8'))
+        elif self.path.startswith('/api/camera-calibration/board.svg'):
+            try:
+                from urllib.parse import urlparse, parse_qs
+                query = parse_qs(urlparse(self.path).query)
+                svg = make_a4_chessboard_svg(
+                    int(query.get('cols', [8])[0]), int(query.get('rows', [6])[0]),
+                    float(query.get('square_mm', [25])[0]))
+                svg_payload = svg.encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/svg+xml; charset=utf-8')
+                self.send_header('Content-Disposition', 'attachment; filename="camera_chessboard_A4.svg"')
+                self.send_header('Content-Length', str(len(svg_payload)))
+                self.end_headers()
+                self.wfile.write(svg_payload)
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"error": str(exc)})
+        elif self.path.startswith('/api/camera-calibration/status'):
+            self._send_json(200, self.server.node.get_camera_calibration_status())
         elif self.path == '/video_feed':
             self.send_response(200)
             self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
@@ -2938,6 +3064,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             width: 100%;
             line-height: 0;
         }
+        .video-content::before, .video-content::after {
+            content: "";
+            position: absolute;
+            z-index: 2;
+            pointer-events: none;
+            background: rgba(0, 235, 255, 0.62);
+            box-shadow: 0 0 2px rgba(0,0,0,.9);
+        }
+        .video-content::before { left: 0; right: 0; top: 50%; height: 1px; }
+        .video-content::after { top: 0; bottom: 0; left: 50%; width: 1px; }
         #camera-stream {
             width: 100%;
             height: auto;
@@ -3010,6 +3146,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .tag-form .tag-save { grid-column: 1 / -1; }
         .wizard-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
         .wizard-controls button { min-width: 0; width: 100%; }
+        .primary-tabs, .settings-tabs {
+            display: grid;
+            gap: 6px;
+            margin-bottom: 12px;
+        }
+        .primary-tabs { grid-template-columns: 1fr 1fr; }
+        .settings-tabs { grid-template-columns: repeat(2, 1fr); }
+        .tab-btn {
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.1);
+            color: #8b9bb4;
+            border-radius: 6px;
+            padding: 7px 5px;
+            cursor: pointer;
+            font: inherit;
+            font-size: 11px;
+        }
+        .tab-btn.active { color: #071012; background: #66fcf1; border-color: #66fcf1; font-weight: 700; }
+        .settings-nav, .settings-only { display: none !important; }
+        #sidebar.settings-mode .remote-only { display: none !important; }
+        #sidebar.settings-mode .settings-nav { display: grid !important; }
+        #sidebar.settings-mode .settings-only.settings-active { display: block !important; }
+        #sidebar.settings-mode .settings-only.settings-active.settings-flex { display: flex !important; }
+        .calib-progress { height: 8px; background: rgba(255,255,255,.08); border-radius: 10px; overflow: hidden; }
+        .calib-progress > div { height: 100%; width: 0; background: #66fcf1; transition: width .25s; }
+        .guide-box { font-size: 12px; line-height: 1.45; color: #d8e1ee; background: rgba(102,252,241,.06); border-left: 3px solid #66fcf1; padding: 9px; border-radius: 4px; }
         .control-box {
             background: rgba(255, 255, 255, 0.02);
             border: 1px solid rgba(255, 255, 255, 0.05);
@@ -3076,6 +3238,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <div id="sidebar">
         <h1>ЛОКАЛИЗАЦИЯ</h1>
         <div class="subtitle">Multi-tag Data Fusion</div>
+
+        <div class="primary-tabs">
+            <button class="tab-btn active" id="tab-remote">Пульт</button>
+            <button class="tab-btn" id="tab-settings">Настройки</button>
+        </div>
+
+        <div class="settings-tabs settings-nav">
+            <button class="tab-btn active" data-settings-tab="camera">Камера</button>
+            <button class="tab-btn" data-settings-tab="autopilot">Автодвижение</button>
+            <button class="tab-btn" data-settings-tab="tags">Метки</button>
+            <button class="tab-btn" data-settings-tab="system">Робот</button>
+        </div>
         
         <div class="status-container">
             <span class="status-dot" id="status-dot"></span>
@@ -3097,8 +3271,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section-title">Текущие Координаты</div>
-        <div class="card coords-grid">
+        <div class="section-title settings-only settings-camera settings-active">Калибровка камеры</div>
+        <div class="calib-container settings-only settings-camera settings-active">
+            <div class="guide-box">
+                Нужна шахматная калибровочная доска: <b id="camera-board-spec">9×7 чёрно-белых клеток, 8×6 внутренних пересечений</b>.
+                Размер каждой клетки — <span id="camera-board-square-label">25</span> мм. Печатайте шаблон
+                на A4 в альбомной ориентации, масштаб 100%, без «Вписать в страницу».
+            </div>
+            <a class="btn btn-secondary" id="camera-board-download" href="/api/camera-calibration/board.svg?cols=8&rows=6&square_mm=25" download style="text-align:center; text-decoration:none;">
+                Скачать доску A4 для печати
+            </a>
+            <div class="calib-row"><span class="stat-label">Внутренние углы:</span><span><input type="number" id="camera-board-cols" class="calib-input" value="8" min="4" max="15" style="width:52px;"> × <input type="number" id="camera-board-rows" class="calib-input" value="6" min="4" max="12" style="width:52px;"></span></div>
+            <div class="calib-row"><span class="stat-label">Размер клетки (мм):</span><input type="number" id="camera-square-mm" class="calib-input" value="25" min="5" max="60" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Нужно кадров:</span><input type="number" id="camera-required-frames" class="calib-input" value="25" min="10" max="50"></div>
+            <div class="calib-progress"><div id="camera-calibration-progress"></div></div>
+            <div id="camera-calibration-count" style="font-size:11px; color:#8b9bb4; text-align:center;">0 / 25 кадров</div>
+            <div class="guide-box" id="camera-calibration-guide">1. Скачайте и распечатайте доску. 2. Нажмите «Начать». 3. Медленно показывайте доску по центру, у краёв, ближе, дальше и под разными наклонами.</div>
+            <div id="camera-calibration-quality" style="font-size:11px; color:#8b9bb4;"></div>
+            <div class="wizard-controls">
+                <button class="btn" id="camera-calibration-start" style="margin:0;">Начать</button>
+                <button class="btn btn-secondary" id="camera-calibration-cancel" style="margin:0;">Остановить</button>
+                <button class="btn btn-secondary" id="camera-calibration-solve" disabled style="margin:0;">Рассчитать</button>
+                <button class="btn" id="camera-calibration-apply" disabled style="margin:0; background:#2ecc71; border-color:#2ecc71;">Применить</button>
+            </div>
+            <div id="camera-calibration-result" style="font-size:11px; color:#8b9bb4; line-height:1.4;"></div>
+        </div>
+
+        <div class="section-title remote-only">Текущие Координаты</div>
+        <div class="card coords-grid remote-only">
             <div class="coord-box">
                 <span class="coord-label">Ось X</span>
                 <span class="coord-val" id="val-x">0.000<span>m</span></span>
@@ -3117,8 +3317,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section-title">Статистика Движения</div>
-        <div class="card">
+        <div class="section-title remote-only">Статистика Движения</div>
+        <div class="card remote-only">
             <div class="stat-item">
                 <span class="stat-label">Сырой путь (с шумом)</span>
                 <span class="stat-val" id="stat-dist-raw">0.00 m</span>
@@ -3135,11 +3335,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <button class="btn" id="btn-autocenter">Автоцентрирование: ВКЛ</button>
-        <button class="btn btn-secondary" id="btn-reset">Сбросить Траекторию & Вид</button>
+        <button class="btn remote-only" id="btn-autocenter">Автоцентрирование: ВКЛ</button>
+        <button class="btn btn-secondary remote-only" id="btn-reset">Сбросить Траекторию & Вид</button>
 
-        <div class="section-title" style="margin-top: 15px;">Карта меток ArUco (Schema v2)</div>
-        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+        <div class="section-title settings-only settings-tags" style="margin-top: 15px;">Карта меток ArUco (Schema v2)</div>
+        <div class="calib-container settings-only settings-tags settings-flex" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <span style="font-size: 12px; color: #8b9bb4;">Метки в реестре:</span>
                 <button class="btn btn-secondary" id="btn-refresh-tags" style="font-size: 11px; padding: 4px 8px; margin: 0;">Обновить</button>
@@ -3156,8 +3356,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section-title" style="margin-top: 15px;">Мастер автокалибровки метки</div>
-        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+        <div class="section-title settings-only settings-tags" style="margin-top: 15px;">Мастер автокалибровки метки</div>
+        <div class="calib-container settings-only settings-tags settings-flex" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
             <div style="display:flex; align-items:center; justify-content:space-between;">
                 <span style="font-size:12px; color:#8b9bb4;">Целевой ID:</span>
                 <input type="number" id="wizard-target-tag" class="calib-input" value="17" min="0" max="99" style="width:50px; text-align:center;">
@@ -3173,16 +3373,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section-title" style="margin-top: 15px;">Физические параметры</div>
-        <div class="calib-container">
+        <div class="section-title settings-only settings-system" style="margin-top: 15px;">Физические параметры</div>
+        <div class="calib-container settings-only settings-system">
             <div class="calib-row"><span class="stat-label">Диаметр колеса (мм):</span><input type="number" id="input-wheel-diameter" class="calib-input" min="20" max="300" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Сторона метки (мм):</span><input type="number" id="input-default-tag-size" class="calib-input" min="20" max="1000" step="1"></div>
             <div class="calib-row"><span class="stat-label">Высота потолка (м):</span><input type="number" id="input-ceiling-height" class="calib-input" min="0.2" max="20" step="0.01"></div>
             <button class="btn" id="btn-save-physical" style="margin: 4px 0 0;">Сохранить параметры</button>
         </div>
 
-        <div class="section-title" style="margin-top: 20px;">Калибровка моторов</div>
-        <div class="calib-container">
+        <div class="section-title settings-only settings-system" style="margin-top: 20px;">Калибровка моторов</div>
+        <div class="calib-container settings-only settings-system">
             <div class="calib-row">
                 <span class="stat-label">Колеса (Wheel Mult):</span>
                 <input type="number" id="input-wheel-mult" class="calib-input" value="1.000" step="0.005" min="0.5" max="1.5">
@@ -3194,15 +3394,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="btn" id="btn-set-calib" style="margin-top: 8px; font-size: 13px;">Применить коэффициенты</button>
         </div>
 
-        <div class="section-title">Тестовые движения</div>
-        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+        <div class="section-title settings-only settings-system">Тестовые движения</div>
+        <div class="settings-only settings-system settings-flex" style="display: flex; gap: 8px; margin-bottom: 8px;">
             <button class="btn btn-secondary" id="btn-test-forward" style="flex: 1; font-size: 12px; padding: 10px 4px;">1м Вперед</button>
             <button class="btn btn-secondary" id="btn-test-rotate" style="flex: 1; font-size: 12px; padding: 10px 4px;">Поворот 360°</button>
         </div>
-        <button class="btn" id="btn-test-stop" style="background-color: #ff4d4d; color: white; box-shadow: 0 0 10px rgba(255, 77, 77, 0.3); border-color: #ff4d4d; margin-bottom: 12px; font-size: 13px;">ОСТАНОВИТЬ ДВИЖЕНИЕ</button>
+        <button class="btn settings-only settings-system" id="btn-test-stop" style="background-color: #ff4d4d; color: white; box-shadow: 0 0 10px rgba(255, 77, 77, 0.3); border-color: #ff4d4d; margin-bottom: 12px; font-size: 13px;">ОСТАНОВИТЬ ДВИЖЕНИЕ</button>
 
-        <div class="section-title" style="margin-top: 15px;">Питание моторов (Ток)</div>
-        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+        <div class="section-title remote-only" style="margin-top: 15px;">Питание моторов (Ток)</div>
+        <div class="calib-container remote-only" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
             <div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; font-size: 12px;">
                 <span style="color: #8b9bb4;">Обмотки моторов:</span>
                 <span id="motor-power-badge" style="font-weight: 600; color: #2ecc71;">⚡ ПОД ТОКОМ (УДЕРЖАНИЕ)</span>
@@ -3216,8 +3416,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section-title" style="margin-top: 15px;">Автопилот (Маршруты)</div>
-        <div class="calib-container" style="display: flex; flex-direction: column; gap: 8px;">
+        <div class="section-title remote-only" style="margin-top: 15px;">Автопилот (Маршруты)</div>
+        <div class="calib-container remote-only" style="display: flex; flex-direction: column; gap: 8px;">
             <div style="display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; background: rgba(0,0,0,0.3); border-radius: 6px; font-size: 12px;">
                 <span style="color: #8b9bb4;">Статус:</span>
                 <span id="route-status-badge" style="font-weight: 600; color: #45a29e;">ОЖИДАНИЕ</span>
@@ -3250,57 +3450,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
         </div>
 
-        <div class="section-title">Настройки автопилота</div>
-        <div class="calib-container">
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Look-ahead (м):</span>
-                <input type="number" id="input-look-ahead" class="calib-input" value="0.15" step="0.01" min="0.01" max="1.50" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Макс. линейная (м/с):</span>
-                <input type="number" id="input-max-lin" class="calib-input" value="0.14" step="0.01" min="0.05" max="0.50" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Макс. угловая (рад/с):</span>
-                <input type="number" id="input-max-ang" class="calib-input" value="0.70" step="0.01" min="0.10" max="3.00" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Kp Линейный:</span>
-                <input type="number" id="input-kp-lin" class="calib-input" value="0.80" step="0.01" min="0.10" max="5.00" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Kp Угловой:</span>
-                <input type="number" id="input-kp-ang" class="calib-input" value="1.50" step="0.01" min="0.10" max="5.00" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Точность финиша (м):</span>
-                <input type="number" id="input-goal-tol" class="calib-input" value="0.04" step="0.01" min="0.01" max="0.50" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Торможение (м):</span>
-                <input type="number" id="input-decel-dist" class="calib-input" value="0.30" step="0.01" min="0.05" max="1.50" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Мин. линейная (м/с):</span>
-                <input type="number" id="input-min-lin" class="calib-input" value="0.03" step="0.01" min="0.01" max="0.20" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Мертвая зона Yaw (м):</span>
-                <input type="number" id="input-yaw-deadzone" class="calib-input" value="0.05" step="0.01" min="0.01" max="0.30" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Точность точек (м):</span>
-                <input type="number" id="input-wp-tol" class="calib-input" value="0.08" step="0.01" min="0.01" max="0.50" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <div class="calib-row">
-                <span class="stat-label" style="font-size: 12px;">Торможение в повороте:</span>
-                <input type="number" id="input-turn-decel" class="calib-input" value="0.20" step="0.01" min="0.00" max="1.50" style="font-size: 12px; padding: 2px 6px;">
-            </div>
-            <button class="btn btn-secondary" id="btn-set-follower-params" style="margin-top: 8px; font-size: 12px; padding: 8px 4px;">Применить параметры</button>
+        <div class="section-title settings-only settings-autopilot">Все параметры автоматического движения</div>
+        <div class="calib-container settings-only settings-autopilot">
+            <div class="guide-box">Эти параметры управляют текущим векторным автопилотом и сохраняются после перезапуска.</div>
+            <div class="calib-row"><span class="stat-label">Крейсерская скорость (м/с):</span><input type="number" id="input-ap-cruise" class="calib-input" step="0.01" min="0.01" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Ограничение скорости (м/с):</span><input type="number" id="input-ap-max-lin" class="calib-input" step="0.01" min="0.01" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Минимальная скорость (м/с):</span><input type="number" id="input-ap-min-lin" class="calib-input" step="0.005" min="0" max="0.5"></div>
+            <div class="calib-row"><span class="stat-label">Допуск финиша (м):</span><input type="number" id="input-ap-goal-tol" class="calib-input" step="0.005" min="0.005" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Допуск точки (м):</span><input type="number" id="input-ap-wp-tol" class="calib-input" step="0.005" min="0.005" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Kp боковой ошибки:</span><input type="number" id="input-ap-kp-cross" class="calib-input" step="0.05" min="0" max="10"></div>
+            <div class="calib-row"><span class="stat-label">Макс. боковая скорость:</span><input type="number" id="input-ap-cross-max" class="calib-input" step="0.01" min="0" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Замедление (м/с²):</span><input type="number" id="input-ap-brake" class="calib-input" step="0.01" min="0.01" max="5"></div>
+            <div class="calib-row"><span class="stat-label">Скорость в поворотах:</span><input type="number" id="input-ap-turn-factor" class="calib-input" step="0.05" min="0" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Макс. вращение (рад/с):</span><input type="number" id="input-ap-max-ang" class="calib-input" step="0.05" min="0" max="5"></div>
+            <div class="calib-row"><span class="stat-label">Kp ориентации:</span><input type="number" id="input-ap-kp-ang" class="calib-input" step="0.1" min="0" max="10"></div>
+            <div class="calib-row"><span class="stat-label">Сглаживание позиции:</span><input type="number" id="input-filter-alpha" class="calib-input" step="0.01" min="0.01" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Курс робота:</span><select id="input-ap-yaw-mode" class="calib-input"><option value="FREE">Свободный</option><option value="HOLD_INITIAL">Держать начальный</option><option value="PATH_TANGENT">По касательной пути</option><option value="FINAL_YAW">Заданный на финише</option></select></div>
+            <div class="calib-row"><span class="stat-label">Финальный yaw (рад):</span><input type="number" id="input-ap-final-yaw" class="calib-input" step="0.05" min="-3.1416" max="3.1416"></div>
+            <button class="btn" id="btn-save-autopilot-settings">Сохранить параметры автодвижения</button>
         </div>
 
-        <div class="section-title" style="margin-top: 10px;">Ручное управление</div>
-        <div class="control-box">
+        <div class="section-title remote-only" style="margin-top: 10px;">Ручное управление</div>
+        <div class="control-box remote-only">
             <div style="display: flex; gap: 8px; margin-bottom: 12px; width: 100%;">
                 <button class="btn btn-secondary" id="btn-rot-ccw" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0;">↺ Влево</button>
                 <button class="btn btn-secondary" id="btn-rot-cw" style="flex: 1; font-size: 13px; padding: 10px 4px; margin-bottom: 0;">Вправо ↻</button>
@@ -3353,6 +3524,33 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let isConnected = false;
         let showRaw = true;
         let showGrid = true;
+
+        const sidebar = document.getElementById('sidebar');
+        const tabRemote = document.getElementById('tab-remote');
+        const tabSettings = document.getElementById('tab-settings');
+        let selectedSettingsTab = 'camera';
+        function showSettingsTab(name) {
+            selectedSettingsTab = name;
+            document.querySelectorAll('.settings-only').forEach(el => el.classList.remove('settings-active'));
+            document.querySelectorAll(`.settings-${name}`).forEach(el => el.classList.add('settings-active'));
+            document.querySelectorAll('[data-settings-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.settingsTab === name));
+            sidebar.scrollTop = 0;
+        }
+        tabRemote.addEventListener('click', () => {
+            sidebar.classList.remove('settings-mode');
+            tabRemote.classList.add('active');
+            tabSettings.classList.remove('active');
+            sidebar.scrollTop = 0;
+        });
+        tabSettings.addEventListener('click', () => {
+            sidebar.classList.add('settings-mode');
+            tabSettings.classList.add('active');
+            tabRemote.classList.remove('active');
+            showSettingsTab(selectedSettingsTab);
+        });
+        document.querySelectorAll('[data-settings-tab]').forEach(btn => {
+            btn.addEventListener('click', () => showSettingsTab(btn.dataset.settingsTab));
+        });
 
         // Масштаб и сдвиг
         let zoom = 120; // Пикселей на метр
@@ -4043,22 +4241,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 canvas.style.cursor = 'grab';
             }
             
-            // Автоматически отправляем текущие параметры из полей ввода перед стартом
-            const lookAhead = parseFloat(inputLookAhead.value);
-            const maxLin = parseFloat(inputMaxLin.value);
-            const maxAng = parseFloat(inputMaxAng.value);
-            const kpLin = parseFloat(inputKpLin.value);
-            const kpAng = parseFloat(inputKpAng.value);
-            const goalTol = parseFloat(inputGoalTol.value);
-            const decelDist = parseFloat(inputDecelDist.value);
-            const minLin = parseFloat(inputMinLin.value);
-            const yawDeadzone = parseFloat(inputYawDeadzone.value);
-            const wpTol = parseFloat(inputWpTol.value);
-            const turnDecel = parseFloat(inputTurnDecel.value);
-            
-            fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
-                .catch(err => console.error("Error setting follower params:", err));
-            
             const ptsStr = plannedPath.map(pt => `${pt.x.toFixed(3)},${pt.y.toFixed(3)}`).join(';');
             fetch(`/set_path?points=${ptsStr}`)
                 .then(res => res.json())
@@ -4120,22 +4302,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     canvas.style.cursor = 'grab';
                 }
                 
-                // Автоматически отправляем текущие параметры из полей ввода
-                const lookAhead = parseFloat(inputLookAhead.value);
-                const maxLin = parseFloat(inputMaxLin.value);
-                const maxAng = parseFloat(inputMaxAng.value);
-                const kpLin = parseFloat(inputKpLin.value);
-                const kpAng = parseFloat(inputKpAng.value);
-                const goalTol = parseFloat(inputGoalTol.value);
-                const decelDist = parseFloat(inputDecelDist.value);
-                const minLin = parseFloat(inputMinLin.value);
-                const yawDeadzone = parseFloat(inputYawDeadzone.value);
-                const wpTol = parseFloat(inputWpTol.value);
-                const turnDecel = parseFloat(inputTurnDecel.value);
-                
-                fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
-                    .catch(err => console.error("Error setting follower params:", err));
-
                 const rx = robotPos.x;
                 const ry = robotPos.y;
                 const dist = Math.sqrt(rx * rx + ry * ry);
@@ -4218,47 +4384,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             addLog(`Круг (R=1м) сгенерирован (шаг ${spacing}м, ${plannedPath.length} точек). Нажмите "Запустить" для старта.`);
             draw();
-        });
-
-        // Настройка параметров автопилота
-        const inputLookAhead = document.getElementById('input-look-ahead');
-        const inputMaxLin = document.getElementById('input-max-lin');
-        const inputMaxAng = document.getElementById('input-max-ang');
-        const inputKpLin = document.getElementById('input-kp-lin');
-        const inputKpAng = document.getElementById('input-kp-ang');
-        const inputGoalTol = document.getElementById('input-goal-tol');
-        const inputDecelDist = document.getElementById('input-decel-dist');
-        const inputMinLin = document.getElementById('input-min-lin');
-        const inputYawDeadzone = document.getElementById('input-yaw-deadzone');
-        const inputWpTol = document.getElementById('input-wp-tol');
-        const inputTurnDecel = document.getElementById('input-turn-decel');
-        const btnSetFollowerParams = document.getElementById('btn-set-follower-params');
-        
-        btnSetFollowerParams.addEventListener('click', () => {
-            const lookAhead = parseFloat(inputLookAhead.value);
-            const maxLin = parseFloat(inputMaxLin.value);
-            const maxAng = parseFloat(inputMaxAng.value);
-            const kpLin = parseFloat(inputKpLin.value);
-            const kpAng = parseFloat(inputKpAng.value);
-            const goalTol = parseFloat(inputGoalTol.value);
-            const decelDist = parseFloat(inputDecelDist.value);
-            const minLin = parseFloat(inputMinLin.value);
-            const yawDeadzone = parseFloat(inputYawDeadzone.value);
-            const wpTol = parseFloat(inputWpTol.value);
-            const turnDecel = parseFloat(inputTurnDecel.value);
-            
-            fetch(`/set_follower_params?look_ahead=${lookAhead}&max_lin=${maxLin}&max_ang=${maxAng}&kp_lin=${kpLin}&kp_ang=${kpAng}&goal_tol=${goalTol}&decel_dist=${decelDist}&min_lin=${minLin}&yaw_deadzone=${yawDeadzone}&wp_tol=${wpTol}&turn_decel=${turnDecel}`)
-                .then(res => res.json())
-                .then(data => {
-                    if (data.status === 'success') {
-                        addLog(`Успех: Параметры автопилота обновлены.`);
-                    } else {
-                        addLog("Ошибка применения параметров автопилота.");
-                    }
-                })
-                .catch(err => {
-                    addLog("Сеть: Ошибка настройки автопилота.");
-                });
         });
 
         // Логика джойстика и ручного вращения
@@ -4441,6 +4566,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     document.getElementById('input-default-tag-size').value = physicalSettings.default_marker_size_mm;
                     document.getElementById('input-ceiling-height').value = physicalSettings.ceiling_height_m;
                     if (!document.getElementById('input-new-tag-size').value) document.getElementById('input-new-tag-size').value = physicalSettings.default_marker_size_mm;
+                    const settingInputs = {
+                        ap_cruise_speed: 'input-ap-cruise', ap_max_lin: 'input-ap-max-lin',
+                        ap_min_lin: 'input-ap-min-lin', ap_goal_tol: 'input-ap-goal-tol',
+                        ap_wp_tol: 'input-ap-wp-tol', ap_kp_cross: 'input-ap-kp-cross',
+                        ap_v_cross_max: 'input-ap-cross-max', ap_brake_accel: 'input-ap-brake',
+                        ap_turn_factor: 'input-ap-turn-factor', ap_max_ang: 'input-ap-max-ang',
+                        ap_kp_ang: 'input-ap-kp-ang', filter_alpha: 'input-filter-alpha',
+                        ap_yaw_mode: 'input-ap-yaw-mode', ap_final_yaw: 'input-ap-final-yaw'
+                    };
+                    Object.entries(settingInputs).forEach(([key, id]) => {
+                        const input = document.getElementById(id);
+                        if (input && physicalSettings[key] !== undefined) input.value = physicalSettings[key];
+                    });
                 }
                 if (extRes.ok) {
                     const ext = await extRes.json();
@@ -4465,6 +4603,92 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('input-new-tag-size').value = physicalSettings.default_marker_size_mm;
                 addLog('Физические параметры сохранены');
             } catch (e) { addLog(`Ошибка параметров: ${e.message}`); }
+        }
+
+        async function saveAutopilotSettings() {
+            const value = id => parseFloat(document.getElementById(id).value);
+            const settings = {
+                ap_cruise_speed: value('input-ap-cruise'), ap_max_lin: value('input-ap-max-lin'),
+                ap_min_lin: value('input-ap-min-lin'), ap_goal_tol: value('input-ap-goal-tol'),
+                ap_wp_tol: value('input-ap-wp-tol'), ap_kp_cross: value('input-ap-kp-cross'),
+                ap_v_cross_max: value('input-ap-cross-max'), ap_brake_accel: value('input-ap-brake'),
+                ap_turn_factor: value('input-ap-turn-factor'), ap_max_ang: value('input-ap-max-ang'),
+                ap_kp_ang: value('input-ap-kp-ang'), filter_alpha: value('input-filter-alpha'),
+                ap_yaw_mode: document.getElementById('input-ap-yaw-mode').value,
+                ap_final_yaw: value('input-ap-final-yaw')
+            };
+            try {
+                const res = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({settings})});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                physicalSettings = Object.assign(physicalSettings, data.settings || {});
+                addLog('Параметры автоматического движения сохранены');
+            } catch (e) { addLog(`Ошибка параметров автодвижения: ${e.message}`); }
+        }
+
+        async function cameraCalibrationAction(action, body = {}) {
+            const res = await fetch(`/api/camera-calibration/${action}`, {
+                method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+            return data;
+        }
+
+        async function startCameraCalibration() {
+            const body = {
+                inner_cols: parseInt(document.getElementById('camera-board-cols').value),
+                inner_rows: parseInt(document.getElementById('camera-board-rows').value),
+                square_mm: parseFloat(document.getElementById('camera-square-mm').value),
+                required_frames: parseInt(document.getElementById('camera-required-frames').value)
+            };
+            try {
+                await cameraCalibrationAction('start', body);
+                addLog('Калибровка камеры начата; моторы остановлены');
+                pollCameraCalibration();
+            } catch (e) { addLog(`Калибровка камеры: ${e.message}`); }
+        }
+
+        async function pollCameraCalibration() {
+            try {
+                const res = await fetch('/api/camera-calibration/status');
+                if (!res.ok) return;
+                const data = await res.json();
+                const total = data.required_frames || 25;
+                const count = data.captured_frames || 0;
+                document.getElementById('camera-calibration-count').textContent = `${count} / ${total} кадров`;
+                document.getElementById('camera-calibration-progress').style.width = `${Math.min(100, count / total * 100)}%`;
+                document.getElementById('camera-calibration-guide').textContent = data.guidance || '';
+                document.getElementById('camera-calibration-quality').textContent = data.board_detected
+                    ? `Доска найдена · резкость ${data.sharpness} · площадь ${data.coverage_percent}% кадра`
+                    : 'Доска сейчас не распознана';
+                const solve = document.getElementById('camera-calibration-solve');
+                const apply = document.getElementById('camera-calibration-apply');
+                solve.disabled = data.state !== 'ready';
+                apply.disabled = data.state !== 'review';
+                const current = data.current && data.current.camera_matrix;
+                let result = current ? `Текущая: fx=${current[0].toFixed(1)}, fy=${current[4].toFixed(1)}, cx=${current[2].toFixed(1)}, cy=${current[5].toFixed(1)}.` : '';
+                if (data.candidate) {
+                    const k = data.candidate.camera_matrix;
+                    result += `<br>Новая: RMS=${data.candidate.rms_error_px}px, cx=${k[2].toFixed(1)}, cy=${k[5].toFixed(1)}, кадров ${data.candidate.frames_used}.`;
+                    if (data.candidate.warnings.length) result += `<br><span style="color:#f0b429">${data.candidate.warnings.join('; ')}</span>`;
+                }
+                document.getElementById('camera-calibration-result').innerHTML = result;
+            } catch (e) {}
+        }
+
+        function updateBoardDownload() {
+            const c = document.getElementById('camera-board-cols').value;
+            const r = document.getElementById('camera-board-rows').value;
+            const s = document.getElementById('camera-square-mm').value;
+            const link = document.getElementById('camera-board-download');
+            document.getElementById('camera-board-spec').textContent = `${Number(c)+1}×${Number(r)+1} чёрно-белых клеток, ${c}×${r} внутренних пересечений`;
+            document.getElementById('camera-board-square-label').textContent = s;
+            const fitsA4 = (Number(c)+1)*Number(s) <= 287 && (Number(r)+1)*Number(s) <= 200;
+            link.href = fitsA4 ? `/api/camera-calibration/board.svg?cols=${c}&rows=${r}&square_mm=${s}` : '#';
+            link.textContent = fitsA4 ? 'Скачать доску A4 для печати' : 'Такая доска не помещается на A4';
+            link.style.pointerEvents = fitsA4 ? 'auto' : 'none';
+            link.style.color = fitsA4 ? '' : '#ff5c5c';
         }
 
         async function fetchBatteryStatus() {
@@ -4716,13 +4940,43 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (btnWizAbort) btnWizAbort.addEventListener('click', abortWizard);
         const btnSavePhysical = document.getElementById('btn-save-physical');
         if (btnSavePhysical) btnSavePhysical.addEventListener('click', savePhysicalSettings);
+        const btnSaveAutopilot = document.getElementById('btn-save-autopilot-settings');
+        if (btnSaveAutopilot) btnSaveAutopilot.addEventListener('click', saveAutopilotSettings);
+
+        document.getElementById('camera-calibration-start').addEventListener('click', startCameraCalibration);
+        document.getElementById('camera-calibration-cancel').addEventListener('click', async () => {
+            try {
+                await cameraCalibrationAction('cancel');
+                addLog('Калибровка камеры остановлена; прежние параметры сохранены');
+                pollCameraCalibration();
+            } catch (e) { addLog(`Калибровка камеры: ${e.message}`); }
+        });
+        document.getElementById('camera-calibration-solve').addEventListener('click', async () => {
+            try {
+                const data = await cameraCalibrationAction('solve');
+                addLog(`Калибровка рассчитана: RMS ${data.candidate.rms_error_px} px`);
+                pollCameraCalibration();
+            } catch (e) { addLog(`Расчёт калибровки: ${e.message}`); }
+        });
+        document.getElementById('camera-calibration-apply').addEventListener('click', async () => {
+            try {
+                await cameraCalibrationAction('apply');
+                addLog('Новая калибровка камеры применена без перезапуска системы');
+                pollCameraCalibration();
+            } catch (e) { addLog(`Применение калибровки: ${e.message}`); }
+        });
+        ['camera-board-cols', 'camera-board-rows', 'camera-square-mm'].forEach(id => {
+            document.getElementById(id).addEventListener('input', updateBoardDownload);
+        });
 
         fetchTagRegistry();
         fetchPhysicalSettings();
         fetchBatteryStatus();
+        pollCameraCalibration();
         setInterval(fetchTagRegistry, 2000);
         setInterval(pollWizardStatus, 400);
         setInterval(fetchBatteryStatus, 5000);
+        setInterval(pollCameraCalibration, 500);
 
         // Старт
         resizeCanvas();

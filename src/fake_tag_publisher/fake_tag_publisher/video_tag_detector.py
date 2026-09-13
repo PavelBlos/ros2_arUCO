@@ -4,6 +4,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from fake_tag_interfaces.msg import TagDetection, TagDetectionArray, TagMapUpdate, TagMapAck
 from sensor_msgs.msg import CompressedImage
 from geometry_msgs.msg import Pose
+from std_msgs.msg import String
 from ament_index_python.packages import get_package_share_directory
 import cv2
 import numpy as np
@@ -115,6 +116,9 @@ class VideoTagDetector(Node):
         self.update_sub = self.create_subscription(
             TagMapUpdate, '/tag_map/updated', self.tag_map_update_callback, transient_qos
         )
+        self.calibration_update_sub = self.create_subscription(
+            String, '/camera_calibration/updated', self.camera_calibration_update_callback, 10
+        )
 
         timer_period = 1.0 / self.detection_rate
         self.timer = self.create_timer(timer_period, self.timer_callback)
@@ -177,6 +181,10 @@ class VideoTagDetector(Node):
             ack_msg.status = "error"
             ack_msg.error_message = str(e)
             self.ack_pub.publish(ack_msg)
+
+    def camera_calibration_update_callback(self, msg: String):
+        self.get_logger().info(f"Reloading camera calibration from {msg.data}")
+        self.load_calibration()
 
     def load_calibration(self):
         resolved_path = self.calibration_path
@@ -454,20 +462,6 @@ class VideoTagDetector(Node):
             label = f"ID:{info['id']} [{status_text}] d={info['dist']:.2f}m e={info['err']:.1f}px"
             cv2.putText(frame, label, (int(c0[0]), max(15, int(c0[1]) - 6)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
-
-        # Camera optical axes. Prefer the calibrated principal point, since it
-        # is the point used by PnP and tag-centering; fall back to frame center.
-        height, width = frame.shape[:2]
-        center_x, center_y = width // 2, height // 2
-        if self.camera_matrix is not None:
-            calibrated_x = int(round(float(self.camera_matrix[0, 2])))
-            calibrated_y = int(round(float(self.camera_matrix[1, 2])))
-            if 0 <= calibrated_x < width and 0 <= calibrated_y < height:
-                center_x, center_y = calibrated_x, calibrated_y
-        axis_color = (255, 220, 0)  # cyan in BGR, visible over usual tag colors
-        cv2.line(frame, (0, center_y), (width - 1, center_y), axis_color, 1, cv2.LINE_AA)
-        cv2.line(frame, (center_x, 0), (center_x, height - 1), axis_color, 1, cv2.LINE_AA)
-        cv2.circle(frame, (center_x, center_y), 5, axis_color, 1, cv2.LINE_AA)
 
         # Compress and publish annotated image
         ret_enc, jpeg_buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])

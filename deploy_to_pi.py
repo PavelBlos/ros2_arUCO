@@ -100,7 +100,8 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
                     # Also map key nodes to release root for direct execution
                     if pyf in ['localization_node.py', 'video_tag_detector.py', 'termit_api.py',
                               'geometry_transforms.py', 'tag_registry.py', 'single_tag_pnp.py',
-                              'multi_tag_fusion.py', 'tag_calibration_wizard.py', 'covisibility_graph.py']:
+                              'multi_tag_fusion.py', 'tag_calibration_wizard.py', 'covisibility_graph.py',
+                              'camera_calibration_session.py']:
                         files[pyf] = os.path.join(py_dir, pyf)
 
     # 3. Root helper scripts and configuration
