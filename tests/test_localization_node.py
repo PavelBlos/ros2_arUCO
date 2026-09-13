@@ -472,6 +472,24 @@ def test_api_calibration_abort_and_confirm(mock_node):
     assert mock_node.wizard.state == WizardState.COMPLETED
     assert "25" in mock_node.tag_registry.get_all_tags()
 
+    # Centering the anchor must never redefine the map origin.
+    mock_node.tag_registry.set_anchor_tag(17, confirm=True)
+    anchor_before = mock_node.tag_registry.get_tag(17)["pose"]
+    mock_node.wizard.state = WizardState.REVIEW
+    mock_node.wizard.target_tag_id = 17
+    mock_node.wizard.calibrated_tag_result = {
+        "tag_id": 17, "state": "provisional", "enabled": True,
+        "marker_size_m": 0.100,
+        "pose": {"x": 0.8, "y": -0.4, "z": 2.2, "roll": 2.6, "pitch": 0.1, "yaw": 0.3},
+        "diagnostics": {"samples_count": 30},
+    }
+    handler.path = "/api/calibration/confirm"
+    handler.do_POST()
+
+    assert sent_responses[-1] == 200
+    assert mock_node.tag_registry.get_tag(17)["pose"] == anchor_before
+    assert mock_node.wizard.calibrated_tag_result["pose"] == anchor_before
+
 def test_publish_camera_tf(mock_node):
     mock_node.tf_broadcaster = MagicMock()
     mock_node.publish_camera_tf()
