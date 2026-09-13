@@ -14,6 +14,10 @@ Features:
 import math
 import numpy as np
 import cv2
+try:
+    from .ceiling_geometry import solve_ceiling_frame
+except ImportError:
+    from ceiling_geometry import solve_ceiling_frame
 from scipy.spatial.transform import Rotation as R
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -147,7 +151,8 @@ class MultiTagFusion:
                       expected_sha256: Optional[str] = None,
                       frame_epoch: Optional[int] = None,
                       frame_revision: Optional[int] = None,
-                      frame_sha256: Optional[str] = None) -> Dict[str, Any]:
+                      frame_sha256: Optional[str] = None,
+                      ceiling_planar: bool = False) -> Dict[str, Any]:
         """
         Main fusion entrypoint for a single video frame.
 
@@ -183,6 +188,9 @@ class MultiTagFusion:
                     "multi_tag_used": False,
                     "covariance": pred_odom_cov if pred_odom_cov is not None else np.diag([0.05**2, 0.05**2, 0.05**2])
                 }
+
+        if ceiling_planar:
+            return solve_ceiling_frame(detections, active_tags_db, camera_matrix, dist_coeffs, T_base_cam)
 
         # 1. Filter valid confirmed detections
         valid_candidates = []

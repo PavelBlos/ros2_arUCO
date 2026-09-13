@@ -67,6 +67,8 @@ class RobotConfig:
     k1: float = 1.0                      # Масштаб колеса 1
     k2: float = 1.0                      # Масштаб колеса 2
     k3: float = 1.0                      # Масштаб колеса 3
+    linear_scale: float = 1.0            # Measured displacement / nominal wheel odometry
+    angular_scale: float = 1.0           # Measured yaw change / nominal wheel odometry
 
 
 def _diff_int32(curr: int, prev: int) -> int:
@@ -336,7 +338,8 @@ class TermitRobotAPI:
         if self._direct_speeds is not None:
             return self._direct_speeds
         c = self.config
-        vx, vy, w = self._target_vx, self._target_vy, self._target_omega
+        vx, vy = self._target_vx / c.linear_scale, self._target_vy / c.linear_scale
+        w = self._target_omega / c.angular_scale
         wheels = ((vx + w * c.base_radius) * c.inv_m1,
                   (-c.side_ratio * vx - 0.866025 * vy + w * c.base_radius) * c.inv_m2,
                   (-c.side_ratio * vx + 0.866025 * vy + w * c.base_radius) * c.inv_m3)
@@ -595,8 +598,9 @@ class TermitRobotAPI:
             ds_forward = (1.0 / math.sqrt(3.0)) * (ds3 - ds2)
             dtheta = (1.0 / (3.0 * L)) * (ds1 + ds2 + ds3)
 
-            dx_body = ds_forward
-            dy_body = -ds_strafe_right
+            dx_body = ds_forward * self.config.linear_scale
+            dy_body = -ds_strafe_right * self.config.linear_scale
+            dtheta *= self.config.angular_scale
 
             # Скорости тела робота в REP-103
             self._odom.vx = dx_body / dt

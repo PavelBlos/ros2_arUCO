@@ -53,6 +53,10 @@ from scipy.spatial.transform import Rotation as R, Slerp
 import threading
 import json
 import queue
+try:
+    from .ceiling_geometry import vertical_target_pixel
+except ImportError:
+    from ceiling_geometry import vertical_target_pixel
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import socketserver
 
@@ -92,6 +96,7 @@ class LocalizationNode(Node):
             cx=self.camera_image_width / 2.0,
             cy=self.camera_image_height / 2.0,
         )
+        self.configure_wizard_geometry()
         self.covis_graph = CovisibilityGraph()
 
         # Detections caching and rate limits
@@ -99,6 +104,7 @@ class LocalizationNode(Node):
         self.latest_detections_stamp = 0.0
         self._last_conflict_warn_time = 0.0
         self.last_fusion_diagnostics = {"status": "not_started"}
+        self.fusion_conflict_since = None
         self.detector_revision = 0
 
         # Timers: 25 Hz for Calibration Wizard FSM, 20 Hz for Dynamic Camera TF broadcast
@@ -255,6 +261,8 @@ class LocalizationNode(Node):
         # Persistent physical settings. Load only after all defaults exist so the
         # file values are not silently overwritten later in __init__.
         self.wheel_diameter_mm = 70.0
+        self.drive_linear_scale = 1.0
+        self.drive_angular_scale = 1.0
         self.default_marker_size_mm = 100.0
         self.ceiling_height_m = 2.5
         self.load_runtime_settings()
@@ -470,6 +478,8 @@ class LocalizationNode(Node):
                 if "ap_yaw_mode" in cfg: self.ap_yaw_mode = str(cfg["ap_yaw_mode"])
                 if "ap_final_yaw" in cfg: self.ap_final_yaw = float(cfg["ap_final_yaw"])
                 if "wheel_diameter_mm" in cfg: self.wheel_diameter_mm = float(cfg["wheel_diameter_mm"])
+                self.drive_linear_scale = float(cfg.get('drive_linear_scale', 1.))
+                self.drive_angular_scale = float(cfg.get('drive_angular_scale', 1.))
                 if "default_marker_size_mm" in cfg: self.default_marker_size_mm = float(cfg["default_marker_size_mm"])
                 if "ceiling_height_m" in cfg: self.ceiling_height_m = float(cfg["ceiling_height_m"])
                 self.get_logger().info(f"Loaded runtime settings from {self.runtime_settings_path}")
@@ -513,6 +523,8 @@ class LocalizationNode(Node):
             "ap_yaw_mode": str(getattr(self, 'ap_yaw_mode', 'HOLD_INITIAL')),
             "ap_final_yaw": float(getattr(self, 'ap_final_yaw', 0.0)),
             "wheel_diameter_mm": float(getattr(self, 'wheel_diameter_mm', 70.0)),
+            "drive_linear_scale": float(getattr(self, 'drive_linear_scale', 1.)),
+            "drive_angular_scale": float(getattr(self, 'drive_angular_scale', 1.)),
             "default_marker_size_mm": float(getattr(self, 'default_marker_size_mm', 100.0)),
             "ceiling_height_m": float(getattr(self, 'ceiling_height_m', 2.5)),
         }
@@ -528,7 +540,7 @@ class LocalizationNode(Node):
             'ap_goal_tol', 'ap_wp_tol', 'ap_kp_cross', 'ap_v_cross_max',
             'ap_brake_accel', 'ap_turn_factor', 'ap_max_ang', 'ap_kp_ang',
             'ap_final_yaw', 'wheel_diameter_mm',
-            'default_marker_size_mm', 'ceiling_height_m'
+            'default_marker_size_mm', 'ceiling_height_m', 'drive_linear_scale', 'drive_angular_scale'
         }
         str_keys = {'ap_yaw_mode'}
 
@@ -539,6 +551,8 @@ class LocalizationNode(Node):
                 if not math.isfinite(val):
                     raise ValueError(f"{k} must be finite")
                 limits = {
+                    'drive_linear_scale': (0.2, 2.0),
+                    'drive_angular_scale': (0.2, 2.0),
                     'wheel_diameter_mm': (20.0, 300.0),
                     'default_marker_size_mm': (20.0, 1000.0),
                     'ceiling_height_m': (0.2, 20.0),
@@ -570,11 +584,14 @@ class LocalizationNode(Node):
         if not effective_min <= effective_cruise <= effective_max:
             raise ValueError('speeds must satisfy ap_min_lin <= ap_cruise_speed <= ap_max_lin')
         old_wheel = self.wheel_diameter_mm
+        old_scales = (getattr(self, 'drive_linear_scale', 1.), getattr(self, 'drive_angular_scale', 1.))
         for k, val in validated.items():
             setattr(self, k, val)
-        if self.robot and self.wheel_diameter_mm != old_wheel:
+        if self.robot and (self.wheel_diameter_mm != old_wheel or old_scales != (self.drive_linear_scale, self.drive_angular_scale)):
             self.robot.stop()
             self.robot.set_wheel_diameter_mm(self.wheel_diameter_mm)
+            self.robot.config.linear_scale = self.drive_linear_scale
+            self.robot.config.angular_scale = self.drive_angular_scale
             self.map_odom_initialized = False
             self.odom_covariance = np.diag([0.02 ** 2, 0.02 ** 2, math.radians(2.0) ** 2])
         if not self.save_runtime_settings():
@@ -591,6 +608,7 @@ class LocalizationNode(Node):
         """25 Hz periodic tick driving the Calibration Wizard FSM independently of camera frames."""
         if not self.wizard or self.wizard.state in (WizardState.IDLE, WizardState.COMPLETED, WizardState.ABORTED):
             return
+        self.configure_wizard_geometry()
 
         now_t = time.monotonic()
 
@@ -636,6 +654,8 @@ class LocalizationNode(Node):
                     anchored_result["pose"] = dict(res_tag["pose"])
                     anchored_result["pose"]["x"] = float(anchor["pose"]["x"])
                     anchored_result["pose"]["y"] = float(anchor["pose"]["y"])
+                    if self.ceiling_planar:
+                        anchored_result["pose"] = dict(anchor["pose"])
                     self.tag_registry.set_tag(res_tag["tag_id"], anchored_result)
                     self.tags_db = self.tag_registry.get_active_confirmed_tags()
                     self.publish_tag_map_update()
@@ -741,6 +761,7 @@ class LocalizationNode(Node):
                 with open(ext_path, 'r', encoding='utf-8') as f:
                     data = yaml.safe_load(f) or {}
                 self.camera_extrinsics_status = data.get("status", "unverified")
+                self.ceiling_planar = data.get('localization_model') == 'ceiling_planar'
                 trans = data.get("translation", {}) if isinstance(data.get("translation"), dict) else {}
                 rot = data.get("rotation_rpy_rad", {}) if isinstance(data.get("rotation_rpy_rad"), dict) else {}
                 x = float(data.get("x", trans.get("x", 0.0)))
@@ -757,8 +778,24 @@ class LocalizationNode(Node):
                 self.get_logger().warn(f"Failed to parse camera extrinsics: {e}")
 
         self.camera_extrinsics_status = "unverified"
+        self.ceiling_planar = False
         self.T_base_cam = pose_to_matrix(0.0, 0.0, 0.0, 0.0, -np.pi / 2.0, np.pi / 2.0)
         self.camera_extrinsics_path = os.path.join(curr_dir, 'camera_extrinsics.yaml')
+
+    def configure_wizard_geometry(self):
+        self.wizard.ceiling_planar = getattr(self, 'ceiling_planar', False)
+        self.wizard.ceiling_height_m = getattr(self, 'ceiling_height_m', 2.5)
+        if self.wizard.ceiling_planar:
+            try:
+                target = vertical_target_pixel(
+                    self.camera_matrix, self.dist_coeffs,
+                    self.T_base_cam, self.wizard.ceiling_height_m,
+                )
+                self.wizard.cx, self.wizard.cy = map(float, target)
+                self.wizard.centering_tol_px = 3.0
+            except (ValueError, np.linalg.LinAlgError):
+                self.wizard.cx = self.camera_image_width / 2.0
+                self.wizard.cy = self.camera_image_height / 2.0
 
     def publish_tag_map_update(self):
         if getattr(self, 'tag_map_pub', None) and TagMapUpdate:
@@ -845,10 +882,13 @@ class LocalizationNode(Node):
 
             # Lookup odometry at exact frame midpoint capture stamp
             odom_at_cam = self.lookup_odom_at(stamp_sec)
-            if odom_at_cam is None:
-                odom_x_c, odom_y_c, odom_yaw_c = self.fused_x, self.fused_y, self.fused_yaw
-            else:
+            if odom_at_cam is not None:
                 odom_x_c, odom_y_c, odom_yaw_c = odom_at_cam
+            else:
+                # Fusion may still diagnose a contradictory visual jump, but
+                # it must not update map->odom without a time-matched odometry
+                # sample.  The current fused pose is only a prediction here.
+                odom_x_c = odom_y_c = odom_yaw_c = None
 
             # Use the validated persistent extrinsics directly. This node also
             # publishes the same matrix to TF for other ROS consumers.
@@ -866,6 +906,7 @@ class LocalizationNode(Node):
 
                 det_dicts.append({
                     "tag_id": int(d.tag_id),
+                    "frame_stamp": stamp_sec,
                     "pose_valid": bool(getattr(d, 'pose_valid', True)),
                     "rejection_reason": getattr(d, 'rejection_reason', ''),
                     "reproj_err": float(getattr(d, 'reproj_err', 0.5)),
@@ -915,7 +956,9 @@ class LocalizationNode(Node):
             predicted_map_pose = compute_fused_pose_se2(
                 self.delta_map_odom_x, self.delta_map_odom_y, self.delta_map_odom_yaw,
                 odom_x_c, odom_y_c, odom_yaw_c
-            ) if self.map_odom_initialized else (odom_x_c, odom_y_c, odom_yaw_c)
+            ) if self.map_odom_initialized and odom_at_cam is not None else (
+                self.fused_x, self.fused_y, self.fused_yaw
+            )
             fusion_res = self.fusion.process_frame(
                 det_dicts,
                 active_tags,
@@ -929,7 +972,8 @@ class LocalizationNode(Node):
                 expected_sha256=self.tag_registry.sha256 if self.tag_registry else None,
                 frame_epoch=frame_epoch,
                 frame_revision=frame_rev,
-                frame_sha256=frame_sha
+                frame_sha256=frame_sha,
+                ceiling_planar=getattr(self, 'ceiling_planar', False)
             )
             self.last_fusion_diagnostics = {
                 "status": fusion_res.get("status", "unknown"),
@@ -938,7 +982,14 @@ class LocalizationNode(Node):
                 "rejection_reasons": fusion_res.get("rejection_reasons", {}),
                 "reproj_rms_px": float(fusion_res.get("reproj_rms_px", 0.0)),
                 "pair": fusion_res.get("pair_diagnostics"),
+                "ceiling_height_m": fusion_res.get('ceiling_height_m'),
+                "per_tag_residuals": fusion_res.get('per_tag_residuals'),
             }
+            if fusion_res.get('fused_base_pose') is not None:
+                self.fusion_conflict_since = None
+            elif fusion_res.get('status') in ('multi_tag_conflict', 'revision_mismatch'):
+                if self.fusion_conflict_since is None:
+                    self.fusion_conflict_since = time.time()
 
             # Record in Co-Visibility Graph
             self.covis_graph.record_frame_observations(
@@ -960,6 +1011,11 @@ class LocalizationNode(Node):
                         f"⚠️ Visual jump {jump_dist:.2f}m > 0.15m while in motion! "
                         f"Locking navigation and halting robot for Stop-and-Reanchor."
                     )
+                    return
+                if odom_at_cam is None:
+                    # A fused map pose is not an odometry pose. Do not compose
+                    # it with map->odom a second time. The visual frame has
+                    # still been checked above for an emergency jump.
                     return
                 else:
                     target_x_mo, target_y_mo, target_yaw_mo = compute_map_to_odom_se2(
@@ -1039,6 +1095,8 @@ class LocalizationNode(Node):
                 from termit_api import TermitRobotAPI, RobotConfig, HoldMode
                 
             config = RobotConfig(
+                linear_scale=getattr(self, 'drive_linear_scale', 1.),
+                angular_scale=getattr(self, 'drive_angular_scale', 1.),
                 wheel_radius=float(self.wheel_diameter_mm) / 2000.0,
                 base_radius=0.122,
                 steps_per_rev=1600,
@@ -1317,6 +1375,12 @@ class LocalizationNode(Node):
             self.notify_ui_event()
             self.get_logger().warn(f"Autopilot start rejected: {self.route_error}")
             return False
+        geometry_error = self.navigation_geometry_error()
+        if geometry_error:
+            self.route_state = 'blocked'
+            self.route_error = geometry_error
+            self.notify_ui_event()
+            return False
         if not (self.robot and self.robot.is_connected):
             self.route_state = "blocked"
             self.route_error = "Контроллер ESP32 не подключён"
@@ -1389,6 +1453,19 @@ class LocalizationNode(Node):
         self.get_logger().info(f"🎯 Построен маршрут возврата в (0,0): {len(points)} точек, дистанция {dist:.2f}м")
         return self.start_route()
 
+    def navigation_geometry_error(self):
+        if getattr(self, 'camera_extrinsics_status', 'unverified') != 'verified':
+            return 'Не откалибровано положение камеры относительно корпуса'
+        if getattr(self, 'ceiling_planar', False):
+            try:
+                vertical_target_pixel(self.camera_matrix, self.dist_coeffs, self.T_base_cam, self.ceiling_height_m)
+            except (ValueError, np.linalg.LinAlgError):
+                return 'Камера не направлена на плоскость потолочных меток'
+        conflict_since = getattr(self, 'fusion_conflict_since', None)
+        if conflict_since is not None and time.time()-conflict_since > .5:
+            return 'Метки дают противоречивые координаты; требуется проверка карты'
+        return ''
+
     def autopilot_loop(self):
         """
         Высокоточный векторный контроллер следования по траектории (20 Гц).
@@ -1423,9 +1500,10 @@ class LocalizationNode(Node):
             t_loop_start = pytime.time()
             self.last_motion_cmd_time = t_loop_start
 
-            if self.is_nav_locked:
+            geometry_error = self.navigation_geometry_error()
+            if self.is_nav_locked or geometry_error:
                 self.route_state = "blocked"
-                self.route_error = self.nav_lock_reason or "Навигация заблокирована"
+                self.route_error = geometry_error or self.nav_lock_reason or "Навигация заблокирована"
                 self.autopilot_active = False
                 self.notify_ui_event()
                 self.get_logger().warn(f"Autopilot halted: {self.route_error}")
@@ -1451,7 +1529,8 @@ class LocalizationNode(Node):
 
             # 2. Продвижение на следующий сегмент
             if seg_idx < total_wps - 2:
-                if t_param >= 0.95 or dist_to_next_wp <= self.ap_wp_tol:
+                line_cross_error = abs(float(np.dot(ap, normal)))
+                if (t_param >= 0.95 and line_cross_error <= self.ap_wp_tol) or dist_to_next_wp <= self.ap_wp_tol:
                     seg_idx += 1
                     self.current_seg_idx = seg_idx
                     self.current_wp_idx = seg_idx
@@ -1482,7 +1561,7 @@ class LocalizationNode(Node):
             finish_euclid = float(np.hypot(fx - rx, fy - ry))
 
             if seg_idx >= total_wps - 2:
-                if dist_to_finish <= self.ap_goal_tol or finish_euclid <= self.ap_goal_tol:
+                if finish_euclid <= self.ap_goal_tol:
                     self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
                     pytime.sleep(0.4)
                     self.route_state = "finished"
@@ -1514,6 +1593,10 @@ class LocalizationNode(Node):
 
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
+            if t_param >= 1.0:
+                # Outside the endpoint plane, drive toward the actual vertex;
+                # path projection alone must not report a remote finish.
+                v_map = .8 * (p_b - np.array([rx, ry]))
             v_norm = float(np.linalg.norm(v_map))
             if v_norm > speed_limit:
                 v_map = v_map * (speed_limit / v_norm)
@@ -2230,6 +2313,8 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                         res_tag["pose"] = dict(res_tag["pose"])
                         res_tag["pose"]["x"] = float(anchor["pose"]["x"])
                         res_tag["pose"]["y"] = float(anchor["pose"]["y"])
+                        if getattr(node, 'ceiling_planar', False):
+                            res_tag['pose'] = dict(anchor['pose'])
                         rev, sha = reg.set_tag(res_tag["tag_id"], res_tag)
                         node.tags_db = reg.get_active_confirmed_tags()
                         node.publish_tag_map_update()
@@ -2319,6 +2404,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 }
                 if not all(math.isfinite(v) for k, v in data.items() if k != 'status'):
                     raise ValueError("extrinsics values must be finite")
+                data['localization_model'] = payload.get('localization_model', 'ceiling_planar' if getattr(node, 'ceiling_planar', False) else 'general_3d')
                 matrix = pose_to_matrix(data['x'], data['y'], data['z'], data['roll'], data['pitch'], data['yaw'])
                 target = node.camera_extrinsics_path
                 tmp = target + '.tmp'
@@ -2329,6 +2415,8 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 os.replace(tmp, target)
                 node.T_base_cam = matrix
                 node.camera_extrinsics_status = status
+                node.ceiling_planar = data['localization_model'] == 'ceiling_planar'
+                node.configure_wizard_geometry()
                 node.map_odom_initialized = False
                 self._send_json(200, {"status": "ok", "message": "Extrinsics saved"})
             except (TypeError, ValueError) as e:
@@ -2682,8 +2770,11 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 blocking_reasons.append("Camera intrinsics unavailable")
             if not connected:
                 blocking_reasons.append("ESP32 controller not connected")
+            geometry_error = node.navigation_geometry_error()
+            if geometry_error and geometry_error not in blocking_reasons:
+                blocking_reasons.append(geometry_error)
 
-            if estop_active or is_nav_locked or not anchor_confirmed:
+            if estop_active or is_nav_locked or not anchor_confirmed or geometry_error:
                 overall_status = "blocked"
             elif (not connected or not esp_odom_fresh or camera_ext_status != "verified"
                   or not getattr(node, 'camera_calibration_valid', False)):
@@ -2837,6 +2928,9 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             resp = {
                 "status": getattr(node, 'camera_extrinsics_status', 'unverified'),
                 "matrix": node.T_base_cam.tolist()
+                ,"localization_model": 'ceiling_planar' if getattr(node, 'ceiling_planar', False) else 'general_3d'
+                ,"vertical_target_px": vertical_target_pixel(node.camera_matrix, node.dist_coeffs, node.T_base_cam, node.ceiling_height_m).tolist() if getattr(node, 'ceiling_planar', False) else None
+                ,"image_size": [node.camera_image_width, node.camera_image_height]
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -3211,6 +3305,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
         .video-content::before { left: 0; right: 0; top: 50%; height: 1px; }
         .video-content::after { top: 0; bottom: 0; left: 50%; width: 1px; }
+        .vertical-target {
+            position: absolute;
+            z-index: 4;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #ffd43b;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+            box-shadow: 0 0 3px #000, 0 0 6px rgba(255, 212, 59, .8);
+            display: none;
+        }
+        .vertical-target::before, .vertical-target::after {
+            content: "";
+            position: absolute;
+            background: #ffd43b;
+            left: 50%;
+            top: 50%;
+            transform: translate(-50%, -50%);
+        }
+        .vertical-target::before { width: 22px; height: 2px; }
+        .vertical-target::after { width: 2px; height: 22px; }
         #camera-stream {
             width: 100%;
             height: auto;
@@ -3513,6 +3629,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="section-title settings-only settings-system" style="margin-top: 15px;">Физические параметры</div>
         <div class="calib-container settings-only settings-system">
             <div class="calib-row"><span class="stat-label">Диаметр колеса (мм):</span><input type="number" id="input-wheel-diameter" class="calib-input" min="20" max="300" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Масштаб перемещения:</span><input type="number" id="input-drive-linear-scale" class="calib-input" min="0.2" max="2" step="0.001"></div>
+            <div class="calib-row"><span class="stat-label">Масштаб поворота:</span><input type="number" id="input-drive-angular-scale" class="calib-input" min="0.2" max="2" step="0.001"></div>
             <div class="calib-row"><span class="stat-label">Сторона метки (мм):</span><input type="number" id="input-default-tag-size" class="calib-input" min="20" max="1000" step="1"></div>
             <div class="calib-row"><span class="stat-label">Высота потолка (м):</span><input type="number" id="input-ceiling-height" class="calib-input" min="0.2" max="20" step="0.01"></div>
             <button class="btn" id="btn-save-physical" style="margin: 4px 0 0;">Сохранить параметры</button>
@@ -3639,6 +3757,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
                 <div class="video-content" id="video-content">
                     <img id="camera-stream" src="/video_feed" alt="Загрузка видео..." />
+                    <div class="vertical-target" id="vertical-target" title="Точка потолка над центром робота"></div>
                 </div>
             </div>
             <div class="control-panel">
@@ -4708,7 +4827,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         // --- Tag Registry & Calibration Wizard JS Logic ---
         let currentTagMapRevision = 0;
         let wizardActive = false;
-        let physicalSettings = {wheel_diameter_mm: 70, default_marker_size_mm: 100, ceiling_height_m: 2.5};
+        let physicalSettings = {wheel_diameter_mm: 70, drive_linear_scale: 1, drive_angular_scale: 1, default_marker_size_mm: 100, ceiling_height_m: 2.5};
 
         async function fetchPhysicalSettings() {
             try {
@@ -4717,6 +4836,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     const data = await settingsRes.json();
                     physicalSettings = Object.assign(physicalSettings, data.settings || {});
                     document.getElementById('input-wheel-diameter').value = physicalSettings.wheel_diameter_mm;
+                    document.getElementById('input-drive-linear-scale').value = physicalSettings.drive_linear_scale;
+                    document.getElementById('input-drive-angular-scale').value = physicalSettings.drive_angular_scale;
                     document.getElementById('input-default-tag-size').value = physicalSettings.default_marker_size_mm;
                     document.getElementById('input-ceiling-height').value = physicalSettings.ceiling_height_m;
                     if (!document.getElementById('input-new-tag-size').value) document.getElementById('input-new-tag-size').value = physicalSettings.default_marker_size_mm;
@@ -4739,6 +4860,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     const badge = document.getElementById('sync-extrinsics-badge');
                     badge.textContent = String(ext.status || 'unverified').toUpperCase();
                     badge.style.color = ext.status === 'verified' ? '#2ecc71' : '#e74c3c';
+                    const target = document.getElementById('vertical-target');
+                    if (target && Array.isArray(ext.vertical_target_px) && Array.isArray(ext.image_size)) {
+                        target.style.left = `${100 * ext.vertical_target_px[0] / ext.image_size[0]}%`;
+                        target.style.top = `${100 * ext.vertical_target_px[1] / ext.image_size[1]}%`;
+                        target.style.display = 'block';
+                    } else if (target) {
+                        target.style.display = 'none';
+                    }
                 }
             } catch (e) { console.error('settings fetch failed', e); }
         }
@@ -4746,6 +4875,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         async function savePhysicalSettings() {
             const settings = {
                 wheel_diameter_mm: parseFloat(document.getElementById('input-wheel-diameter').value),
+                drive_linear_scale: parseFloat(document.getElementById('input-drive-linear-scale').value),
+                drive_angular_scale: parseFloat(document.getElementById('input-drive-angular-scale').value),
                 default_marker_size_mm: parseFloat(document.getElementById('input-default-tag-size').value),
                 ceiling_height_m: parseFloat(document.getElementById('input-ceiling-height').value)
             };

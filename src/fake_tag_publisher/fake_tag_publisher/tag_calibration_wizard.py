@@ -15,6 +15,10 @@ import time
 import math
 import threading
 import numpy as np
+try:
+    from .ceiling_geometry import ceiling_rays, locate_ceiling_tag, solve_ceiling_frame, vertical_target_pixel
+except ImportError:
+    from ceiling_geometry import ceiling_rays, locate_ceiling_tag, solve_ceiling_frame, vertical_target_pixel
 from enum import Enum
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -161,6 +165,9 @@ class TagCalibrationWizard:
         self.max_lin_vel = max_lin_vel
         self.max_ang_vel = max_ang_vel
         self.auto_confirm = auto_confirm
+        self.ceiling_planar = False
+        self.ceiling_height_m = 2.5
+        self._last_sample_stamp = None
 
         # Internal state
         self.state = WizardState.IDLE
@@ -245,6 +252,7 @@ class TagCalibrationWizard:
         self._probe_forward_retries = 0
         self._probe_strafe_retries = 0
         self.collected_samples.clear()
+        self._last_sample_stamp = None
         self.calibrated_tag_result = None
 
         # Request motion authority
@@ -363,6 +371,18 @@ class TagCalibrationWizard:
             self.centering_forward_error_m = float(e_fwd) if use_3d else None
             self.centering_strafe_error_m = float(e_str) if use_3d else None
 
+            if self.ceiling_planar:
+                try:
+                    rays = ceiling_rays(corners, camera_matrix, dist_coeffs, T_base_cam)
+                    height = self.ceiling_height_m - T_base_cam[2, 3]
+                    error_body = height * rays.mean(axis=0) + T_base_cam[:2, 3]
+                    e_fwd, e_str = error_body
+                    self.centering_forward_error_m = float(e_fwd)
+                    self.centering_strafe_error_m = float(e_str)
+                    use_3d = True
+                except (ValueError, np.linalg.LinAlgError):
+                    return self.state, (0., 0., 0.), 'Ceiling geometry invalid; holding'
+
             # The camera overlay and the user both refer to the geometric
             # frame centre. Do not mix this pixel objective with a separate
             # 3-D threshold: that previously left one axis driving for 25 s
@@ -381,6 +401,21 @@ class TagCalibrationWizard:
                     )
                 return self.state, self.centering_command, "Target is centered; verifying stability..."
             self._centered_since = None
+
+            if self.ceiling_planar:
+                if self._best_total_error_px is None or pixel_dist < self._best_total_error_px - 1.0:
+                    self._best_total_error_px = pixel_dist
+                    self._last_total_progress_time = t
+                if t-self.state_enter_time > 35.0 or t-self._last_total_progress_time > 5.0:
+                    self.abort('Centering did not converge with calibrated camera/body geometry')
+                    return self.state, (0., 0., 0.), self.abort_reason
+                velocity = .6 * np.array([e_fwd, e_str])
+                velocity *= min(1., self.max_lin_vel/max(1e-9, np.linalg.norm(velocity)))
+                self.centering_phase = 'calibrated_geometry'
+                self.centering_axis = 'combined'
+                self.centering_command = (float(velocity[0]), float(velocity[1]), 0.)
+                self._append_trace(t, u_tag, v_tag, du, dv, self.centering_command)
+                return self.state, self.centering_command, 'Centering above base origin with calibrated camera geometry'
 
             # Calculate centering velocity in REP-103 (+X forward, +Y left).
             if use_3d:
@@ -476,7 +511,32 @@ class TagCalibrationWizard:
                 self.abort("Robot moved during stationary solve phase!")
                 return self.state, (0.0, 0.0, 0.0), self.abort_reason
 
-            if target_det is not None and target_det.get("pose_valid", False):
+            if self.ceiling_planar and target_det is not None:
+                stamp = target_det.get('frame_stamp', t)
+                if stamp != self._last_sample_stamp:
+                    references = {k:v for k,v in (known_tags or {}).items() if str(k) != str(self.target_tag_id)}
+                    ref_pose = solve_ceiling_frame(detections, references, camera_matrix, dist_coeffs, T_base_cam)
+                    pose = ref_pose.get('fused_base_pose')
+                    visible_reference_ids = {
+                        str(d.get('tag_id')) for d in detections
+                        if str(d.get('tag_id')) in references
+                    }
+                    if pose is None and visible_reference_ids:
+                        if (t - self.state_enter_time) > 4.0:
+                            self.abort('Visible reference tag is inconsistent with the ceiling map')
+                            return self.state, (0., 0., 0.), self.abort_reason
+                        return self.state, (0., 0., 0.), 'Waiting for a consistent independent reference tag'
+                    used_reference = pose is not None
+                    pose = current_robot_pose if pose is None else pose
+                    mapped = locate_ceiling_tag(target_det, self.marker_size_m, pose, camera_matrix, dist_coeffs, T_base_cam)
+                    # This profile has one physical ceiling plane. Apparent-size
+                    # noise must not create a different map Z for every tag.
+                    mapped['z'] = float(self.ceiling_height_m)
+                    self.collected_samples.append({**mapped, 'reproj_err':float(target_det.get('reproj_err', 0.)),
+                        'distance_m':mapped['z'], 'viewing_angle_deg':0.,
+                        'mapping_source':'covisible_tag' if used_reference else 'odometry_fallback'})
+                    self._last_sample_stamp = stamp
+            elif target_det is not None and target_det.get("pose_valid", False):
                 corners = np.array(target_det.get("corners_px", []), dtype=np.float64).reshape(4, 2)
                 res_pnp = solve_single_tag_ippe(corners, self.marker_size_m, camera_matrix, dist_coeffs)
                 if res_pnp.get("pose_valid", False):
@@ -576,11 +636,11 @@ class TagCalibrationWizard:
             # IPPE pitch around 5-8 degrees is normal with small printed tags
             # and a wide-angle view. Reject only a clearly non-planar target;
             # retain a warning for review above the preferred 5 degree band.
-            if abs(pitch_deg) > 15.0:
+            if not self.ceiling_planar and abs(pitch_deg) > 15.0:
                 self.abort(f"Tag out-of-plane pitch: {pitch_deg:.1f}deg > 15.0deg")
                 return self.state, (0.0, 0.0, 0.0), self.abort_reason
             quality_warnings = []
-            if abs(pitch_deg) > 5.0:
+            if not self.ceiling_planar and abs(pitch_deg) > 5.0:
                 quality_warnings.append(
                     f"Measured tag pitch {pitch_deg:.1f}deg is outside the preferred +/-5deg band"
                 )
