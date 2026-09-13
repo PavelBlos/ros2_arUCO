@@ -3614,6 +3614,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const ctx = canvas.getContext('2d');
 
         let tags = {};
+        let anchorTagId = null;
         let rawHistory = [];
         let filteredHistory = [];
         let robotPos = { x: 0, y: 0, z: 0, yaw: 0 };
@@ -3799,6 +3800,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                 // Подсветка активной метки
                 const isActive = activeTags.includes(parseInt(tagId));
+                const isAnchor = anchorTagId !== null && parseInt(tagId) === anchorTagId;
+
+                if (isAnchor) {
+                    ctx.strokeStyle = 'rgba(102, 252, 241, 0.55)';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(px, py, size * 0.82, 0, 2 * Math.PI);
+                    ctx.stroke();
+                }
                 
                 ctx.fillStyle = isActive ? 'rgba(46, 204, 113, 0.15)' : 'rgba(255, 165, 0, 0.08)';
                 ctx.strokeStyle = isActive ? '#2ecc71' : 'rgba(255, 165, 0, 0.6)';
@@ -3811,7 +3821,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 ctx.fillStyle = isActive ? '#2ecc71' : '#ffa500';
                 ctx.font = 'bold 11px Outfit, Arial';
                 ctx.textAlign = 'center';
-                ctx.fillText('Tag ' + tagId, px, py - size/2 - 4);
+                ctx.fillText(`${isAnchor ? '⚓ ' : ''}Tag ${tagId} (${info.x.toFixed(2)}, ${info.y.toFixed(2)})`, px, py - size/2 - 5);
             }
 
             // Отрисовка сырой (зашумленной) траектории
@@ -4132,7 +4142,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     document.getElementById('stat-dist-raw').textContent = data.distance_raw.toFixed(2) + ' m';
                     document.getElementById('stat-dist-filt').textContent = data.distance_filtered.toFixed(2) + ' m';
 
-                    activeTags = data.detected_tags || [];
+                    activeTags = (data.detected_tags || []).map(Number);
                     updateActiveTagsUI();
 
                     // Обновляем состояние автопилота и статуса
@@ -4825,6 +4835,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 if (!res.ok) return;
                 const data = await res.json();
                 currentTagMapRevision = data.tag_map_revision || 0;
+                anchorTagId = data.anchor_tag_id === null || data.anchor_tag_id === undefined
+                    ? null : Number(data.anchor_tag_id);
+                tags = {};
+                for (const [tid, info] of Object.entries(data.tags || {})) {
+                    const pose = info.pose || {};
+                    const x = Number(pose.x);
+                    const y = Number(pose.y);
+                    if (info.enabled !== false && Number.isFinite(x) && Number.isFinite(y)) {
+                        tags[tid] = {x, y, state: info.state || 'unknown'};
+                    }
+                }
+                draw();
 
                 const revEpochEl = document.getElementById('sync-rev-epoch');
                 if (revEpochEl) {
