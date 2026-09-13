@@ -78,7 +78,7 @@ def test_visual_servoing_coordinate_signs():
     wizard.start(target_tag_id=42, now=100.0)
     wizard.update([], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.0)
 
-    # The validated 3-D transform places the tag in front of the robot.
+    # Tag above the frame centre: move backward so it moves down in view.
     T_front = np.eye(4)
     T_front[:3, 3] = [0.20, 0.0, 2.5]
     det_front = {
@@ -90,10 +90,10 @@ def test_visual_servoing_coordinate_signs():
     state, cmd, msg = wizard.update([det_front], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.05)
     assert state == WizardState.FINE_CENTERING
     vx, vy, w = cmd
-    assert vx > 0.0  # Must drive forward!
+    assert vx < 0.0
     assert abs(vy) < 0.001
 
-    # The validated 3-D transform places the tag left of the robot.
+    # Tag left of the frame centre: move left so it moves right in view.
     T_left = np.eye(4)
     T_left[:3, 3] = [0.0, 0.20, 2.5]
     det_left = {
@@ -108,7 +108,7 @@ def test_visual_servoing_coordinate_signs():
     assert vy > 0.0  # Must drive left!
 
 
-def test_centering_uses_calibrated_principal_point_and_one_axis_at_a_time():
+def test_centering_uses_geometric_frame_center_and_one_axis_at_a_time():
     wizard = TagCalibrationWizard(cx=320.0, cy=240.0, heartbeat_timeout_sec=3.0)
     wizard.start(target_tag_id=42, now=100.0)
     K = np.array([[798.0, 0.0, 317.0], [0.0, 798.0, 293.0], [0.0, 0.0, 1.0]])
@@ -128,20 +128,64 @@ def test_centering_uses_calibrated_principal_point_and_one_axis_at_a_time():
     state, cmd, _ = wizard.update([det], False, (0, 0, 0), K, np.zeros(5), np.eye(4), now=100.05)
 
     assert state == WizardState.FINE_CENTERING
-    assert wizard.cx == pytest.approx(317.0)
-    assert wizard.cy == pytest.approx(293.0)
+    assert wizard.cx == pytest.approx(320.0)
+    assert wizard.cy == pytest.approx(240.0)
     assert wizard.centering_axis == "horizontal"
     assert cmd[0] == 0.0
     assert cmd[1] > 0.0
 
     det["T_cameraRos_tag"] = det["T_cameraRos_tag"].copy()
-    det["T_cameraRos_tag"][1, 3] = 0.005
-    det["corners_px"] = [307, 220, 327, 220, 327, 240, 307, 240]
+    det["T_cameraRos_tag"][1, 3] = 0.30
+    det["corners_px"] = [310, 170, 330, 170, 330, 190, 310, 190]
     _, cmd, _ = wizard.update([det], False, (0, 0, 0), K, np.zeros(5), np.eye(4), now=100.10)
 
     assert wizard.centering_axis == "vertical"
-    assert cmd[0] > 0.0
+    assert cmd[0] < 0.0
     assert cmd[1] == 0.0
+
+
+def test_centering_switches_axis_using_pixel_error_not_inconsistent_3d_error():
+    wizard = TagCalibrationWizard(cx=320.0, cy=240.0, heartbeat_timeout_sec=3.0)
+    wizard.start(target_tag_id=42, now=100.0)
+    wizard.update([], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.0)
+    det = {
+        "tag_id": 42,
+        "pose_valid": True,
+        # Deliberately inconsistent with pixels, matching the field failure.
+        "T_cameraRos_tag": np.array([
+            [1.0, 0.0, 0.0, 0.50],
+            [0.0, 1.0, 0.0, 0.50],
+            [0.0, 0.0, 1.0, 2.00],
+            [0.0, 0.0, 0.0, 1.00],
+        ]),
+        "corners_px": [430, 220, 450, 220, 450, 240, 430, 240],
+    }
+    _, cmd, _ = wizard.update([det], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.05)
+    assert wizard.centering_axis == "horizontal"
+    assert cmd[0] == 0.0 and cmd[1] < 0.0
+
+    det["corners_px"] = [250, 220, 270, 220, 270, 240, 250, 240]
+    _, cmd, _ = wizard.update([det], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.10)
+    assert wizard.centering_axis == "horizontal"
+    assert cmd[0] == 0.0 and cmd[1] > 0.0
+
+
+def test_centering_auto_reverses_an_axis_when_observed_error_grows():
+    wizard = TagCalibrationWizard(cx=320.0, cy=240.0, heartbeat_timeout_sec=3.0)
+    wizard.start(target_tag_id=42, now=100.0)
+    wizard.update([], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.0)
+    det = {
+        "tag_id": 42,
+        "pose_valid": True,
+        "T_cameraRos_tag": np.eye(4),
+        "corners_px": [390, 230, 410, 230, 410, 250, 390, 250],
+    }
+    _, cmd_before, _ = wizard.update([det], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.05)
+    det["corners_px"] = [400, 230, 420, 230, 420, 250, 400, 250]
+    _, cmd_after, _ = wizard.update([det], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.85)
+    assert cmd_before[1] < 0.0
+    assert cmd_after[1] > 0.0
+    assert wizard.centering_direction_corrections == 1
 
 def test_full_calibration_flow_to_completion():
     K = np.array([[600., 0., 320.], [0., 600., 240.], [0., 0., 1.]], dtype=np.float64)
@@ -176,6 +220,9 @@ def test_full_calibration_flow_to_completion():
     }
 
     t += 0.05
+    state, cmd, msg = wizard.update([det_centered], False, (1.0, 2.0, 0.0), K, dist, T_base_cam, now=t)
+    assert state == WizardState.FINE_CENTERING
+    t += 0.25
     state, cmd, msg = wizard.update([det_centered], False, (1.0, 2.0, 0.0), K, dist, T_base_cam, now=t)
     assert state == WizardState.SETTLING
     assert cmd == (0.0, 0.0, 0.0)

@@ -5,7 +5,7 @@ Features:
   - Motion authority mutex (IDLE, MANUAL, ROUTE, TEST, CALIBRATION).
   - Safety leases with REST heartbeat timeout (0.5s period, 1.0s timeout).
   - Target loss watchdog (< 0.25s during active servoing).
-  - Visual servoing to center tag in image with correct coordinate signs (+x forward, +y left).
+  - Visual servoing to the geometric image centre (+x forward, +y left).
   - Mechanical oscillation settling delay (>= 0.8s) and stationary verification (|v_i| < 0.005 m/s).
   - Multi-frame stationary pose accumulation (>= 30 frames over >= 1.0s) with outlier rejection.
   - Safe speed clamps (max linear 0.04 m/s, max angular 0.15 rad/s).
@@ -140,7 +140,7 @@ class TagCalibrationWizard:
                  motion_manager: Optional[MotionAuthorityManager] = None,
                  cx: float = 320.0,
                  cy: float = 240.0,
-                 centering_tol_px: float = 25.0,
+                 centering_tol_px: float = 18.0,
                  target_loss_timeout_sec: float = 0.25,
                  heartbeat_timeout_sec: float = 1.0,
                  settling_delay_sec: float = 0.8,
@@ -176,8 +176,24 @@ class TagCalibrationWizard:
         self.centering_error_px: Optional[float] = None
         self.centering_axis_error_px: Optional[float] = None
         self.centering_command: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.centering_du_px: Optional[float] = None
+        self.centering_dv_px: Optional[float] = None
+        self.centering_forward_error_m: Optional[float] = None
+        self.centering_strafe_error_m: Optional[float] = None
+        self.centering_direction_corrections: int = 0
         self._axis_best_error_px: Optional[float] = None
         self._axis_last_progress_time: float = 0.0
+        self._best_total_error_px: Optional[float] = None
+        self._last_total_progress_time: float = 0.0
+        self._centered_since: Optional[float] = None
+        # Image bottom is robot +X and image right is robot -Y for the
+        # verified mounting. A short observed-error check can correct either
+        # sign once per run if the physical mounting does not match it.
+        self._axis_motion_sign = {"horizontal": -1.0, "vertical": 1.0}
+        self._axis_probe_axis: Optional[str] = None
+        self._axis_probe_error: Optional[float] = None
+        self._axis_probe_time: float = 0.0
+        self._axis_reversed_this_run = set()
 
         # Stationary frame collection
         self.collected_samples: List[Dict[str, Any]] = []
@@ -198,8 +214,20 @@ class TagCalibrationWizard:
         self.centering_error_px = None
         self.centering_axis_error_px = None
         self.centering_command = (0.0, 0.0, 0.0)
+        self.centering_du_px = None
+        self.centering_dv_px = None
+        self.centering_forward_error_m = None
+        self.centering_strafe_error_m = None
+        self.centering_direction_corrections = 0
         self._axis_best_error_px = None
         self._axis_last_progress_time = t
+        self._best_total_error_px = None
+        self._last_total_progress_time = t
+        self._centered_since = None
+        self._axis_probe_axis = None
+        self._axis_probe_error = None
+        self._axis_probe_time = t
+        self._axis_reversed_this_run.clear()
         self.collected_samples.clear()
         self.calibrated_tag_result = None
 
@@ -243,17 +271,6 @@ class TagCalibrationWizard:
           cmd_vel_tuple is (vx, vy, omega) in robot REP-103 frame (+x forward, +y left, +w CCW).
         """
         t = now if now is not None else time.monotonic()
-
-        # Always use the calibrated optical centre. The old 320x240 defaults
-        # are wrong for the 640x600 camera (current cy is about 293 px).
-        try:
-            if camera_matrix is not None and np.asarray(camera_matrix).shape == (3, 3):
-                cx = float(camera_matrix[0, 2])
-                cy = float(camera_matrix[1, 2])
-                if math.isfinite(cx) and math.isfinite(cy) and cx > 1.0 and cy > 1.0:
-                    self.cx, self.cy = cx, cy
-        except (TypeError, ValueError, IndexError):
-            pass
 
         # Check heartbeat timeout
         if self.state not in (WizardState.IDLE, WizardState.COMPLETED, WizardState.ABORTED):
@@ -309,6 +326,8 @@ class TagCalibrationWizard:
             dv = v_tag - self.cy
             pixel_dist = math.sqrt(du**2 + dv**2)
             self.centering_error_px = float(pixel_dist)
+            self.centering_du_px = float(du)
+            self.centering_dv_px = float(dv)
 
             # Check if 3D base-frame error is available
             T_c_tag = target_det.get("T_cameraRos_tag")
@@ -324,44 +343,76 @@ class TagCalibrationWizard:
                 except Exception:
                     use_3d = False
 
-            centered_by_3d = use_3d and (abs(e_fwd) <= 0.015 and abs(e_str) <= 0.015)
+            self.centering_forward_error_m = float(e_fwd) if use_3d else None
+            self.centering_strafe_error_m = float(e_str) if use_3d else None
 
-            if centered_by_3d:
-                # Centering target reached! Transition to SETTLING
-                self._transition_to(WizardState.SETTLING, t)
-                return self.state, (0.0, 0.0, 0.0), f"Base-to-tag planar error <= 15 mm ({pixel_dist:.1f}px). Entering settling delay."
+            # The camera overlay and the user both refer to the geometric
+            # frame centre. Do not mix this pixel objective with a separate
+            # 3-D threshold: that previously left one axis driving for 25 s
+            # even after its pixel error had already reached the target.
+            centered_by_pixel = abs(du) <= self.centering_tol_px and abs(dv) <= self.centering_tol_px
+            if centered_by_pixel:
+                if self._centered_since is None:
+                    self._centered_since = t
+                self.centering_axis = None
+                self.centering_axis_error_px = max(abs(du), abs(dv))
+                self.centering_command = (0.0, 0.0, 0.0)
+                if (t - self._centered_since) >= 0.20:
+                    self._transition_to(WizardState.SETTLING, t)
+                    return self.state, self.centering_command, (
+                        f"Target held inside +/-{self.centering_tol_px:.0f}px for 0.2s. Entering settling delay."
+                    )
+                return self.state, self.centering_command, "Target is centered; verifying stability..."
+            self._centered_since = None
 
             # Calculate centering velocity in REP-103 (+X forward, +Y left)
             if use_3d:
-                kp = 0.40
-                # The physical three-wheel base distorts low-speed diagonal
-                # commands. Centre one image axis at a time so the observed
-                # motion remains predictable and cannot steer away diagonally.
-                if self.centering_axis is None:
-                    self.centering_axis = "horizontal" if abs(du) >= abs(dv) else "vertical"
-                    self._axis_best_error_px = None
-                    self._axis_last_progress_time = t
-                elif self.centering_axis == "horizontal" and abs(e_str) <= 0.015:
-                    self.centering_axis = "vertical"
-                    self._axis_best_error_px = None
-                    self._axis_last_progress_time = t
-                elif self.centering_axis == "vertical" and abs(e_fwd) <= 0.015:
-                    self.centering_axis = "horizontal"
+                # Centre one image axis at a time. Select and finish axes by
+                # the same pixel errors that define success. If wheel
+                # asymmetry couples the axes, switch to whichever error is now
+                # dominant instead of blindly continuing the old command.
+                horizontal_error = abs(du)
+                vertical_error = abs(dv)
+                desired_axis = "horizontal" if horizontal_error >= vertical_error else "vertical"
+                current_error = horizontal_error if self.centering_axis == "horizontal" else vertical_error
+                other_error = vertical_error if self.centering_axis == "horizontal" else horizontal_error
+                if (self.centering_axis is None
+                        or current_error <= self.centering_tol_px
+                        or other_error > max(self.centering_tol_px, current_error * 1.35)):
+                    self.centering_axis = desired_axis
                     self._axis_best_error_px = None
                     self._axis_last_progress_time = t
 
+                signed_axis_error = du if self.centering_axis == "horizontal" else dv
+                axis_error_px = abs(signed_axis_error)
+
+                # Learn a reversed camera/motion sign from the real response.
+                # The check is delayed until the base has overcome its ramp.
+                if self._axis_probe_axis != self.centering_axis:
+                    self._axis_probe_axis = self.centering_axis
+                    self._axis_probe_error = float(signed_axis_error)
+                    self._axis_probe_time = t
+                elif (t - self._axis_probe_time) >= 0.75:
+                    probe = self._axis_probe_error
+                    same_side = probe is not None and signed_axis_error * probe > 0.0
+                    if (same_side and axis_error_px > abs(probe) + 5.0
+                            and self.centering_axis not in self._axis_reversed_this_run):
+                        self._axis_motion_sign[self.centering_axis] *= -1.0
+                        self._axis_reversed_this_run.add(self.centering_axis)
+                        self.centering_direction_corrections += 1
+                        self._axis_best_error_px = axis_error_px
+                        self._axis_last_progress_time = t
+                    self._axis_probe_error = float(signed_axis_error)
+                    self._axis_probe_time = t
+
+                # A minimum usable speed avoids the stepper dead zone; speed
+                # then increases smoothly with pixel error and remains capped.
+                speed = min(self.max_lin_vel, 0.018 + max(0.0, axis_error_px - self.centering_tol_px) * 0.00030)
+                direction = self._axis_motion_sign[self.centering_axis] * (1.0 if signed_axis_error > 0.0 else -1.0)
                 if self.centering_axis == "horizontal":
-                    vx = 0.0
-                    vy = max(-self.max_lin_vel, min(self.max_lin_vel, e_str * kp))
-                    if abs(e_str) < 0.010:
-                        vy = 0.0
-                    axis_error_px = abs(du)
+                    vx, vy = 0.0, direction * speed
                 else:
-                    vx = max(-self.max_lin_vel, min(self.max_lin_vel, e_fwd * kp))
-                    vy = 0.0
-                    if abs(e_fwd) < 0.010:
-                        vx = 0.0
-                    axis_error_px = abs(dv)
+                    vx, vy = direction * speed, 0.0
 
                 self.centering_axis_error_px = float(axis_error_px)
                 if self._axis_best_error_px is None or axis_error_px < self._axis_best_error_px - 1.0:
@@ -371,6 +422,18 @@ class TagCalibrationWizard:
                     self.abort(
                         f"Centering divergence on {self.centering_axis} axis: "
                         f"error grew from {self._axis_best_error_px:.1f}px to {axis_error_px:.1f}px"
+                    )
+                    self.centering_command = (0.0, 0.0, 0.0)
+                    return self.state, self.centering_command, self.abort_reason
+
+                if self._best_total_error_px is None or pixel_dist < self._best_total_error_px - 1.5:
+                    self._best_total_error_px = float(pixel_dist)
+                    self._last_total_progress_time = t
+                elif ((t - self._last_total_progress_time) > 4.0
+                      and pixel_dist > self._best_total_error_px + 10.0):
+                    self.abort(
+                        f"Centering is not converging: total error grew from "
+                        f"{self._best_total_error_px:.1f}px to {pixel_dist:.1f}px"
                     )
                     self.centering_command = (0.0, 0.0, 0.0)
                     return self.state, self.centering_command, self.abort_reason

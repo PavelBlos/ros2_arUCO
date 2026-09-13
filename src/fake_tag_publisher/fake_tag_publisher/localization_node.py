@@ -73,6 +73,8 @@ class LocalizationNode(Node):
         self.load_tags_config()
 
         # Camera Intrinsics and Extrinsics
+        self.camera_image_width = 640
+        self.camera_image_height = 480
         self.camera_matrix = np.array([[794.108, 0.0, 317.316], [0.0, 798.507, 293.119], [0.0, 0.0, 1.0]], dtype=np.float64)
         self.dist_coeffs = np.array([-0.400, -0.0655, -0.00376, 0.00322, 1.105], dtype=np.float64)
         self.load_camera_calibration()
@@ -87,8 +89,8 @@ class LocalizationNode(Node):
         self.motion_mgr = MotionAuthorityManager()
         self.wizard = TagCalibrationWizard(
             motion_manager=self.motion_mgr,
-            cx=float(self.camera_matrix[0, 2]),
-            cy=float(self.camera_matrix[1, 2]),
+            cx=self.camera_image_width / 2.0,
+            cy=self.camera_image_height / 2.0,
         )
         self.covis_graph = CovisibilityGraph()
 
@@ -645,6 +647,8 @@ class LocalizationNode(Node):
                         data = yaml.safe_load(f)
                     self.camera_matrix = np.array(data['camera_matrix'], dtype=np.float64).reshape(3, 3)
                     self.dist_coeffs = np.array(data['distortion_coefficients'], dtype=np.float64)
+                    self.camera_image_width = int(data.get('image_width', self.camera_image_width))
+                    self.camera_image_height = int(data.get('image_height', self.camera_image_height))
                     if self.camera_matrix.shape != (3, 3) or not np.all(np.isfinite(self.camera_matrix)):
                         raise ValueError("camera_matrix must be a finite 3x3 matrix")
                     self.camera_calibration_path = os.path.abspath(p)
@@ -686,10 +690,12 @@ class LocalizationNode(Node):
         data = self.camera_calibration_session.apply(target)
         self.camera_matrix = np.array(data["camera_matrix"], dtype=np.float64).reshape(3, 3)
         self.dist_coeffs = np.array(data["distortion_coefficients"], dtype=np.float64)
+        self.camera_image_width = int(data["image_width"])
+        self.camera_image_height = int(data["image_height"])
         self.camera_calibration_path = os.path.abspath(target)
         self.camera_calibration_valid = True
-        self.wizard.cx = float(self.camera_matrix[0, 2])
-        self.wizard.cy = float(self.camera_matrix[1, 2])
+        self.wizard.cx = self.camera_image_width / 2.0
+        self.wizard.cy = self.camera_image_height / 2.0
         self.map_odom_initialized = False
         msg = String()
         msg.data = self.camera_calibration_path
@@ -2677,6 +2683,12 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                     "centering_error_px": wiz.centering_error_px,
                     "centering_axis_error_px": wiz.centering_axis_error_px,
                     "centering_command": list(wiz.centering_command),
+                    "centering_du_px": wiz.centering_du_px,
+                    "centering_dv_px": wiz.centering_dv_px,
+                    "centering_target_px": [wiz.cx, wiz.cy],
+                    "centering_forward_error_m": wiz.centering_forward_error_m,
+                    "centering_strafe_error_m": wiz.centering_strafe_error_m,
+                    "centering_direction_corrections": wiz.centering_direction_corrections,
                     "calibrated_result": wiz.calibrated_tag_result
                 }
             self.send_response(200)
@@ -4901,7 +4913,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     if (data.state === 'FINE_CENTERING') {
                         const axis = data.centering_axis === 'horizontal' ? 'по горизонтали' : 'по вертикали';
                         const err = Number.isFinite(data.centering_axis_error_px) ? `, ошибка ${data.centering_axis_error_px.toFixed(1)} px` : '';
-                        diag.textContent = `Центрирование ${axis}${err} (${data.elapsed_s}s)`;
+                        const du = Number.isFinite(data.centering_du_px) ? data.centering_du_px.toFixed(1) : '—';
+                        const dv = Number.isFinite(data.centering_dv_px) ? data.centering_dv_px.toFixed(1) : '—';
+                        const corrected = data.centering_direction_corrections ? `, коррекций направления: ${data.centering_direction_corrections}` : '';
+                        diag.textContent = `Центрирование ${axis}${err}; dx=${du}, dy=${dv} px${corrected} (${data.elapsed_s}s)`;
                     } else if (data.state === 'STATIONARY_SOLVE') {
                         diag.textContent = `Сбор статических кадров: ${data.samples_count}/30`;
                     } else if (data.state === 'COMPLETED') {
