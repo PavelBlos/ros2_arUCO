@@ -257,6 +257,15 @@ class LocalizationNode(Node):
         # Таймер автоматического снятия тока с обмоток при отсутствии команд 2 секунды (5 Гц)
         self.power_watchdog_timer = self.create_timer(0.2, self.check_motor_power_watchdog)
 
+        # UPS HAT telemetry. This reads the same I2C registers as ~/scripts/bat.py,
+        # but keeps the I2C operation out of HTTP request handlers.
+        self._battery_lock = threading.Lock()
+        self._battery_status = {"available": False, "percent": None, "voltage_v": None,
+                                "current_ma": None, "charging": False, "external_power": False,
+                                "updated_at": 0.0}
+        self.battery_timer = self.create_timer(5.0, self.refresh_battery_status)
+        self.refresh_battery_status()
+
         # Телеметрия и мониторинг свежести данных
         self.last_esp32_odom_time = 0.0
         self.last_pose_publish_time = 0.0
@@ -276,6 +285,40 @@ class LocalizationNode(Node):
         self.start_web_server()
 
         self.get_logger().info('Localization node started successfully (Multi-tag Data Fusion + ESP32 API + Autopilot Engine)')
+
+    def refresh_battery_status(self):
+        """Read UPS HAT 0x2d using the register layout from scripts/bat.py."""
+        status = {"available": False, "percent": None, "voltage_v": None,
+                  "current_ma": None, "charging": False, "external_power": False,
+                  "updated_at": time.time()}
+        try:
+            import smbus
+            bus = smbus.SMBus(1)
+            voltage_mv = (bus.read_byte_data(0x2D, 0x21) << 8) + bus.read_byte_data(0x2D, 0x20)
+            current_ma = (bus.read_byte_data(0x2D, 0x23) << 8) + bus.read_byte_data(0x2D, 0x22)
+            if current_ma > 32767:
+                current_ma -= 65536
+            cells_mv = [(bus.read_byte_data(0x2D, reg + 1) << 8) + bus.read_byte_data(0x2D, reg)
+                        for reg in range(0x30, 0x38, 2)]
+            flags = bus.read_byte_data(0x2D, 0x02)
+            cell_voltage_v = sum(cells_mv) / len(cells_mv) / 1000.0
+            percent = max(0.0, min(100.0, ((cell_voltage_v - 3.0) / 1.2) * 100.0))
+            status.update({"available": True, "percent": round(percent),
+                           "voltage_v": round(voltage_mv / 1000.0, 2),
+                           "current_ma": abs(current_ma), "charging": bool(flags & 0x80),
+                           "external_power": bool(flags & 0x20)})
+        except Exception:
+            # The web UI stays usable on machines without the UPS HAT.
+            pass
+        with self._battery_lock:
+            self._battery_status = status
+
+    def get_battery_status(self):
+        with self._battery_lock:
+            status = dict(self._battery_status)
+        updated_at = status.get("updated_at", 0.0)
+        status["age_s"] = round(max(0.0, time.time() - updated_at), 1) if updated_at else None
+        return status
 
     def start_run_logging(self, run_id=None):
         with self.run_logger_lock:
@@ -2352,6 +2395,13 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(resp).encode('utf-8'))
 
+        elif self.path.startswith('/api/battery'):
+            node = self.server.node
+            if hasattr(node, 'get_battery_status'):
+                self._send_json(200, node.get_battery_status())
+            else:
+                self._send_json(200, {"available": False, "percent": None})
+
         elif self.path.startswith('/api/health'):
             now_t = time.time()
             node = self.server.node
@@ -2859,6 +2909,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             background: #2ea043;
             box-shadow: 0 0 8px #2ea043;
         }
+        .battery-badge {
+            color: #cbd5e1;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.2px;
+            text-transform: none;
+            white-space: nowrap;
+        }
         .video-toggle-btn {
             background: transparent;
             border: 1px solid rgba(255, 255, 255, 0.1);
@@ -3267,6 +3325,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <div class="video-title">
                         <span class="video-dot"></span>
                         Камера (ArUco)
+                        <span class="battery-badge" id="battery-status" title="Заряд UPS HAT">🔋 —</span>
                     </div>
                     <button class="video-toggle-btn" id="btn-toggle-cam" title="Свернуть / Развернуть">▼</button>
                 </div>
@@ -4408,6 +4467,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch (e) { addLog(`Ошибка параметров: ${e.message}`); }
         }
 
+        async function fetchBatteryStatus() {
+            const badge = document.getElementById('battery-status');
+            if (!badge) return;
+            try {
+                const res = await fetch('/api/battery');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                if (!data.available) {
+                    badge.textContent = '🔋 нет данных';
+                    badge.style.color = '#8b9bb4';
+                    return;
+                }
+                const percent = Number(data.percent);
+                const voltage = Number(data.voltage_v).toFixed(2);
+                const current = Math.round(Number(data.current_ma));
+                const icon = data.charging && data.external_power ? '⚡' : '🔋';
+                badge.textContent = `${icon} ${percent}% · ${voltage} В · ${current} мА`;
+                badge.style.color = percent <= 20 ? '#ff5c5c' : (percent <= 45 ? '#f0b429' : '#66fcf1');
+            } catch (e) {
+                badge.textContent = '🔋 нет данных';
+                badge.style.color = '#8b9bb4';
+            }
+        }
+
         async function fetchTagRegistry() {
             try {
                 const res = await fetch('/api/tags');
@@ -4636,8 +4719,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         fetchTagRegistry();
         fetchPhysicalSettings();
+        fetchBatteryStatus();
         setInterval(fetchTagRegistry, 2000);
         setInterval(pollWizardStatus, 400);
+        setInterval(fetchBatteryStatus, 5000);
 
         // Старт
         resizeCanvas();
