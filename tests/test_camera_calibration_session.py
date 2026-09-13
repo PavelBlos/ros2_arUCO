@@ -20,6 +20,21 @@ def test_a4_board_matches_default_calibration_pattern():
     assert svg.count('<rect x=') == 32  # black cells in a 9x7 board
 
 
+def test_cancel_is_not_overwritten_by_frame_finishing(monkeypatch):
+    session = CameraCalibrationSession()
+    session.start()
+
+    def finish_after_cancel(*args, **kwargs):
+        session.cancel()
+        return False, None
+
+    monkeypatch.setattr(cv2, "findChessboardCorners", finish_after_cancel)
+    session.process_frame(np.zeros((480, 640, 3), dtype=np.uint8))
+    status = session.status()
+    assert status["state"] == "cancelled"
+    assert "остановлена" in status["guidance"].lower()
+
+
 def test_solve_and_atomically_apply_camera_calibration(tmp_path):
     session = CameraCalibrationSession()
     session.start(required_frames=25)

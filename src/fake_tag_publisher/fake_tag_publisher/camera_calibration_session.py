@@ -117,6 +117,9 @@ class CameraCalibrationSession:
         sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
         with self._lock:
+            # The user may have cancelled while OpenCV was processing this frame.
+            if self.state != "collecting":
+                return False
             self.board_detected = bool(found)
             self.sharpness = round(sharpness, 1)
             self.image_size = (int(gray.shape[1]), int(gray.shape[0]))
