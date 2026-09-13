@@ -303,11 +303,25 @@ class MultiTagFusion:
             x1, y1, yaw1 = c1["base_pose_se2"]
             x2, y2, yaw2 = c2["base_pose_se2"]
             
-            d_m12, _ = compute_mahalanobis_distance(x1, y1, yaw1, c1["cov_vis"], x2, y2, yaw2, c2["cov_vis"])
+            d_m12, pair_error = compute_mahalanobis_distance(
+                x1, y1, yaw1, c1["cov_vis"], x2, y2, yaw2, c2["cov_vis"]
+            )
+            pair_diagnostics = {
+                "tag_ids": [c1["tag_id"], c2["tag_id"]],
+                "candidate_poses": {
+                    c1["tag_id"]: [float(x1), float(y1), float(yaw1)],
+                    c2["tag_id"]: [float(x2), float(y2), float(yaw2)],
+                },
+                "delta": [float(v) for v in pair_error],
+                "mahalanobis": float(d_m12),
+                "threshold": float(math.sqrt(CHI2_3_95)),
+            }
             
             if d_m12 <= math.sqrt(CHI2_3_95):
                 # Consistent! Proceed to joint refinement across both
-                return self._solve_joint_pnp(candidate_poses, camera_matrix, dist_coeffs, T_base_cam)
+                result = self._solve_joint_pnp(candidate_poses, camera_matrix, dist_coeffs, T_base_cam)
+                result["pair_diagnostics"] = pair_diagnostics
+                return result
             else:
                 # Conflict between the two tags!
                 if pred_odom_cov is not None:
@@ -328,7 +342,8 @@ class MultiTagFusion:
                             "rejection_reasons": {c2["tag_id"]: f"conflict_mahalanobis_{d2_pred:.2f}"},
                             "reproj_rms_px": float(c1["cand"]["detection"].get("reproj_err", 0.0)),
                             "multi_tag_used": False,
-                            "covariance": c1["cov_vis"]
+                            "covariance": c1["cov_vis"],
+                            "pair_diagnostics": pair_diagnostics,
                         }
                     elif d2_pred <= math.sqrt(CHI2_3_95) and d1_pred > math.sqrt(CHI2_3_999):
                         return {
@@ -339,7 +354,8 @@ class MultiTagFusion:
                             "rejection_reasons": {c1["tag_id"]: f"conflict_mahalanobis_{d1_pred:.2f}"},
                             "reproj_rms_px": float(c2["cand"]["detection"].get("reproj_err", 0.0)),
                             "multi_tag_used": False,
-                            "covariance": c2["cov_vis"]
+                            "covariance": c2["cov_vis"],
+                            "pair_diagnostics": pair_diagnostics,
                         }
 
                 # Unresolved conflict: hold odometry, flag multi_tag_conflict!
@@ -354,7 +370,8 @@ class MultiTagFusion:
                     },
                     "reproj_rms_px": 999.0,
                     "multi_tag_used": False,
-                    "covariance": pred_odom_cov if pred_odom_cov is not None else np.diag([0.1**2, 0.1**2, 0.1**2])
+                    "covariance": pred_odom_cov if pred_odom_cov is not None else np.diag([0.1**2, 0.1**2, 0.1**2]),
+                    "pair_diagnostics": pair_diagnostics,
                 }
 
         # 5. Handle N >= 3: Tag-level hypothesis consensus

@@ -114,6 +114,9 @@ def test_two_tag_conflict_holds_odometry(test_setup):
     res = fusion.process_frame([det1, det2], active_db, K, dist, T_base_cam, odom_at_stamp=(0.0, 0.0, 0.0))
     assert res["status"] == "multi_tag_conflict"
     assert res["fused_base_pose"] is None  # DO NOT MAKE A VISUAL JUMP!
+    assert res["pair_diagnostics"]["tag_ids"] == ["1", "2"]
+    assert res["pair_diagnostics"]["mahalanobis"] > res["pair_diagnostics"]["threshold"]
+    assert len(res["pair_diagnostics"]["delta"]) == 3
 
 def test_joint_pnp_reduces_noise(test_setup):
     """

@@ -98,6 +98,7 @@ class LocalizationNode(Node):
         self.latest_detections = []
         self.latest_detections_stamp = 0.0
         self._last_conflict_warn_time = 0.0
+        self.last_fusion_diagnostics = {"status": "not_started"}
         self.detector_revision = 0
 
         # Timers: 25 Hz for Calibration Wizard FSM, 20 Hz for Dynamic Camera TF broadcast
@@ -930,6 +931,14 @@ class LocalizationNode(Node):
                 frame_revision=frame_rev,
                 frame_sha256=frame_sha
             )
+            self.last_fusion_diagnostics = {
+                "status": fusion_res.get("status", "unknown"),
+                "inlier_ids": fusion_res.get("inlier_ids", []),
+                "rejected_ids": fusion_res.get("rejected_ids", []),
+                "rejection_reasons": fusion_res.get("rejection_reasons", {}),
+                "reproj_rms_px": float(fusion_res.get("reproj_rms_px", 0.0)),
+                "pair": fusion_res.get("pair_diagnostics"),
+            }
 
             # Record in Co-Visibility Graph
             self.covis_graph.record_frame_observations(
@@ -1002,7 +1011,11 @@ class LocalizationNode(Node):
             elif fusion_res.get("status") == "multi_tag_conflict":
                 now_t = time.time()
                 if now_t - self._last_conflict_warn_time >= 1.0:
-                    self.get_logger().warn("⚠️ Multi-tag conflict detected between visible tags! Holding dead reckoning.")
+                    pair = fusion_res.get("pair_diagnostics") or {}
+                    self.get_logger().warn(
+                        "⚠️ Multi-tag conflict detected between visible tags; "
+                        f"pair={pair}. Holding dead reckoning."
+                    )
                     self._last_conflict_warn_time = now_t
 
         except Exception as e:
@@ -2744,6 +2757,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 },
                 "is_nav_locked": is_nav_locked,
                 "visual_jump_pending": getattr(node, 'visual_jump_pending', False)
+                ,"fusion_diagnostics": getattr(node, 'last_fusion_diagnostics', {})
             }
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
