@@ -206,6 +206,36 @@ def test_centering_measures_rotated_camera_response_before_servoing():
     assert cmd[0] != 0.0
     assert cmd[1] != 0.0
 
+def test_response_probe_retries_once_instead_of_aborting_on_small_motion():
+    wizard = TagCalibrationWizard(cx=320.0, cy=240.0, heartbeat_timeout_sec=3.0)
+    wizard.start(target_tag_id=42, now=100.0)
+    wizard.state = WizardState.FINE_CENTERING
+    wizard.centering_phase = "probe_strafe_settle"
+    wizard._probe_start_uv = np.array([320.0, 240.0])
+    wizard._probe_forward_delta = np.array([5.0, 0.0])
+    wizard._probe_phase_start = 100.0
+
+    cmd, message = wizard._update_response_probe(321.0, 240.0, 100.36)
+
+    assert wizard.state == WizardState.FINE_CENTERING
+    assert wizard.centering_phase == "probe_strafe"
+    assert wizard._probe_strafe_retries == 1
+    assert cmd == (0.0, 0.0, 0.0)
+    assert "retrying" in message
+
+
+def test_successful_response_matrix_is_reused_for_next_marker():
+    wizard = TagCalibrationWizard(cx=320.0, cy=240.0, heartbeat_timeout_sec=3.0)
+    learned = np.array([[0.8, 0.2], [-0.6, 0.98]])
+    wizard._cached_response_matrix = learned.copy()
+
+    ok, _ = wizard.start(target_tag_id=43, now=200.0)
+
+    assert ok is True
+    assert wizard.centering_phase == "servo"
+    assert wizard._response_matrix == pytest.approx(learned)
+
+
 def test_full_calibration_flow_to_completion():
     K = np.array([[600., 0., 320.], [0., 600., 240.], [0., 0., 1.]], dtype=np.float64)
     dist = np.zeros(5)

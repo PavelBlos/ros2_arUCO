@@ -191,12 +191,16 @@ class TagCalibrationWizard:
         # 2x2 mapping from body translation to image motion at the start of a
         # run instead of assuming that image and body axes are parallel.
         self._response_matrix: Optional[np.ndarray] = None
+        self._cached_response_matrix: Optional[np.ndarray] = None
         self._probe_start_uv: Optional[np.ndarray] = None
         self._probe_forward_delta: Optional[np.ndarray] = None
         self._probe_phase_start: float = 0.0
         self._probe_speed: float = min(0.030, self.max_lin_vel)
         self._probe_motion_sec: float = 0.65
         self._probe_settle_sec: float = 0.35
+        self._probe_retry_limit: int = 1
+        self._probe_forward_retries: int = 0
+        self._probe_strafe_retries: int = 0
 
         # Stationary frame collection
         self.collected_samples: List[Dict[str, Any]] = []
@@ -222,16 +226,24 @@ class TagCalibrationWizard:
         self.centering_forward_error_m = None
         self.centering_strafe_error_m = None
         self.centering_direction_corrections = 0
-        self.centering_phase = "probe_forward"
-        self.centering_response_matrix = None
+        cached = self._cached_response_matrix
+        if cached is not None and np.all(np.isfinite(cached)) and abs(float(np.linalg.det(cached))) >= 0.25:
+            self._response_matrix = cached.copy()
+            self.centering_response_matrix = cached.tolist()
+            self.centering_phase = "servo"
+        else:
+            self._response_matrix = None
+            self.centering_response_matrix = None
+            self.centering_phase = "probe_forward"
         self.centering_trace.clear()
         self._best_total_error_px = None
         self._last_total_progress_time = t
         self._centered_since = None
-        self._response_matrix = None
         self._probe_start_uv = None
         self._probe_forward_delta = None
         self._probe_phase_start = t
+        self._probe_forward_retries = 0
+        self._probe_strafe_retries = 0
         self.collected_samples.clear()
         self.calibrated_tag_result = None
 
@@ -618,7 +630,8 @@ class TagCalibrationWizard:
             if self._probe_start_uv is None:
                 self._probe_start_uv = uv.copy()
                 self._probe_phase_start = now
-            if (now - self._probe_phase_start) < self._probe_motion_sec:
+            probe_duration = self._probe_motion_sec + 0.35 * self._probe_forward_retries
+            if (now - self._probe_phase_start) < probe_duration:
                 return (self._probe_speed, 0.0, 0.0), "Measuring camera response: short forward motion"
             self.centering_phase = "probe_forward_settle"
             self._probe_phase_start = now
@@ -629,7 +642,13 @@ class TagCalibrationWizard:
                 return zero, "Waiting after forward response probe"
             delta = uv - self._probe_start_uv
             if float(np.linalg.norm(delta)) < 3.0:
-                self.abort("Forward response probe moved the tag by less than 3 px")
+                if self._probe_forward_retries < self._probe_retry_limit:
+                    self._probe_forward_retries += 1
+                    self._probe_start_uv = uv.copy()
+                    self._probe_phase_start = now
+                    self.centering_phase = "probe_forward"
+                    return zero, "Forward response was too small; retrying with a longer probe"
+                self.abort("Forward response probe stayed below 3 px after retry")
                 return zero, self.abort_reason
             self._probe_forward_delta = delta
             self._probe_start_uv = uv.copy()
@@ -638,7 +657,8 @@ class TagCalibrationWizard:
             return zero, "Forward response measured; starting left-motion probe"
 
         if self.centering_phase == "probe_strafe":
-            if (now - self._probe_phase_start) < self._probe_motion_sec:
+            probe_duration = self._probe_motion_sec + 0.35 * self._probe_strafe_retries
+            if (now - self._probe_phase_start) < probe_duration:
                 return (0.0, self._probe_speed, 0.0), "Measuring camera response: short left motion"
             self.centering_phase = "probe_strafe_settle"
             self._probe_phase_start = now
@@ -649,7 +669,13 @@ class TagCalibrationWizard:
                 return zero, "Waiting after left-motion response probe"
             strafe_delta = uv - self._probe_start_uv
             if float(np.linalg.norm(strafe_delta)) < 3.0:
-                self.abort("Left-motion response probe moved the tag by less than 3 px")
+                if self._probe_strafe_retries < self._probe_retry_limit:
+                    self._probe_strafe_retries += 1
+                    self._probe_start_uv = uv.copy()
+                    self._probe_phase_start = now
+                    self.centering_phase = "probe_strafe"
+                    return zero, "Left-motion response was too small; retrying with a longer probe"
+                self.abort("Left-motion response probe stayed below 3 px after retry")
                 return zero, self.abort_reason
             forward_unit = self._probe_forward_delta / np.linalg.norm(self._probe_forward_delta)
             strafe_unit = strafe_delta / np.linalg.norm(strafe_delta)
@@ -661,6 +687,7 @@ class TagCalibrationWizard:
                 )
                 return zero, self.abort_reason
             self._response_matrix = response
+            self._cached_response_matrix = response.copy()
             self.centering_response_matrix = response.tolist()
             self.centering_phase = "servo"
             self._best_total_error_px = None

@@ -131,6 +131,8 @@ class LocalizationNode(Node):
         # Safety and Versioning
         self.is_nav_locked = False
         self.visual_jump_pending = False
+        self.anchor_reinit_pending = False
+        self.nav_lock_reason = ""
         self.firmware_version = "FastAccelStepper-v2.0"
         self.git_commit = self._get_git_commit()
         
@@ -229,6 +231,7 @@ class LocalizationNode(Node):
         self.current_wp_idx = 0
         self.autopilot_thread = None
         self.autopilot_active = False
+        self.route_error = ""
 
         # Параметры векторного контроллера (Cross-track follower & Corner speed profile)
         self.ap_cruise_speed = 0.14       # Крейсерская скорость по прямой (м/с)
@@ -917,6 +920,7 @@ class LocalizationNode(Node):
                 if jump_dist > 0.15 and is_moving and self.map_odom_initialized:
                     self.is_nav_locked = True
                     self.visual_jump_pending = True
+                    self.nav_lock_reason = "Visual localization jump detected"
                     self.drive_robot(0.0, 0.0, 0.0)
                     self.get_logger().warn(
                         f"⚠️ Visual jump {jump_dist:.2f}m > 0.15m while in motion! "
@@ -942,7 +946,13 @@ class LocalizationNode(Node):
                     if self.visual_jump_pending and not is_moving:
                         self.visual_jump_pending = False
                         self.is_nav_locked = False
+                        self.nav_lock_reason = ""
                         self.get_logger().info("✅ Stop-and-Reanchor completed cleanly at zero velocity. Navigation unlocked.")
+                    elif self.anchor_reinit_pending and not is_moving:
+                        self.anchor_reinit_pending = False
+                        self.is_nav_locked = False
+                        self.nav_lock_reason = ""
+                        self.get_logger().info("✅ Pose initialized from the new anchor at zero velocity. Navigation unlocked.")
 
                 self.tracking_mode = "aruco_multi" if fusion_res.get("multi_tag_used") else "aruco_single"
                 self.odom_covariance = np.asarray(fusion_res.get("covariance", self.odom_covariance), dtype=float)
@@ -1089,7 +1099,10 @@ class LocalizationNode(Node):
             self.delta_map_odom_y = 0.0
             self.delta_map_odom_yaw = 0.0
             self.fused_initialized = True
-            self.map_odom_initialized = True
+            # Wheel odometry establishes an odom-frame pose only.  The map
+            # frame is not valid until a confirmed, synchronized tag supplies
+            # the first map->odom transform.
+            self.map_odom_initialized = False
         else:
             # Преобразование SE(2): T_map_base = T_map_odom @ T_odom_base
             self.fused_x, self.fused_y, self.fused_yaw = compute_fused_pose_se2(
@@ -1159,6 +1172,7 @@ class LocalizationNode(Node):
         if hasattr(self, 'motion_mgr') and self.motion_mgr:
             if self.motion_mgr.current_mode == MotionAuthorityMode.ESTOP:
                 self.is_nav_locked = True
+                self.nav_lock_reason = "E-STOP is active"
                 if self.robot and self.robot.is_connected:
                     try:
                         self.robot.emergency_stop()
@@ -1175,7 +1189,7 @@ class LocalizationNode(Node):
                     return False
 
         # 2. Блокировка навигации (Stop-and-Reanchor)
-        if self.is_nav_locked and source_mode not in (MotionAuthorityMode.CALIBRATION, MotionAuthorityMode.MANUAL):
+        if is_motion and self.is_nav_locked and source_mode not in (MotionAuthorityMode.CALIBRATION, MotionAuthorityMode.MANUAL):
             return False
 
         # Автоматическое включение питания обмоток и обновление таймера простоя при команде движения
@@ -1246,8 +1260,26 @@ class LocalizationNode(Node):
 
     def start_route(self):
         """Запуск автономного движения по маршруту"""
+        self.route_error = ""
         if not self.route_waypoints or len(self.route_waypoints) < 2:
+            self.route_error = "Маршрут должен содержать не менее двух точек"
             self.get_logger().warn("Невозможно запустить маршрут: список точек пуст или содержит менее 2 точек!")
+            return False
+        if not self.tag_registry.anchor_confirmed:
+            self.route_state = "blocked"
+            self.route_error = "Якорная метка не назначена"
+            self.notify_ui_event()
+            return False
+        if self.is_nav_locked or not self.map_odom_initialized:
+            self.route_state = "blocked"
+            self.route_error = self.nav_lock_reason or "Локализация не привязана к подтверждённому якорю"
+            self.notify_ui_event()
+            self.get_logger().warn(f"Autopilot start rejected: {self.route_error}")
+            return False
+        if not (self.robot and self.robot.is_connected):
+            self.route_state = "blocked"
+            self.route_error = "Контроллер ESP32 не подключён"
+            self.notify_ui_event()
             return False
             
         ok, reason = self.motion_mgr.request_lease(MotionAuthorityMode.ROUTE)
@@ -1349,6 +1381,14 @@ class LocalizationNode(Node):
         while self.autopilot_active and self.route_state == "running":
             t_loop_start = pytime.time()
             self.last_motion_cmd_time = t_loop_start
+
+            if self.is_nav_locked:
+                self.route_state = "blocked"
+                self.route_error = self.nav_lock_reason or "Навигация заблокирована"
+                self.autopilot_active = False
+                self.notify_ui_event()
+                self.get_logger().warn(f"Autopilot halted: {self.route_error}")
+                break
 
             rx = float(self.fused_x)
             ry = float(self.fused_y)
@@ -1466,7 +1506,13 @@ class LocalizationNode(Node):
             smooth_w = smooth_w * (1.0 - alpha) + w * alpha
 
             # 11. Отправка команды движения
-            self.drive_robot(smooth_forward, smooth_strafe, smooth_w, source_mode=MotionAuthorityMode.ROUTE)
+            if not self.drive_robot(smooth_forward, smooth_strafe, smooth_w, source_mode=MotionAuthorityMode.ROUTE):
+                self.route_state = "blocked"
+                self.route_error = "Команда движения отклонена системой безопасности"
+                self.autopilot_active = False
+                self.notify_ui_event()
+                self.get_logger().warn(f"Autopilot halted: {self.route_error}")
+                break
 
             # 12. Логирование телеметрии забега
             rec = {
@@ -1507,7 +1553,8 @@ class LocalizationNode(Node):
             "total_wps": int(len(self.route_waypoints)),
             "tracking_mode": self.tracking_mode,
             "esp32_connected": bool(self.robot and self.robot.is_connected),
-            "motor_power": self.motor_power_state
+            "motor_power": self.motor_power_state,
+            "route_error": getattr(self, 'route_error', '')
         }
         with sse_clients_lock:
             for q in sse_clients:
@@ -2039,6 +2086,8 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                     node.map_odom_initialized = False
                     node.is_nav_locked = True
                     node.visual_jump_pending = False
+                    node.anchor_reinit_pending = False
+                    node.nav_lock_reason = "Нужно назначить и увидеть новый якорь"
                 node.publish_tag_map_update()
                 node.notify_ui_event()
                 self._send_json(200, {
@@ -2161,8 +2210,15 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 return
 
             try:
+                node.stop_route()
+                node.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.MANUAL)
                 rev, sha = reg.set_anchor_tag(int(tag_id), confirm=True, size_mm=size_mm, ceiling_z_m=ceiling_z_m, expected_revision=expected_rev)
                 node.tags_db = reg.get_active_confirmed_tags()
+                node.map_odom_initialized = False
+                node.is_nav_locked = True
+                node.visual_jump_pending = False
+                node.anchor_reinit_pending = True
+                node.nav_lock_reason = "Ожидание привязки координат по новому якорю"
                 node.publish_tag_map_update()
                 node.notify_ui_event()
                 self._send_json(200, {"status": "ok", "message": f"Anchor tag {tag_id} confirmed", "revision": rev, "sha256": sha})
@@ -2370,11 +2426,11 @@ class WebServerHandler(SimpleHTTPRequestHandler):
 
         elif self.path.startswith('/start_route'):
             success = self.server.node.start_route()
-            self.send_response(200)
+            self.send_response(200 if success else 409)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "success" if success else "error", "route_state": self.server.node.route_state}).encode('utf-8'))
+            self.wfile.write(json.dumps({"status": "success" if success else "error", "route_state": self.server.node.route_state, "error": getattr(self.server.node, 'route_error', '')}).encode('utf-8'))
 
         elif self.path.startswith('/pause_route'):
             success = self.server.node.pause_route()
@@ -2436,12 +2492,12 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
             
         elif self.path.startswith('/start_work'):
-            self.server.node.start_route()
-            self.send_response(200)
+            success = self.server.node.start_route()
+            self.send_response(200 if success else 409)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({"status": "success"}).encode('utf-8'))
+            self.wfile.write(json.dumps({"status": "success" if success else "error", "error": getattr(self.server.node, 'route_error', '')}).encode('utf-8'))
             
         elif self.path.startswith('/drive'):
             from urllib.parse import urlparse, parse_qs
@@ -4084,6 +4140,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     } else if (rState === 'finished') {
                         badge.textContent = "ФИНИШ";
                         badge.style.color = "#3498db";
+                    } else if (rState === 'blocked') {
+                        badge.textContent = "ЗАБЛОКИРОВАН";
+                        badge.style.color = "#e74c3c";
                     } else {
                         badge.textContent = "ОЖИДАНИЕ";
                         badge.style.color = "#8b9bb4";
@@ -4263,7 +4322,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     fetch(`/start_route`)
                         .then(r => r.json())
                         .then(resData => {
-                            addLog("▶ Автопилот запущен. Робот начинает движение по маршруту!");
+                            if (resData.status === 'success') {
+                                addLog("▶ Автопилот запущен. Робот начинает движение по маршруту!");
+                            } else {
+                                addLog(`Ошибка запуска автопилота: ${resData.error || 'движение заблокировано'}`);
+                            }
                         });
                 })
                 .catch(err => {

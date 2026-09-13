@@ -410,6 +410,23 @@ def test_api_anchor_wizard_status_and_confirm(mock_node):
     res_conf = json.loads(written_data[-1].decode('utf-8'))
     assert res_conf["status"] == "ok"
     assert mock_node.tag_registry.anchor_confirmed is True
+    assert mock_node.is_nav_locked is True
+    assert mock_node.anchor_reinit_pending is True
+    assert mock_node.map_odom_initialized is False
+
+
+def test_autopilot_refuses_to_claim_running_state_while_navigation_locked(mock_node):
+    mock_node.route_waypoints = [[0.0, 0.0], [0.2, 0.0]]
+    mock_node.path_s_accum = [0.0, 0.2]
+    mock_node.is_nav_locked = True
+    mock_node.map_odom_initialized = False
+    mock_node.nav_lock_reason = "Waiting for new anchor"
+    mock_node.tag_registry.set_anchor_tag(17, confirm=True)
+
+    assert mock_node.start_route() is False
+    assert mock_node.autopilot_active is False
+    assert mock_node.route_state == "blocked"
+    assert mock_node.route_error == "Waiting for new anchor"
 
 def test_api_calibration_abort_and_confirm(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)
