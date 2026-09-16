@@ -294,7 +294,7 @@ def test_api_settings_get_and_post(mock_node, tmp_path):
     update_payload = json.dumps({
         "settings": {
             "filter_alpha": 0.28,
-            "ap_cruise_speed": 0.12
+            "ap_cruise_speed": 0.10
         }
     }).encode('utf-8')
     handler.rfile = MagicMock()
@@ -308,7 +308,7 @@ def test_api_settings_get_and_post(mock_node, tmp_path):
     assert res_post["status"] == "ok"
     assert abs(res_post["settings"]["filter_alpha"] - 0.28) < 1e-4
     assert abs(mock_node.filter_alpha - 0.28) < 1e-4
-    assert abs(mock_node.ap_cruise_speed - 0.12) < 1e-4
+    assert abs(mock_node.ap_cruise_speed - 0.10) < 1e-4
 
     # 3. POST /api/settings flat payload
     update_payload_flat = json.dumps({

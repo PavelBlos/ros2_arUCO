@@ -257,15 +257,15 @@ class LocalizationNode(Node):
         self.resume_route_requested = False
 
         # Параметры векторного контроллера (Cross-track follower & Corner speed profile)
-        self.ap_cruise_speed = 0.10       # Крейсерская скорость по прямой (м/с)
-        self.ap_max_lin = 0.12
-        self.ap_min_lin = 0.015           # Минимальная скорость движения (м/с)
-        self.ap_goal_tol = 0.015          # Радиус попадания в цель (м)
-        self.ap_wp_tol = 0.03             # Радиус прохождения вершины угла для переключения сегмента (м)
+        self.ap_cruise_speed = 0.09       # Крейсерская скорость по прямой (м/с)
+        self.ap_max_lin = 0.11
+        self.ap_min_lin = 0.012           # Минимальная скорость движения (м/с)
+        self.ap_goal_tol = 0.010          # Радиус попадания в цель (м)
+        self.ap_wp_tol = 0.015            # Радиус прохождения вершины угла для переключения сегмента (м)
         self.ap_kp_cross = 1.20           # Пропорциональный коэффициент возврата на траекторию (1/с)
         self.ap_v_cross_max = 0.08        # Максимальная скорость боковой коррекции (м/с)
-        self.ap_brake_accel = 0.20        # Тормозное кинематическое замедление (м/с^2)
-        self.ap_turn_factor = 0.55        # Множитель скорости прохождения углов
+        self.ap_brake_accel = 0.16        # Тормозное кинематическое замедление (м/с^2)
+        self.ap_turn_factor = 0.25        # Множитель скорости прохождения углов
         self.ap_max_ang = 0.60            # Предельная угловая скорость вращения (рад/с)
         self.ap_kp_ang = 1.80             # Пропорциональный коэффициент ориентации
         self.ap_yaw_mode = "HOLD_INITIAL" # FREE, HOLD_INITIAL, PATH_TANGENT, FINAL_YAW
@@ -1547,6 +1547,7 @@ class LocalizationNode(Node):
         control_path_s = [0.0]
         speed_limit = min(self.ap_cruise_speed, self.ap_max_lin)
         control_corner_speeds = [speed_limit] * len(control_waypoints)
+        control_corner_angles = [0.0] * len(control_waypoints)
         for i in range(len(control_waypoints) - 1):
             segment_length = float(np.linalg.norm(
                 np.asarray(control_waypoints[i + 1]) - np.asarray(control_waypoints[i])
@@ -1560,6 +1561,7 @@ class LocalizationNode(Node):
                 turn_angle = float(np.arccos(np.clip(
                     np.dot(incoming / len_in, outgoing / len_out), -1.0, 1.0
                 )))
+                control_corner_angles[i] = turn_angle
                 if turn_angle > np.radians(15.0):
                     control_corner_speeds[i] = max(
                         self.ap_min_lin,
@@ -1613,13 +1615,31 @@ class LocalizationNode(Node):
             if seg_idx < total_wps - 2:
                 line_cross_error = abs(float(np.dot(ap, normal)))
                 is_first_connector = route_index_offset == 1 and seg_idx == 0
+                target_corner_angle = control_corner_angles[seg_idx + 1]
+                is_precision_corner = target_corner_angle >= np.radians(25.0)
                 reached_waypoint = (
                     dist_to_next_wp <= self.ap_goal_tol
                     if is_first_connector
-                    else ((t_param >= 0.95 and line_cross_error <= self.ap_wp_tol)
-                          or dist_to_next_wp <= self.ap_wp_tol)
+                    else (
+                        dist_to_next_wp <= self.ap_wp_tol
+                        if is_precision_corner
+                        else ((t_param >= 0.98 and line_cross_error <= self.ap_wp_tol)
+                              or dist_to_next_wp <= self.ap_wp_tol)
+                    )
                 )
                 if reached_waypoint:
+                    if is_first_connector or is_precision_corner:
+                        # Remove the previous segment's velocity before asking
+                        # the omni chassis to leave in a new direction.
+                        self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
+                        smooth_forward = smooth_strafe = smooth_w = 0.0
+                        pytime.sleep(0.15)
+                        verified_corner_error = float(np.hypot(
+                            p_b[0] - self.fused_x, p_b[1] - self.fused_y
+                        ))
+                        required_tolerance = self.ap_goal_tol if is_first_connector else self.ap_wp_tol
+                        if verified_corner_error > required_tolerance:
+                            continue
                     seg_idx += 1
                     self.current_seg_idx = max(0, seg_idx - route_index_offset)
                     self.current_wp_idx = max(0, seg_idx - route_index_offset)
@@ -1692,7 +1712,25 @@ class LocalizationNode(Node):
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
             terminal_radius = max(0.08, 2.0 * self.ap_wp_tol)
-            if seg_idx >= total_wps - 2 and finish_euclid <= terminal_radius:
+            target_corner_angle = control_corner_angles[seg_idx + 1]
+            precision_corner_capture = (
+                seg_idx < total_wps - 2
+                and target_corner_angle >= np.radians(25.0)
+                and dist_to_next_wp <= 0.07
+            )
+            if precision_corner_capture:
+                # A sharp polyline vertex cannot be followed accurately while
+                # carrying the old segment's velocity. Converge directly and
+                # slowly, then the transition gate above settles at the point.
+                v_map, _ = point_target_velocity(
+                    np.array([rx, ry], dtype=float),
+                    p_b,
+                    kp=1.0,
+                    max_speed=min(speed_limit, 0.035),
+                    min_speed=min(self.ap_min_lin, 0.008),
+                    stop_radius=self.ap_wp_tol,
+                )
+            elif seg_idx >= total_wps - 2 and finish_euclid <= terminal_radius:
                 # Close to the finish, aim directly at the endpoint and lower
                 # the speed continuously. This removes the visible tolerance-
                 # sized shortfall left by pure segment tracking.
@@ -1700,8 +1738,8 @@ class LocalizationNode(Node):
                     np.array([rx, ry], dtype=float),
                     np.array([fx, fy], dtype=float),
                     kp=1.2,
-                    max_speed=min(speed_limit, 0.05),
-                    min_speed=min(self.ap_min_lin, 0.010),
+                    max_speed=min(speed_limit, 0.04),
+                    min_speed=min(self.ap_min_lin, 0.008),
                     stop_radius=self.ap_goal_tol,
                 )
             elif t_param >= 1.0:
