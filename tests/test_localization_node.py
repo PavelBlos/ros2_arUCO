@@ -62,7 +62,10 @@ class MockNode:
 
 sys.modules['rclpy.node'].Node = MockNode
 import rclpy
-from localization_node import LocalizationNode, WebServerHandler, point_target_velocity
+from localization_node import (
+    LocalizationNode, WebServerHandler, point_target_velocity,
+    waypoint_capture_tolerance,
+)
 
 @pytest.fixture
 def mock_node(tmp_path):
@@ -469,6 +472,11 @@ def test_point_target_velocity_aims_at_waypoint_and_slows_near_it():
     assert np.linalg.norm(near_velocity) == pytest.approx(0.01)
     assert stopped_distance == pytest.approx(0.01)
     assert stopped == pytest.approx([0.0, 0.0])
+
+
+def test_first_connector_uses_same_strict_tolerance_for_capture_and_transition():
+    assert waypoint_capture_tolerance(True, 0.010, 0.015) == pytest.approx(0.010)
+    assert waypoint_capture_tolerance(False, 0.010, 0.015) == pytest.approx(0.015)
 
 def test_api_calibration_abort_and_confirm(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)

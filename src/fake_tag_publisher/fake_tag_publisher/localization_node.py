@@ -74,6 +74,11 @@ def point_target_velocity(current_xy, target_xy, kp, max_speed, min_speed, stop_
     ))
     return delta * (speed / distance), distance
 
+
+def waypoint_capture_tolerance(is_first_connector, goal_tolerance, waypoint_tolerance):
+    """Use one identical tolerance for capture control and its transition gate."""
+    return float(goal_tolerance if is_first_connector else waypoint_tolerance)
+
 class LocalizationNode(Node):
     def __init__(self):
         super().__init__('localization_node')
@@ -1610,15 +1615,18 @@ class LocalizationNode(Node):
             ap = np.array([rx, ry]) - p_a
             t_param = float(np.dot(ap, tangent) / seg_len)
             dist_to_next_wp = float(np.hypot(p_b[0] - rx, p_b[1] - ry))
+            is_first_connector = route_index_offset == 1 and seg_idx == 0
+            target_corner_angle = control_corner_angles[seg_idx + 1]
+            is_precision_corner = target_corner_angle >= np.radians(25.0)
+            capture_tolerance = waypoint_capture_tolerance(
+                is_first_connector, self.ap_goal_tol, self.ap_wp_tol
+            )
 
             # 2. Продвижение на следующий сегмент
             if seg_idx < total_wps - 2:
                 line_cross_error = abs(float(np.dot(ap, normal)))
-                is_first_connector = route_index_offset == 1 and seg_idx == 0
-                target_corner_angle = control_corner_angles[seg_idx + 1]
-                is_precision_corner = target_corner_angle >= np.radians(25.0)
                 reached_waypoint = (
-                    dist_to_next_wp <= self.ap_goal_tol
+                    dist_to_next_wp <= capture_tolerance
                     if is_first_connector
                     else (
                         dist_to_next_wp <= self.ap_wp_tol
@@ -1637,8 +1645,7 @@ class LocalizationNode(Node):
                         verified_corner_error = float(np.hypot(
                             p_b[0] - self.fused_x, p_b[1] - self.fused_y
                         ))
-                        required_tolerance = self.ap_goal_tol if is_first_connector else self.ap_wp_tol
-                        if verified_corner_error > required_tolerance:
+                        if verified_corner_error > capture_tolerance:
                             continue
                     seg_idx += 1
                     self.current_seg_idx = max(0, seg_idx - route_index_offset)
@@ -1712,10 +1719,9 @@ class LocalizationNode(Node):
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
             terminal_radius = max(0.08, 2.0 * self.ap_wp_tol)
-            target_corner_angle = control_corner_angles[seg_idx + 1]
             precision_corner_capture = (
                 seg_idx < total_wps - 2
-                and target_corner_angle >= np.radians(25.0)
+                and (is_first_connector or is_precision_corner)
                 and dist_to_next_wp <= 0.07
             )
             if precision_corner_capture:
@@ -1728,7 +1734,7 @@ class LocalizationNode(Node):
                     kp=1.0,
                     max_speed=min(speed_limit, 0.035),
                     min_speed=min(self.ap_min_lin, 0.008),
-                    stop_radius=self.ap_wp_tol,
+                    stop_radius=capture_tolerance,
                 )
             elif seg_idx >= total_wps - 2 and finish_euclid <= terminal_radius:
                 # Close to the finish, aim directly at the endpoint and lower
