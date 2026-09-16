@@ -62,7 +62,7 @@ class MockNode:
 
 sys.modules['rclpy.node'].Node = MockNode
 import rclpy
-from localization_node import LocalizationNode, WebServerHandler
+from localization_node import LocalizationNode, WebServerHandler, point_target_velocity
 
 @pytest.fixture
 def mock_node(tmp_path):
@@ -446,6 +446,29 @@ def test_fusion_conflict_must_be_continuous_and_current(mock_node):
     mock_node.update_fusion_conflict_state('ceiling_no_valid_tags', False, now=11.0)
     assert mock_node.fusion_conflict_since is None
     assert not mock_node.has_sustained_fusion_conflict(now=11.0)
+
+
+def test_point_target_velocity_aims_at_waypoint_and_slows_near_it():
+    far_velocity, far_distance = point_target_velocity(
+        [0.0, 0.0], [0.30, 0.40], kp=1.2,
+        max_speed=0.08, min_speed=0.01, stop_radius=0.015,
+    )
+    near_velocity, near_distance = point_target_velocity(
+        [0.0, 0.0], [0.02, 0.0], kp=1.2,
+        max_speed=0.08, min_speed=0.01, stop_radius=0.015,
+    )
+    stopped, stopped_distance = point_target_velocity(
+        [0.0, 0.0], [0.01, 0.0], kp=1.2,
+        max_speed=0.08, min_speed=0.01, stop_radius=0.015,
+    )
+
+    assert far_distance == pytest.approx(0.5)
+    assert np.linalg.norm(far_velocity) == pytest.approx(0.08)
+    assert far_velocity[0] > 0 and far_velocity[1] > 0
+    assert near_distance == pytest.approx(0.02)
+    assert np.linalg.norm(near_velocity) == pytest.approx(0.01)
+    assert stopped_distance == pytest.approx(0.01)
+    assert stopped == pytest.approx([0.0, 0.0])
 
 def test_api_calibration_abort_and_confirm(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)

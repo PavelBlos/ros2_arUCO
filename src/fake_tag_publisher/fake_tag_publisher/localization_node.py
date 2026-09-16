@@ -60,6 +60,20 @@ except ImportError:
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 import socketserver
 
+
+def point_target_velocity(current_xy, target_xy, kp, max_speed, min_speed, stop_radius):
+    """Return a bounded map-frame velocity aimed directly at one waypoint."""
+    delta = np.asarray(target_xy, dtype=float) - np.asarray(current_xy, dtype=float)
+    distance = float(np.linalg.norm(delta))
+    if distance <= float(stop_radius) or distance < 1e-9:
+        return np.zeros(2, dtype=float), distance
+    speed = float(np.clip(
+        float(kp) * max(0.0, distance - float(stop_radius)),
+        float(min_speed),
+        float(max_speed),
+    ))
+    return delta * (speed / distance), distance
+
 class LocalizationNode(Node):
     def __init__(self):
         super().__init__('localization_node')
@@ -240,17 +254,18 @@ class LocalizationNode(Node):
         self.autopilot_thread = None
         self.autopilot_active = False
         self.route_error = ""
+        self.resume_route_requested = False
 
         # Параметры векторного контроллера (Cross-track follower & Corner speed profile)
-        self.ap_cruise_speed = 0.14       # Крейсерская скорость по прямой (м/с)
-        self.ap_max_lin = 0.14
-        self.ap_min_lin = 0.03            # Минимальная скорость движения (м/с)
-        self.ap_goal_tol = 0.03           # Радиус попадания в цель (м)
-        self.ap_wp_tol = 0.05             # Радиус прохождения вершины угла для переключения сегмента (м)
+        self.ap_cruise_speed = 0.10       # Крейсерская скорость по прямой (м/с)
+        self.ap_max_lin = 0.12
+        self.ap_min_lin = 0.015           # Минимальная скорость движения (м/с)
+        self.ap_goal_tol = 0.015          # Радиус попадания в цель (м)
+        self.ap_wp_tol = 0.03             # Радиус прохождения вершины угла для переключения сегмента (м)
         self.ap_kp_cross = 1.20           # Пропорциональный коэффициент возврата на траекторию (1/с)
         self.ap_v_cross_max = 0.08        # Максимальная скорость боковой коррекции (м/с)
-        self.ap_brake_accel = 0.25        # Тормозное кинематическое замедление (м/с^2)
-        self.ap_turn_factor = 0.65        # Множитель скорости прохождения углов
+        self.ap_brake_accel = 0.20        # Тормозное кинематическое замедление (м/с^2)
+        self.ap_turn_factor = 0.55        # Множитель скорости прохождения углов
         self.ap_max_ang = 0.60            # Предельная угловая скорость вращения (рад/с)
         self.ap_kp_ang = 1.80             # Пропорциональный коэффициент ориентации
         self.ap_yaw_mode = "HOLD_INITIAL" # FREE, HOLD_INITIAL, PATH_TANGENT, FINAL_YAW
@@ -1324,6 +1339,7 @@ class LocalizationNode(Node):
         self.current_seg_idx = 0
         self.current_wp_idx = 0
         self.route_state = "idle"
+        self.resume_route_requested = False
         self.path_s_accum = [0.0]
         speed_limit = min(self.ap_cruise_speed, self.ap_max_lin)
         self.path_corner_speeds = [speed_limit] * len(self.route_waypoints)
@@ -1359,6 +1375,7 @@ class LocalizationNode(Node):
 
     def start_route(self):
         """Запуск автономного движения по маршруту"""
+        was_paused = self.route_state == "paused"
         self.route_error = ""
         if not self.route_waypoints or len(self.route_waypoints) < 2:
             self.route_error = "Маршрут должен содержать не менее двух точек"
@@ -1393,6 +1410,7 @@ class LocalizationNode(Node):
             self.get_logger().warn(reason)
             return False
         self.set_motor_power("enable")
+        self.resume_route_requested = was_paused
         self.route_state = "running"
         self.autopilot_active = True
         
@@ -1507,18 +1525,57 @@ class LocalizationNode(Node):
             self.motion_mgr.release_lease(MotionAuthorityMode.ROUTE)
             return
 
-        total_path_len = self.path_s_accum[-1]
-        total_wps = len(self.route_waypoints)
-        seg_idx = 0
-        self.current_seg_idx = 0
+        resuming = bool(getattr(self, 'resume_route_requested', False))
+        self.resume_route_requested = False
+        control_waypoints = [list(point) for point in self.route_waypoints]
+        route_index_offset = 0
+
+        # A drawn path starts at point 1, but the robot can be somewhere else.
+        # Add its current pose as a private connector segment so point 1 is a
+        # real target instead of merely the origin of the line 1 -> 2.
+        first_distance = float(np.linalg.norm(
+            np.asarray(control_waypoints[0], dtype=float)
+            - np.asarray([self.fused_x, self.fused_y], dtype=float)
+        ))
+        if not resuming and first_distance > self.ap_goal_tol:
+            control_waypoints.insert(0, [float(self.fused_x), float(self.fused_y)])
+            route_index_offset = 1
+            self.get_logger().info(
+                f"🎯 Сначала подъезжаем к точке 1: расстояние {first_distance*100:.1f} см"
+            )
+
+        control_path_s = [0.0]
+        speed_limit = min(self.ap_cruise_speed, self.ap_max_lin)
+        control_corner_speeds = [speed_limit] * len(control_waypoints)
+        for i in range(len(control_waypoints) - 1):
+            segment_length = float(np.linalg.norm(
+                np.asarray(control_waypoints[i + 1]) - np.asarray(control_waypoints[i])
+            ))
+            control_path_s.append(control_path_s[-1] + segment_length)
+        for i in range(1, len(control_waypoints) - 1):
+            incoming = np.asarray(control_waypoints[i]) - np.asarray(control_waypoints[i - 1])
+            outgoing = np.asarray(control_waypoints[i + 1]) - np.asarray(control_waypoints[i])
+            len_in, len_out = float(np.linalg.norm(incoming)), float(np.linalg.norm(outgoing))
+            if len_in > 1e-4 and len_out > 1e-4:
+                turn_angle = float(np.arccos(np.clip(
+                    np.dot(incoming / len_in, outgoing / len_out), -1.0, 1.0
+                )))
+                if turn_angle > np.radians(15.0):
+                    control_corner_speeds[i] = max(
+                        self.ap_min_lin,
+                        float(speed_limit * np.cos(turn_angle / 2.0) * self.ap_turn_factor),
+                    )
+
+        total_path_len = control_path_s[-1]
+        total_wps = len(control_waypoints)
+        seg_idx = int(np.clip(self.current_seg_idx if resuming else 0, 0, total_wps - 2))
+        self.current_seg_idx = seg_idx
         initial_yaw = float(self.fused_yaw)
 
         smooth_forward = 0.0
         smooth_strafe = 0.0
         smooth_w = 0.0
         alpha = 0.40
-        speed_limit = min(self.ap_cruise_speed, self.ap_max_lin)
-
         self.get_logger().info(f"▶ Старт векторного контроллера: длина пути {total_path_len:.2f}м, режим курса: {self.ap_yaw_mode}")
 
         while self.autopilot_active and self.route_state == "running":
@@ -1539,8 +1596,8 @@ class LocalizationNode(Node):
             ryaw = float(self.fused_yaw)
 
             # 1. Текущий сегмент пути
-            p_a = np.array(self.route_waypoints[seg_idx])
-            p_b = np.array(self.route_waypoints[seg_idx + 1])
+            p_a = np.array(control_waypoints[seg_idx])
+            p_b = np.array(control_waypoints[seg_idx + 1])
             ab = p_b - p_a
             seg_len = float(np.linalg.norm(ab))
             if seg_len < 1e-6:
@@ -1555,14 +1612,26 @@ class LocalizationNode(Node):
             # 2. Продвижение на следующий сегмент
             if seg_idx < total_wps - 2:
                 line_cross_error = abs(float(np.dot(ap, normal)))
-                if (t_param >= 0.95 and line_cross_error <= self.ap_wp_tol) or dist_to_next_wp <= self.ap_wp_tol:
+                is_first_connector = route_index_offset == 1 and seg_idx == 0
+                reached_waypoint = (
+                    dist_to_next_wp <= self.ap_goal_tol
+                    if is_first_connector
+                    else ((t_param >= 0.95 and line_cross_error <= self.ap_wp_tol)
+                          or dist_to_next_wp <= self.ap_wp_tol)
+                )
+                if reached_waypoint:
                     seg_idx += 1
-                    self.current_seg_idx = seg_idx
-                    self.current_wp_idx = seg_idx
+                    self.current_seg_idx = max(0, seg_idx - route_index_offset)
+                    self.current_wp_idx = max(0, seg_idx - route_index_offset)
                     self.notify_ui_event()
+                    if is_first_connector:
+                        self.get_logger().info(
+                            f"✅ Точка 1 достигнута (ошибка {dist_to_next_wp*100:.1f} см); "
+                            "начинаем следование по маршруту"
+                        )
                     self.get_logger().info(f"📍 Вершина пройдена! Переход на сегмент {seg_idx + 1}/{total_wps - 1}")
-                    p_a = np.array(self.route_waypoints[seg_idx])
-                    p_b = np.array(self.route_waypoints[seg_idx + 1])
+                    p_a = np.array(control_waypoints[seg_idx])
+                    p_b = np.array(control_waypoints[seg_idx + 1])
                     ab = p_b - p_a
                     seg_len = float(np.linalg.norm(ab))
                     if seg_len < 1e-6:
@@ -1572,29 +1641,33 @@ class LocalizationNode(Node):
                     ap = np.array([rx, ry]) - p_a
                     t_param = float(np.dot(ap, tangent) / seg_len)
 
-            self.current_wp_idx = seg_idx + 1
+            self.current_wp_idx = max(0, seg_idx + 1 - route_index_offset)
 
             # 3. Проекция на текущий сегмент и боковая ошибка e_cross
             t_clamped = float(np.clip(t_param, 0.0, 1.0))
             proj_pt = p_a + t_clamped * ab
-            current_s = self.path_s_accum[seg_idx] + t_clamped * seg_len
+            current_s = control_path_s[seg_idx] + t_clamped * seg_len
             e_cross = float(np.dot(np.array([rx, ry]) - proj_pt, normal))
 
             # 4. Проверка достижения финиша
             dist_to_finish = max(0.0, total_path_len - current_s)
-            fx, fy = self.route_waypoints[-1]
+            fx, fy = control_waypoints[-1]
             finish_euclid = float(np.hypot(fx - rx, fy - ry))
 
             if seg_idx >= total_wps - 2:
                 if finish_euclid <= self.ap_goal_tol:
                     self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
-                    pytime.sleep(0.4)
-                    self.route_state = "finished"
-                    self.autopilot_active = False
-                    self.notify_ui_event()
-                    self.get_logger().info(f"🎉 Маршрут полностью выполнен! Финиш достигнут (ошибка {finish_euclid*100:.1f} см)")
-                    self.last_motion_cmd_time = pytime.time()
-                    break
+                    smooth_forward = smooth_strafe = smooth_w = 0.0
+                    pytime.sleep(0.25)
+                    verified_finish = float(np.hypot(fx - self.fused_x, fy - self.fused_y))
+                    if verified_finish <= self.ap_goal_tol:
+                        self.route_state = "finished"
+                        self.autopilot_active = False
+                        self.notify_ui_event()
+                        self.get_logger().info(f"🎉 Маршрут полностью выполнен! Финиш достигнут (ошибка {verified_finish*100:.1f} см)")
+                        self.last_motion_cmd_time = pytime.time()
+                        break
+                    continue
 
             # 5. Профиль скорости вдоль траектории (along-track velocity)
             if dist_to_finish <= self.ap_goal_tol:
@@ -1604,9 +1677,9 @@ class LocalizationNode(Node):
 
             v_corners = []
             for i in range(seg_idx + 1, total_wps - 1):
-                d_to_corner = self.path_s_accum[i] - current_s
+                d_to_corner = control_path_s[i] - current_s
                 if d_to_corner > 0:
-                    v_max_c = self.path_corner_speeds[i]
+                    v_max_c = control_corner_speeds[i]
                     v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
                     v_corners.append(v_brake_c)
 
@@ -1618,7 +1691,20 @@ class LocalizationNode(Node):
 
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
-            if t_param >= 1.0:
+            terminal_radius = max(0.08, 2.0 * self.ap_wp_tol)
+            if seg_idx >= total_wps - 2 and finish_euclid <= terminal_radius:
+                # Close to the finish, aim directly at the endpoint and lower
+                # the speed continuously. This removes the visible tolerance-
+                # sized shortfall left by pure segment tracking.
+                v_map, _ = point_target_velocity(
+                    np.array([rx, ry], dtype=float),
+                    np.array([fx, fy], dtype=float),
+                    kp=1.2,
+                    max_speed=min(speed_limit, 0.05),
+                    min_speed=min(self.ap_min_lin, 0.010),
+                    stop_radius=self.ap_goal_tol,
+                )
+            elif t_param >= 1.0:
                 # Outside the endpoint plane, drive toward the actual vertex;
                 # path projection alone must not report a remote finish.
                 v_map = .8 * (p_b - np.array([rx, ry]))
