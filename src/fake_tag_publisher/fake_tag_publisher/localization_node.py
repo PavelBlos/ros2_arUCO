@@ -4177,6 +4177,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             </div>
             
             <button class="btn btn-secondary" id="btn-draw-mode" style="margin-bottom: 0; font-size: 13px;">✏️ Режим рисования: ВЫКЛ</button>
+            <button class="btn btn-secondary" id="btn-edit-points" style="margin-bottom:0;font-size:13px;">🛠 Редактор точек: ВЫКЛ</button>
+            <div id="route-edit-status" class="guide-box" style="font-size:10px;">Включите редактор: выберите и перетащите точку либо нажмите на участок, чтобы вставить новую.</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
+                <button class="btn btn-secondary" id="btn-delete-route-point" disabled style="margin:0;font-size:11px;padding:8px 3px;">Удалить выбранную</button>
+                <button class="btn btn-secondary" id="btn-save-route-points" disabled style="margin:0;font-size:11px;padding:8px 3px;">Применить точки</button>
+            </div>
             
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
                 <button class="btn" id="btn-route-start" style="margin-bottom: 0; font-size: 13px; padding: 10px 4px; background-color: #2ecc71; color: white; box-shadow: 0 0 10px rgba(46, 204, 113, 0.3); border-color: #2ecc71;">▶ Старт</button>
@@ -4562,17 +4568,23 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 
                 const markerStride = Math.max(1, Math.ceil(plannedPath.length / 200));
                 for (let i = 0; i < plannedPath.length; i += markerStride) {
-                    ctx.fillStyle = i === 0 ? '#2ecc71' : (i === plannedPath.length - 1 ? '#ff4d4d' : '#a855f7');
+                    const selected=i===selectedRoutePoint;
+                    ctx.fillStyle = selected?'#f1c40f':(i === 0 ? '#2ecc71' : (i === plannedPath.length - 1 ? '#ff4d4d' : '#a855f7'));
                     ctx.beginPath();
-                    ctx.arc(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom, 5, 0, 2 * Math.PI);
+                    ctx.arc(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom, selected?8:5, 0, 2 * Math.PI);
                     ctx.fill();
                     ctx.strokeStyle = '#fff';
-                    ctx.lineWidth = 1;
+                    ctx.lineWidth = selected?2:1;
                     ctx.stroke();
                     
                     ctx.fillStyle = '#fff';
                     ctx.font = '10px monospace';
                     if (plannedPath.length <= 200) ctx.fillText(i + 1, panX + plannedPath[i].x * zoom + 8, panY - plannedPath[i].y * zoom - 4);
+                }
+                if(selectedRoutePoint>=0&&selectedRoutePoint<plannedPath.length&&selectedRoutePoint%markerStride!==0){
+                    const p=plannedPath[selectedRoutePoint],px=panX+p.x*zoom,py=panY-p.y*zoom;
+                    ctx.fillStyle='#f1c40f';ctx.strokeStyle='#fff';ctx.lineWidth=2;ctx.beginPath();ctx.arc(px,py,8,0,2*Math.PI);ctx.fill();ctx.stroke();
+                    ctx.fillStyle='#fff';ctx.font='bold 11px monospace';ctx.fillText(selectedRoutePoint+1,px+10,py-7);
                 }
             }
 
@@ -4616,6 +4628,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         // Panning (Перетаскивание)
         canvas.addEventListener('mousedown', (e) => {
+            dragStartX=e.clientX;dragStartY=e.clientY;
+            if(editPointsMode){
+                routeEditDragged=false;
+                autoCenter=false;
+                document.getElementById('btn-autocenter').className='btn btn-secondary';
+                document.getElementById('btn-autocenter').textContent='Автоцентрирование: ВЫКЛ';
+                const hit=routePointAt(e.clientX,e.clientY);
+                if(hit>=0){
+                    selectedRoutePoint=hit;routePointDragging=true;routeEditDragged=false;isDragging=false;
+                    canvas.style.cursor='grabbing';updateRouteEditUI();draw();return;
+                }
+                isDragging=false;return;
+            }
             if (drawMode) {
                 dragStartX = e.clientX;
                 dragStartY = e.clientY;
@@ -4629,6 +4654,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         });
 
         canvas.addEventListener('mousemove', (e) => {
+            if(routePointDragging&&selectedRoutePoint>=0){
+                const rect=canvas.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+                plannedPath[selectedRoutePoint].x=(mx-panX)/zoom;
+                plannedPath[selectedRoutePoint].y=(panY-my)/zoom;
+                routeEditDragged=routeEditDragged||Math.hypot(e.clientX-dragStartX,e.clientY-dragStartY)>2;
+                routeEditDirty=true;plannedPathRenderCache=null;updateRouteEditUI();draw();return;
+            }
             if (isDragging) {
                 panX = e.clientX - startX;
                 panY = e.clientY - startY;
@@ -4636,8 +4668,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         });
 
-        canvas.addEventListener('mouseup', () => isDragging = false);
-        canvas.addEventListener('mouseleave', () => isDragging = false);
+        canvas.addEventListener('mouseup', () => {
+            if(routePointDragging){routePointDragging=false;canvas.style.cursor='crosshair';if(routeEditDragged)markRouteEdited();}
+            isDragging=false;
+        });
+        canvas.addEventListener('mouseleave', () => {
+            if(routePointDragging){routePointDragging=false;canvas.style.cursor='crosshair';if(routeEditDragged)markRouteEdited();}
+            isDragging=false;
+        });
 
         // Поддержка Touch-событий для мобильных устройств (перетаскивание и pinch-to-zoom)
         let isTouching = false;
@@ -4700,7 +4738,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         const x = (mouseX - panX) / zoom;
                         const y = (panY - mouseY) / zoom;
                         
-                        plannedPath.push({ x, y });
+                        plannedPath.push({x,y,laser:plannedPath.length?1:0});
+                        routeEditDirty=true;plannedPathRenderCache=null;updateRouteEditUI('Маршрут изменён. Нажмите «Применить точки» или «Старт».');
                         addLog(`Точка маршрута: X=${x.toFixed(2)}, Y=${y.toFixed(2)}`);
                         draw();
                     }
@@ -4863,6 +4902,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             
             const rState = data.route_state || data.follower_status;
             if (rState) {
+                currentRouteState=rState;
                 if (badge) {
                     if (rState === 'running' || rState === 'tracking' || rState === 'pre_positioning') {
                         badge.textContent = "В ДВИЖЕНИИ";
@@ -4995,6 +5035,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let drawMode = false;
         let plannedPath = [];
         let plannedPathRenderCache = null;
+        let editPointsMode = false;
+        let selectedRoutePoint = -1;
+        let routePointDragging = false;
+        let routeEditDragged = false;
+        let routeEditDirty = false;
+        let currentRouteState = 'idle';
         let dragStartX = 0;
         let dragStartY = 0;
         
@@ -5004,6 +5050,52 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const btnRouteStop = document.getElementById('btn-route-stop');
         const btnClearPlan = document.getElementById('btn-clear-plan');
         const btnReturnHome = document.getElementById('btn-return-home');
+        const btnEditPoints = document.getElementById('btn-edit-points');
+        const btnDeleteRoutePoint = document.getElementById('btn-delete-route-point');
+        const btnSaveRoutePoints = document.getElementById('btn-save-route-points');
+        const routeEditStatus = document.getElementById('route-edit-status');
+
+        function routeEditingIsBlocked(){return ['running','tracking','pre_positioning','paused'].includes(currentRouteState);}
+        function updateRouteEditUI(message='') {
+            btnEditPoints.textContent=editPointsMode?'🛠 Редактор точек: ВКЛ':'🛠 Редактор точек: ВЫКЛ';
+            btnEditPoints.style.borderColor=editPointsMode?'#f1c40f':'rgba(255, 255, 255, 0.1)';
+            btnEditPoints.style.color=editPointsMode?'#f1c40f':'#c5c6c7';
+            btnDeleteRoutePoint.disabled=selectedRoutePoint<0||selectedRoutePoint>=plannedPath.length;
+            btnSaveRoutePoints.disabled=!routeEditDirty||plannedPath.length<2;
+            if(message) routeEditStatus.textContent=message;
+            else if(selectedRoutePoint>=0&&selectedRoutePoint<plannedPath.length){
+                const p=plannedPath[selectedRoutePoint];
+                routeEditStatus.textContent=`Выбрана точка ${selectedRoutePoint+1}/${plannedPath.length}: X ${p.x.toFixed(3)}, Y ${p.y.toFixed(3)} м. Перетащите её или удалите.`;
+            }else routeEditStatus.textContent=editPointsMode?'Нажмите точку для выбора или участок линии для вставки новой точки.':'Включите редактор: выберите и перетащите точку либо нажмите на участок, чтобы вставить новую.';
+        }
+        function markRouteEdited(message='Маршрут изменён. Нажмите «Применить точки».') {
+            routeEditDirty=true;plannedPathRenderCache=null;updateRouteEditUI(message);draw();
+        }
+        function resetRouteEditor(message='') {
+            selectedRoutePoint=-1;routePointDragging=false;routeEditDragged=false;routeEditDirty=false;plannedPathRenderCache=null;updateRouteEditUI(message);
+        }
+        function routePointAt(clientX,clientY,maxDistance=13) {
+            const rect=canvas.getBoundingClientRect(),mx=clientX-rect.left,my=clientY-rect.top;
+            let best=-1,bestDistance=maxDistance;
+            for(let i=0;i<plannedPath.length;i++){
+                const d=Math.hypot(panX+plannedPath[i].x*zoom-mx,panY-plannedPath[i].y*zoom-my);
+                if(d<=bestDistance){best=i;bestDistance=d;}
+            }
+            return best;
+        }
+        function nearestRouteSegment(clientX,clientY) {
+            const rect=canvas.getBoundingClientRect(),mx=clientX-rect.left,my=clientY-rect.top;
+            let best=null;
+            for(let i=1;i<plannedPath.length;i++){
+                const ax=panX+plannedPath[i-1].x*zoom,ay=panY-plannedPath[i-1].y*zoom;
+                const bx=panX+plannedPath[i].x*zoom,by=panY-plannedPath[i].y*zoom;
+                const dx=bx-ax,dy=by-ay,length2=dx*dx+dy*dy;
+                const t=length2>1e-9?Math.max(0,Math.min(1,((mx-ax)*dx+(my-ay)*dy)/length2)):0;
+                const px=ax+t*dx,py=ay+t*dy,distance=Math.hypot(mx-px,my-py);
+                if(!best||distance<best.distance) best={index:i,distance};
+            }
+            return best;
+        }
 
         async function uploadPlannedPath() {
             const response = await fetch('/api/path', {
@@ -5334,6 +5426,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const route=raster?buildRasterRoute():buildVectorRoute();
                 if(route.length>10000) throw new Error(`получилось ${route.length} точек; увеличьте шаг или обрежьте изображение (максимум 10000)`);
                 plannedPath=route; const result=await uploadPlannedPath(); renderArtworkPreview(route);
+                resetRouteEditor('Маршрут подготовлен. Включите редактор, чтобы изменить его точки.');
                 const active=result.laser_segments, widthM=artworkValue('artwork-width')/1000, heightM=artworkValue('artwork-height')/1000;
                 const cx=artworkValue('artwork-center-x'),cy=artworkValue('artwork-center-y'); autoCenter=false; zoom=Math.max(15,Math.min(3000,.75*Math.min(canvas.width/Math.max(.02,widthM),canvas.height/Math.max(.02,heightM)))); panX=canvas.width/2-cx*zoom; panY=canvas.height/2+cy*zoom;
                 const resolutionNote=raster&&lastRasterBuild?.adjusted?` Разрешение автоматически ограничено для стабильной работы: X ${lastRasterBuild.columnStepMm.toFixed(1)} мм, строки ${lastRasterBuild.rowStepMm.toFixed(1)} мм (${lastRasterBuild.cells} ячеек вместо ${lastRasterBuild.requestedCells}).`:'';
@@ -5345,6 +5438,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         btnDrawMode.addEventListener('click', () => {
             drawMode = !drawMode;
+            if(drawMode&&editPointsMode){editPointsMode=false;selectedRoutePoint=-1;updateRouteEditUI();}
             btnDrawMode.textContent = drawMode ? "✏️ Режим рисования: ВКЛ" : "✏️ Режим рисования: ВЫКЛ";
             btnDrawMode.style.borderColor = drawMode ? "#66fcf1" : "rgba(255, 255, 255, 0.1)";
             btnDrawMode.style.color = drawMode ? "#66fcf1" : "#c5c6c7";
@@ -5356,10 +5450,60 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         });
 
+        btnEditPoints.addEventListener('click',()=>{
+            if(!editPointsMode&&routeEditingIsBlocked()){updateRouteEditUI('Сначала остановите автопилот, затем редактируйте маршрут.');return;}
+            editPointsMode=!editPointsMode;
+            if(editPointsMode&&drawMode){
+                drawMode=false;btnDrawMode.textContent='✏️ Режим рисования: ВЫКЛ';
+                btnDrawMode.style.borderColor='rgba(255, 255, 255, 0.1)';btnDrawMode.style.color='#c5c6c7';
+            }
+            if(!editPointsMode) selectedRoutePoint=-1;
+            canvas.style.cursor=editPointsMode?'crosshair':'grab';updateRouteEditUI();draw();
+        });
+
+        btnDeleteRoutePoint.addEventListener('click',()=>{
+            if(routeEditingIsBlocked()){updateRouteEditUI('Удаление заблокировано до остановки автопилота.');return;}
+            if(selectedRoutePoint<0||selectedRoutePoint>=plannedPath.length) return;
+            const index=selectedRoutePoint,removed=plannedPath[index];
+            plannedPath.splice(index,1);
+            if(plannedPath.length){
+                plannedPath[0].laser=0;
+                if(index<plannedPath.length&&Number(removed.laser||0)<=0) plannedPath[index].laser=0;
+            }
+            selectedRoutePoint=Math.min(index,plannedPath.length-1);
+            markRouteEdited(`Точка ${index+1} удалена. Изменения ещё не отправлены на малину.`);
+        });
+
+        btnSaveRoutePoints.addEventListener('click',async()=>{
+            if(routeEditingIsBlocked()){updateRouteEditUI('Сначала остановите автопилот, затем примените изменения.');return;}
+            if(plannedPath.length<2) return;
+            btnSaveRoutePoints.disabled=true;routeEditStatus.textContent='Отправка изменённого маршрута…';
+            try{
+                const result=await uploadPlannedPath();routeEditDirty=false;
+                updateRouteEditUI(`Изменения применены: ${result.count} точек, рабочих сегментов ${result.laser_segments}.`);
+                addLog(`🛠 Изменённый маршрут сохранён: ${result.count} точек.`);
+            }catch(error){routeEditDirty=true;updateRouteEditUI(`Ошибка сохранения: ${error.message}`);}
+        });
+
         canvas.addEventListener('click', (e) => {
-            if (!drawMode) return;
             const dist = Math.sqrt((e.clientX - dragStartX)**2 + (e.clientY - dragStartY)**2);
             if (dist > 5) return; // это было перетаскивание карты
+            if(editPointsMode){
+                if(routeEditDragged){routeEditDragged=false;return;}
+                const hit=routePointAt(e.clientX,e.clientY);
+                if(hit>=0){selectedRoutePoint=hit;updateRouteEditUI();draw();return;}
+                const rect=canvas.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;
+                const x=(mx-panX)/zoom,y=(panY-my)/zoom;
+                if(plannedPath.length<2){
+                    plannedPath.push({x,y,laser:plannedPath.length?1:0});selectedRoutePoint=plannedPath.length-1;
+                }else{
+                    const segment=nearestRouteSegment(e.clientX,e.clientY),index=segment?segment.index:plannedPath.length;
+                    const laser=Number(plannedPath[Math.min(index,plannedPath.length-1)]?.laser??1);
+                    plannedPath.splice(index,0,{x,y,laser});selectedRoutePoint=index;
+                }
+                markRouteEdited(`Добавлена точка ${selectedRoutePoint+1}. Перетащите при необходимости и нажмите «Применить точки».`);return;
+            }
+            if (!drawMode) return;
             
             const rect = canvas.getBoundingClientRect();
             const mouseX = e.clientX - rect.left;
@@ -5369,6 +5513,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const y = (panY - mouseY) / zoom;
             
             plannedPath.push({ x, y, laser: plannedPath.length ? 1 : 0 });
+            routeEditDirty=true;plannedPathRenderCache=null;updateRouteEditUI('Маршрут изменён. Нажмите «Применить точки» или «Старт».');
             addLog(`Точка маршрута: X=${x.toFixed(2)}, Y=${y.toFixed(2)}`);
             draw();
         });
@@ -5386,9 +5531,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 btnDrawMode.style.color = "#c5c6c7";
                 canvas.style.cursor = 'grab';
             }
+            if(editPointsMode){editPointsMode=false;selectedRoutePoint=-1;canvas.style.cursor='grab';updateRouteEditUI();draw();}
             
             uploadPlannedPath()
                 .then(() => {
+                    routeEditDirty=false;updateRouteEditUI('Маршрут передан автопилоту.');
                     fetch(`/start_route`)
                         .then(r => r.json())
                         .then(resData => {
@@ -5428,6 +5575,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         
         btnClearPlan.addEventListener('click', () => {
             plannedPath = [];
+            resetRouteEditor('Маршрут очищен.');
             fetch(`/clear_waypoints`)
                 .then(res => res.json())
                 .then(data => {
@@ -5459,6 +5607,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     const t = i / numPts;
                 plannedPath.push({ x: rx * (1.0 - t), y: ry * (1.0 - t), laser: 0 });
                 }
+                resetRouteEditor('Маршрут возврата подготовлен и отправляется автопилоту.');
                 draw();
                 addLog(`🎯 Возврат в (0,0): дистанция ${dist.toFixed(2)}м (${plannedPath.length} точек).`);
                 
@@ -5506,6 +5655,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
             }
             plannedPath.push(corners[4]); // Замыкающая точка
+            routeEditDirty=true;selectedRoutePoint=-1;plannedPathRenderCache=null;updateRouteEditUI('Квадрат подготовлен. Можно отредактировать точки или нажать «Старт».');
             
             addLog(`Квадрат (1м) сгенерирован (шаг ${spacing}м, ${plannedPath.length} точек). Нажмите "Запустить" для старта.`);
             draw();
@@ -5527,6 +5677,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     y: cy + radius * Math.sin(theta)
                 });
             }
+            routeEditDirty=true;selectedRoutePoint=-1;plannedPathRenderCache=null;updateRouteEditUI('Круг подготовлен. Можно отредактировать точки или нажать «Старт».');
             
             addLog(`Круг (R=1м) сгенерирован (шаг ${spacing}м, ${plannedPath.length} точек). Нажмите "Запустить" для старта.`);
             draw();
