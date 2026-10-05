@@ -4201,7 +4201,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title remote-only" style="margin-top:15px;">Файл для гравировки или резки</div>
         <div class="calib-container remote-only" style="display:flex; flex-direction:column; gap:8px;">
-            <div class="guide-box">SVG и DXF переводятся в контуры. PNG переводится в построчную змейку. Фиолетовые линии — рабочий ход лазера, серые пунктирные — переезд с выключенным лазером. Маршрут сначала только подготавливается; запуск выполняется отдельной кнопкой «Старт».</div>
+            <div class="guide-box">SVG и DXF переводятся в контуры. PNG переводится в построчную змейку с мощностью по яркости пикселей: белый фон выключает лазер, более тёмный участок повышает PWM. Насыщенность фиолетовой линии показывает мощность, серый пунктир — переезд с выключенным лазером. Маршрут сначала только подготавливается; запуск выполняется отдельной кнопкой «Старт».</div>
             <input type="file" id="artwork-file" accept=".svg,.png,.dxf,image/png,image/svg+xml" class="calib-input" style="width:100%;">
             <div class="artwork-grid">
                 <div class="artwork-field"><label>Режим</label><select id="artwork-mode" class="calib-input" style="width:100%;"><option value="auto">Автоматически</option><option value="vector">Контуры</option><option value="raster">Растр-змейка</option></select></div>
@@ -4215,7 +4215,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="artwork-field"><label>Обрезка сверху (%)</label><input id="artwork-crop-top" type="number" value="0" min="0" max="45" step="1" class="calib-input" style="width:100%;"></div>
                 <div class="artwork-field"><label>Обрезка снизу (%)</label><input id="artwork-crop-bottom" type="number" value="0" min="0" max="45" step="1" class="calib-input" style="width:100%;"></div>
                 <div class="artwork-field"><label>Шаг строк PNG (мм)</label><input id="artwork-raster-step" type="number" value="5" min="1" max="100" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Шаг мощности PNG по X (мм)</label><input id="artwork-raster-pixel-step" type="number" value="5" min="1" max="100" step="1" class="calib-input" style="width:100%;"></div>
                 <div class="artwork-field"><label>Порог PNG (0…255)</label><input id="artwork-threshold" type="number" value="160" min="0" max="255" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Уровней мощности PNG</label><input id="artwork-power-levels" type="number" value="8" min="2" max="32" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Гамма яркости PNG</label><input id="artwork-power-gamma" type="number" value="1" min="0.2" max="3" step="0.1" class="calib-input" style="width:100%;"></div>
             </div>
             <label style="font-size:11px;color:#8b9bb4;"><input type="checkbox" id="artwork-lock-aspect" checked> сохранять пропорции</label>
             <label style="font-size:11px;color:#8b9bb4;"><input type="checkbox" id="artwork-invert"> инвертировать PNG</label>
@@ -4536,8 +4539,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             if (plannedPath.length > 0) {
                 ctx.lineWidth = 3;
                 for (let i = 1; i < plannedPath.length; i++) {
-                    const activeLaser = Number(plannedPath[i].laser ?? 1) > 0;
-                    ctx.strokeStyle = activeLaser ? 'rgba(168, 85, 247, 0.9)' : 'rgba(148, 163, 184, 0.55)';
+                    const laserFactor = Math.max(0, Math.min(1, Number(plannedPath[i].laser ?? 1)));
+                    const activeLaser = laserFactor > 0;
+                    ctx.strokeStyle = activeLaser ? `rgba(168, 85, 247, ${(.2 + .8 * laserFactor).toFixed(3)})` : 'rgba(148, 163, 184, 0.55)';
                     ctx.setLineDash(activeLaser ? [] : [5, 5]);
                     ctx.beginPath();
                     ctx.moveTo(panX + plannedPath[i - 1].x * zoom, panY - plannedPath[i - 1].y * zoom);
@@ -5200,21 +5204,45 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const widthM=artworkValue('artwork-width',200)/1000, heightM=artworkValue('artwork-height',200)/1000;
             const cx=artworkValue('artwork-center-x'), cy=artworkValue('artwork-center-y');
             const rowStep=Math.max(1,Math.round((artworkValue('artwork-raster-step',5)/1000)/heightM*h));
+            const columns=Math.max(1,Math.ceil(widthM/Math.max(.001,artworkValue('artwork-raster-pixel-step',5)/1000)));
             const threshold=artworkValue('artwork-threshold',160), invert=document.getElementById('artwork-invert').checked;
+            const levels=Math.max(2,Math.min(32,Math.round(artworkValue('artwork-power-levels',8))));
+            const powerGamma=Math.max(.2,Math.min(3,artworkValue('artwork-power-gamma',1)));
             const route=[];
             for (let y=0,row=0; y<h; y+=rowStep,row++) {
-                const runs=[]; let start=-1;
-                for (let x=0; x<=w; x++) {
-                    let dark=false;
-                    if (x<w) { const n=(y*w+x)*4, lum=.2126*pixels[n]+.7152*pixels[n+1]+.0722*pixels[n+2]; dark=pixels[n+3]>32 && (invert ? lum>threshold : lum<threshold); }
-                    if (dark && start<0) start=x;
-                    if (!dark && start>=0) { runs.push([start,Math.max(start,x-1)]); start=-1; }
+                const reverse=Boolean(row%2), spans=[];
+                let activePower=0, startEdge=reverse?columns:0;
+                const powerAt=column=>{
+                    const x0=Math.floor(column*w/columns),x1=Math.max(x0+1,Math.ceil((column+1)*w/columns));
+                    let weightedLum=0,alphaSum=0;
+                    for(let x=x0;x<Math.min(w,x1);x++){
+                        const n=(y*w+x)*4,alpha=pixels[n+3]/255;
+                        weightedLum+=(.2126*pixels[n]+.7152*pixels[n+1]+.0722*pixels[n+2])*alpha;
+                        alphaSum+=alpha;
+                    }
+                    const alpha=alphaSum/Math.max(1,x1-x0),lum=alphaSum>1e-9?weightedLum/alphaSum:255;
+                    const active=alpha>.125 && (invert ? lum>threshold : lum<threshold);
+                    if(!active) return 0;
+                    const opticalDensity=(invert?lum:255-lum)/255*alpha;
+                    const curved=Math.pow(Math.max(0,Math.min(1,opticalDensity)),powerGamma);
+                    return Math.max(1/(levels-1),Math.round(curved*(levels-1))/(levels-1));
+                };
+                for(let step=0;step<columns;step++){
+                    const column=reverse?columns-1-step:step;
+                    const boundary=reverse?column+1:column;
+                    const power=powerAt(column);
+                    if(Math.abs(power-activePower)>1e-9){
+                        if(activePower>0) spans.push([startEdge,boundary,activePower]);
+                        startEdge=boundary; activePower=power;
+                    }
                 }
-                if (row%2) runs.reverse();
-                for (const run of runs) {
-                    let [x0,x1]=run; if (row%2) [x0,x1]=[x1,x0];
-                    const point=(xv,laser)=>({x:cx+(xv/(Math.max(1,w-1))-.5)*widthM, y:cy-(y/(Math.max(1,h-1))-.5)*heightM, laser});
-                    route.push(point(x0,0),point(x1,1));
+                if(activePower>0) spans.push([startEdge,reverse?0:columns,activePower]);
+                const point=(xv,laser)=>({x:cx+(xv/Math.max(1,columns)-.5)*widthM, y:cy-(y/(Math.max(1,h-1))-.5)*heightM, laser});
+                let previousEdge=null;
+                for (const [start,end,power] of spans) {
+                    if(previousEdge===null||Math.abs(previousEdge-start)>1e-9) route.push(point(start,0));
+                    route.push(point(end,power));
+                    previousEdge=end;
                 }
             }
             if (!route.length) throw new Error('по выбранному порогу тёмные области не найдены');
@@ -5235,7 +5263,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const px=x=>(x-(minX+maxX)/2)*scale+w/2, py=y=>h/2-(y-(minY+maxY)/2)*scale;
             artworkPreviewCtx.lineWidth=Math.max(1,devicePixelRatio);
             for(let i=1;i<route.length;i++){
-                const active=route[i].laser>0; artworkPreviewCtx.strokeStyle=active?'#7c3aed':'#94a3b8'; artworkPreviewCtx.setLineDash(active?[]:[4,4]);
+                const power=Math.max(0,Math.min(1,Number(route[i].laser)||0)),active=power>0;
+                artworkPreviewCtx.strokeStyle=active?`rgba(124,58,237,${(.15+.85*power).toFixed(3)})`:'#94a3b8'; artworkPreviewCtx.setLineDash(active?[]:[4,4]);
                 artworkPreviewCtx.beginPath(); artworkPreviewCtx.moveTo(px(route[i-1].x),py(route[i-1].y)); artworkPreviewCtx.lineTo(px(route[i].x),py(route[i].y)); artworkPreviewCtx.stroke();
             }
             artworkPreviewCtx.setLineDash([]);
