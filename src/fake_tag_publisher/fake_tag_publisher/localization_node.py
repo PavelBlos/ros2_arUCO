@@ -5039,75 +5039,36 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             return {left, right, top, bottom};
         }
         function contourBounds(contours) {
-            let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity,count=0;
-            for(const contour of contours) for(const p of contour){
-                if(!Number.isFinite(p[0])||!Number.isFinite(p[1])) continue;
-                minX=Math.min(minX,p[0]);maxX=Math.max(maxX,p[0]);
-                minY=Math.min(minY,p[1]);maxY=Math.max(maxY,p[1]);count++;
-            }
-            if(!count) throw new Error('в файле не найдено поддерживаемых линий');
-            return {minX,maxX,minY,maxY};
-        }
-        function svgPaintIsVisible(el) {
-            const style=getComputedStyle(el),opacity=Math.max(0,Number.parseFloat(style.opacity)||0);
-            if(style.display==='none'||style.visibility==='hidden'||opacity<=1e-6) return false;
-            const strokeOpacity=Math.max(0,Number.parseFloat(style.strokeOpacity)||0);
-            const strokeWidth=Math.max(0,Number.parseFloat(style.strokeWidth)||0);
-            if(style.stroke!=='none'&&strokeOpacity*opacity>1e-6&&strokeWidth>0) return true;
-            const fillOpacity=Math.max(0,Number.parseFloat(style.fillOpacity)||0);
-            if(style.fill==='none'||fillOpacity*opacity<=1e-6) return false;
-            const rgb=style.fill.match(/^rgba?\\(([^)]+)\\)$/i);
-            if(rgb){
-                const channels=rgb[1].split(',').slice(0,3).map(Number);
-                if(channels.length===3&&channels.every(v=>Number.isFinite(v)&&v>=250)) return false;
-            }
-            return true;
-        }
-        function sampleSvgGeometry(el) {
-            let length;
-            try { length=el.getTotalLength(); } catch (_) { return []; }
-            if(!Number.isFinite(length)||length<=0) return [];
-            const samples=Math.min(4000,Math.max(2,Math.ceil(length/1.5)));
-            const matrix=el.getCTM(),contours=[];
-            let contour=[],previous=null;
-            for(let i=0;i<=samples;i++){
-                const along=length*i/samples,p=el.getPointAtLength(along),q=matrix?p.matrixTransform(matrix):p;
-                const point=[q.x,q.y];
-                if(previous){
-                    const expected=Math.max(1e-9,length/samples);
-                    const jump=Math.hypot(point[0]-previous[0],point[1]-previous[1]);
-                    if(jump>expected*1.75+1e-6){
-                        if(contour.length>1) contours.push(contour);
-                        contour=[];
-                    }
-                }
-                contour.push(point);previous=point;
-            }
-            if(contour.length>1) contours.push(contour);
-            return contours;
+            const points = contours.flat();
+            if (!points.length) throw new Error('в файле не найдено поддерживаемых линий');
+            return {
+                minX: Math.min(...points.map(p => p[0])), maxX: Math.max(...points.map(p => p[0])),
+                minY: Math.min(...points.map(p => p[1])), maxY: Math.max(...points.map(p => p[1]))
+            };
         }
         function parseSvgContours(text) {
             const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
             if (doc.querySelector('parsererror')) throw new Error('ошибка синтаксиса SVG');
             const svg = document.importNode(doc.documentElement, true);
             svg.querySelectorAll('script,foreignObject,image,use').forEach(el => el.remove());
-            svg.style.cssText = 'position:fixed;left:-10000px;top:0;width:1000px;height:1000px;pointer-events:none;';
+            svg.style.cssText = 'position:fixed;left:-10000px;top:0;visibility:hidden;width:1000px;height:1000px;';
             document.body.appendChild(svg);
             const contours = [];
             try {
                 svg.querySelectorAll('path,polyline,polygon,line,rect,circle,ellipse').forEach(el => {
-                    if(typeof el.getTotalLength!=='function'||!svgPaintIsVisible(el)) return;
-                    const d=el.tagName.toLowerCase()==='path'?el.getAttribute('d')||'':'';
-                    const absoluteSubpaths=d.match(/M(?=[\\s,.+\\-\\d])[^Mm]*/g);
-                    const allMoves=d.match(/[Mm](?=[\\s,.+\\-\\d])/g);
-                    if(absoluteSubpaths&&allMoves&&absoluteSubpaths.length===allMoves.length&&absoluteSubpaths.length>1){
-                        for(const subpath of absoluteSubpaths){
-                            const clone=el.cloneNode(false);clone.setAttribute('d',subpath);el.parentNode.appendChild(clone);
-                            contours.push(...sampleSvgGeometry(clone));clone.remove();
-                        }
-                    }else{
-                        contours.push(...sampleSvgGeometry(el));
+                    if (typeof el.getTotalLength !== 'function') return;
+                    let length;
+                    try { length = el.getTotalLength(); } catch (_) { return; }
+                    if (!Number.isFinite(length) || length <= 0) return;
+                    const samples = Math.min(2500, Math.max(2, Math.ceil(length / 2)));
+                    const matrix = el.getCTM();
+                    const contour = [];
+                    for (let i = 0; i <= samples; i++) {
+                        const p = el.getPointAtLength(length * i / samples);
+                        const q = matrix ? p.matrixTransform(matrix) : p;
+                        contour.push([q.x, q.y]);
                     }
+                    if (contour.length > 1) contours.push(contour);
                 });
             } finally { svg.remove(); }
             return contours;
