@@ -1,0 +1,19 @@
+[Unit]
+Description=TERMiT robot localization and web control
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=raspberry
+Group=raspberry
+WorkingDirectory=/home/raspberry/arUco_termit
+ExecStart=/home/raspberry/arUco_termit/start_system.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=8
+KillMode=control-group
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

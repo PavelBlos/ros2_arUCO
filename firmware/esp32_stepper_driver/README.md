@@ -3,14 +3,15 @@
 Validated on the robot on 2026-09-08, ESP32-D0WD-V3, 4 MB flash.
 Build with Arduino ESP32 core **3.3.11**, FastAccelStepper **1.2.7**,
 board `esp32:esp32:esp32`. Version query `v` returns
-`TERMIT_FASTACCEL_V3_LASER`. The Python API remains compatible with the
+`TERMIT_FASTACCEL_V3_LASER_NO_INTERLOCK`. The Python API remains compatible with the
 previous motor-only v2 firmware but refuses laser arming until v3 is installed.
 
 Laser hardware assignments:
 
 - GPIO25: active-high hardware PWM to the laser driver's TTL/PWM input.
 - GPIO2: duplicate applied PWM on the onboard LED.
-- GPIO26: active-high physical interlock input with an internal pull-down.
+- GPIO26 is currently unused. Laser permission is controlled by the web permit,
+  host heartbeat, motion state, and the firmware watchdog.
 
 GPIO25 is a control signal only. The laser must use its own correctly rated
 power supply and a hardware pull-down/isolator so reset and boot stay dark.
@@ -25,11 +26,12 @@ configuration fields do not control the firmware ramp.
 - `s F R L`: signed target speeds in steps/s, including ramped zero/stop.
 - `u F R L P`: atomic signed targets and laser request, where P is 0..1000
   permille. This frame must be refreshed while optical output is permitted.
-- `la 0/1`: software disarm/arm; arming also requires GPIO26 high.
+- `la 0/1`: software disarm/arm.
 - `lf Hz`: configure PWM frequency from 20 through 20000 Hz.
 - `lw milliseconds`: independent laser-frame watchdog, 100 through 2000 ms.
 - `lq`: request laser telemetry. Periodic `l` telemetry reports software arm,
-  interlock, requested/applied duty, frequency, and watchdog.
+  the compatibility interlock field (always closed), requested/applied duty,
+  frequency, and watchdog.
 - `k`: heartbeat, without changing targets. Host sends it every 200 ms or
   faster for short watchdog settings.
 - `stop` / `x`: emergency abort (may lose an in-flight step in odometry).
@@ -54,7 +56,7 @@ live Python API connect/drive/stop/disable; web service restart.
 These checks observe commanded/executed electrical steps, not encoder-confirmed
 rotor motion. Mechanical smoothness under load still needs observation.
 
-Every stop, emergency stop, motor watchdog, interlock opening, firmware reset,
+Every stop, emergency stop, motor watchdog, firmware reset,
 and stale laser frame removes PWM before motor braking. Laser output is also
 forced off when the motors are not moving. Test the complete failure matrix with
 the laser physically disconnected before connecting an optical module.

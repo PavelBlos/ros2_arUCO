@@ -254,6 +254,7 @@ class LocalizationNode(Node):
 
         # Состояние автопилота и маршрутизатора
         self.route_waypoints = []
+        self.route_laser_factors = []
         self.route_state = "idle"  # idle, running, paused, finished
         self.current_wp_idx = 0
         self.autopilot_thread = None
@@ -1334,7 +1335,8 @@ class LocalizationNode(Node):
             "watchdog_ms": int(telemetry.watchdog_ms) if telemetry_fresh else int(self.laser_watchdog_ms),
             "telemetry_fresh": telemetry_fresh,
             "fault": self.laser_fault,
-            "pins": {"pwm": 25, "indicator_led": 2, "interlock": 26},
+            "interlock_required": False,
+            "pins": {"pwm": 25, "indicator_led": 2},
         }
 
     def laser_safe_off(self, disarm=False, reason="laser output disabled"):
@@ -1365,8 +1367,6 @@ class LocalizationNode(Node):
         status = self.laser_status()
         if not status['telemetry_fresh']:
             raise RuntimeError("laser telemetry is not fresh")
-        if not status['interlock_closed']:
-            raise RuntimeError("physical laser interlock on GPIO26 is open")
         self.robot.set_laser_permit(True)
         self.laser_permit = True
         self.laser_permit_deadline = time.monotonic() + 1.0
@@ -1391,16 +1391,19 @@ class LocalizationNode(Node):
         status = self.laser_status()
         if not status['telemetry_fresh']:
             self.laser_safe_off(disarm=True, reason="laser telemetry timeout")
-        elif not status['interlock_closed']:
-            self.laser_safe_off(disarm=True, reason="physical interlock opened")
 
-    def laser_power_for_route_motion(self, forward, strafe, omega):
+    def laser_power_for_route_motion(self, forward, strafe, omega, segment_factor=1.0):
         """Apply speed compensation using velocity of the offset laser spot."""
         if not self.laser_permit or self.laser_mode != 'ROUTE_SPEED' or self.route_state != 'running':
             self.laser_safe_off(disarm=False, reason="route laser is inactive")
             return 0.0
         if time.time() - self.last_valid_tag_time > 0.5:
             self.laser_safe_off(disarm=True, reason="fresh ArUco localization was lost")
+            return 0.0
+        segment_factor = float(np.clip(segment_factor, 0.0, 1.0))
+        if segment_factor <= 0.0:
+            self.laser_last_command_pct = 0.0
+            self.laser_fault = "laser is off for this route segment"
             return 0.0
         ox = self.laser_offset_x_mm / 1000.0
         oy = self.laser_offset_y_mm / 1000.0
@@ -1411,7 +1414,7 @@ class LocalizationNode(Node):
             self.laser_safe_off(disarm=False, reason="laser spot speed is below safety threshold")
             return 0.0
         ratio = max(0.0, speed / max(1e-6, self.laser_reference_speed_mps))
-        requested = self.laser_nominal_power_pct * (ratio ** self.laser_speed_gamma)
+        requested = self.laser_nominal_power_pct * segment_factor * (ratio ** self.laser_speed_gamma)
         requested = min(self.laser_max_power_pct, max(self.laser_min_active_power_pct, requested))
         self.laser_last_command_pct = requested
         self.laser_fault = ""
@@ -1517,7 +1520,27 @@ class LocalizationNode(Node):
 
     def set_path_plan(self, waypoints):
         """Сохранение путевых точек маршрута, расчет кумулятивных длин и скоростей в углах"""
-        self.route_waypoints = [list(pt) for pt in waypoints]
+        if len(waypoints) > 10000:
+            raise ValueError("Маршрут ограничен 10000 точками")
+        normalized = []
+        laser_factors = []
+        for index, pt in enumerate(waypoints):
+            if isinstance(pt, dict):
+                x, y = float(pt.get('x')), float(pt.get('y'))
+                laser = float(pt.get('laser', 1.0 if index else 0.0))
+            else:
+                if len(pt) < 2:
+                    raise ValueError("Каждая точка должна содержать X и Y")
+                x, y = float(pt[0]), float(pt[1])
+                laser = float(pt[2]) if len(pt) > 2 else (1.0 if index else 0.0)
+            if not all(math.isfinite(v) for v in (x, y, laser)):
+                raise ValueError("Координаты и мощность маршрута должны быть конечными")
+            if abs(x) > 20.0 or abs(y) > 20.0:
+                raise ValueError("Точка маршрута выходит за пределы ±20 м")
+            normalized.append([x, y])
+            laser_factors.append(float(np.clip(laser, 0.0, 1.0)))
+        self.route_waypoints = normalized
+        self.route_laser_factors = laser_factors
         self.current_seg_idx = 0
         self.current_wp_idx = 0
         self.route_state = "idle"
@@ -1551,7 +1574,7 @@ class LocalizationNode(Node):
                     v_c = speed_limit * np.cos(turn_angle / 2.0) * self.ap_turn_factor
                     self.path_corner_speeds[i] = max(self.ap_min_lin, float(v_c))
 
-        self.publish_plan(waypoints)
+        self.publish_plan(self.route_waypoints)
         self.notify_ui_event()
         self.get_logger().info(f"Загружен маршрут: {len(waypoints)} точек, общая длина {self.path_s_accum[-1]:.2f}м")
 
@@ -1637,6 +1660,7 @@ class LocalizationNode(Node):
         """Очистка путевых точек"""
         self.stop_route()
         self.route_waypoints = []
+        self.route_laser_factors = []
         self.publish_plan([])
         self.notify_ui_event()
         self.get_logger().info("🗑 Путевые точки очищены.")
@@ -1651,7 +1675,11 @@ class LocalizationNode(Node):
         points = []
         for i in range(num_pts + 1):
             t = i / float(num_pts)
-            points.append([float(rx * (1.0 - t)), float(ry * (1.0 - t))])
+            points.append({
+                "x": float(rx * (1.0 - t)),
+                "y": float(ry * (1.0 - t)),
+                "laser": 0.0,
+            })
         self.set_path_plan(points)
         self.get_logger().info(f"🎯 Построен маршрут возврата в (0,0): {len(points)} точек, дистанция {dist:.2f}м")
         return self.start_route()
@@ -1712,6 +1740,9 @@ class LocalizationNode(Node):
         resuming = bool(getattr(self, 'resume_route_requested', False))
         self.resume_route_requested = False
         control_waypoints = [list(point) for point in self.route_waypoints]
+        control_laser_factors = list(self.route_laser_factors)
+        if len(control_laser_factors) != len(control_waypoints):
+            control_laser_factors = [0.0] + [1.0] * max(0, len(control_waypoints) - 1)
         route_index_offset = 0
 
         # A drawn path starts at point 1, but the robot can be somewhere else.
@@ -1723,6 +1754,7 @@ class LocalizationNode(Node):
         ))
         if not resuming and first_distance > self.ap_goal_tol:
             control_waypoints.insert(0, [float(self.fused_x), float(self.fused_y)])
+            control_laser_factors.insert(0, 0.0)
             route_index_offset = 1
             self.get_logger().info(
                 f"🎯 Сначала подъезжаем к точке 1: расстояние {first_distance*100:.1f} см"
@@ -1965,7 +1997,8 @@ class LocalizationNode(Node):
 
             # 11. Отправка команды движения
             laser_power = self.laser_power_for_route_motion(
-                smooth_forward, smooth_strafe, smooth_w
+                smooth_forward, smooth_strafe, smooth_w,
+                control_laser_factors[min(seg_idx + 1, len(control_laser_factors) - 1)],
             )
             if not self.drive_robot(
                 smooth_forward, smooth_strafe, smooth_w,
@@ -2440,6 +2473,9 @@ class WebServerHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         node = self.server.node
         content_length = int(self.headers.get('Content-Length', 0))
+        if content_length > 2 * 1024 * 1024:
+            self._send_json(413, {"error": "Request body is limited to 2 MiB"})
+            return
         post_data = self.rfile.read(content_length) if content_length > 0 else b""
         payload = {}
         if post_data:
@@ -2453,7 +2489,21 @@ class WebServerHandler(SimpleHTTPRequestHandler):
         query = parse_qs(parsed_url.query)
         request_path = parsed_url.path
 
-        if self.path.startswith('/api/camera-calibration/start'):
+        if request_path == '/api/path':
+            try:
+                points = payload.get('points', [])
+                if not isinstance(points, list):
+                    raise ValueError("points must be an array")
+                node.set_path_plan(points)
+                self._send_json(200, {
+                    "status": "ok",
+                    "count": len(node.route_waypoints),
+                    "laser_segments": sum(1 for factor in node.route_laser_factors if factor > 0.0),
+                })
+            except (TypeError, ValueError) as exc:
+                self._send_json(400, {"error": str(exc)})
+
+        elif self.path.startswith('/api/camera-calibration/start'):
             try:
                 node.stop_route()
                 node.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.MANUAL)
@@ -3854,6 +3904,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: #45a29e;
             margin-right: 6px;
         }
+        #artwork-preview {
+            width: 100%;
+            height: 180px;
+            background: #fff;
+            border: 1px solid rgba(255,255,255,.12);
+            border-radius: 6px;
+            cursor: default;
+        }
+        .artwork-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 7px;
+        }
+        .artwork-field label {
+            display: block;
+            color: #8b9bb4;
+            font-size: 10px;
+            margin-bottom: 3px;
+        }
     </style>
 </head>
 <body>
@@ -3934,7 +4003,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title settings-only settings-laser">Безопасность лазера</div>
         <div class="calib-container settings-only settings-laser">
-            <div class="guide-box">PWM GPIO25, индикатор GPIO2, аппаратная блокировка GPIO26. Разрешение после перезапуска всегда выключено.</div>
+            <div class="guide-box">PWM GPIO25, индикатор GPIO2. GPIO26 сейчас не используется. Программное разрешение и watchdog после перезапуска всегда выключают лазер.</div>
             <div class="calib-row"><span class="stat-label">Режим:</span><select id="input-laser-mode" class="calib-input"><option value="OFF">Выключен</option><option value="ROUTE_SPEED">Маршрут с компенсацией скорости</option></select></div>
             <div class="calib-row"><span class="stat-label">PWM (Гц):</span><input type="number" id="input-laser-pwm-hz" class="calib-input" min="20" max="20000" step="1"></div>
             <div class="calib-row"><span class="stat-label">Watchdog (мс):</span><input type="number" id="input-laser-watchdog" class="calib-input" min="100" max="2000" step="10"></div>
@@ -4128,6 +4197,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <button class="btn btn-secondary" id="btn-gen-circle" style="flex: 1; font-size: 11px; padding: 6px 2px; margin-bottom: 0;">Круг R=1м</button>
                 </div>
             </div>
+        </div>
+
+        <div class="section-title remote-only" style="margin-top:15px;">Файл для гравировки или резки</div>
+        <div class="calib-container remote-only" style="display:flex; flex-direction:column; gap:8px;">
+            <div class="guide-box">SVG и DXF переводятся в контуры. PNG переводится в построчную змейку. Фиолетовые линии — рабочий ход лазера, серые пунктирные — переезд с выключенным лазером. Маршрут сначала только подготавливается; запуск выполняется отдельной кнопкой «Старт».</div>
+            <input type="file" id="artwork-file" accept=".svg,.png,.dxf,image/png,image/svg+xml" class="calib-input" style="width:100%;">
+            <div class="artwork-grid">
+                <div class="artwork-field"><label>Режим</label><select id="artwork-mode" class="calib-input" style="width:100%;"><option value="auto">Автоматически</option><option value="vector">Контуры</option><option value="raster">Растр-змейка</option></select></div>
+                <div class="artwork-field"><label>Шаг контура (мм)</label><input id="artwork-vector-step" type="number" value="5" min="0.5" max="100" step="0.5" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Ширина (мм)</label><input id="artwork-width" type="number" value="200" min="5" max="5000" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Высота (мм)</label><input id="artwork-height" type="number" value="200" min="5" max="5000" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Центр X карты (м)</label><input id="artwork-center-x" type="number" value="0" step="0.01" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Центр Y карты (м)</label><input id="artwork-center-y" type="number" value="0" step="0.01" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Обрезка слева (%)</label><input id="artwork-crop-left" type="number" value="0" min="0" max="45" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Обрезка справа (%)</label><input id="artwork-crop-right" type="number" value="0" min="0" max="45" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Обрезка сверху (%)</label><input id="artwork-crop-top" type="number" value="0" min="0" max="45" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Обрезка снизу (%)</label><input id="artwork-crop-bottom" type="number" value="0" min="0" max="45" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Шаг строк PNG (мм)</label><input id="artwork-raster-step" type="number" value="5" min="1" max="100" step="1" class="calib-input" style="width:100%;"></div>
+                <div class="artwork-field"><label>Порог PNG (0…255)</label><input id="artwork-threshold" type="number" value="160" min="0" max="255" step="1" class="calib-input" style="width:100%;"></div>
+            </div>
+            <label style="font-size:11px;color:#8b9bb4;"><input type="checkbox" id="artwork-lock-aspect" checked> сохранять пропорции</label>
+            <label style="font-size:11px;color:#8b9bb4;"><input type="checkbox" id="artwork-invert"> инвертировать PNG</label>
+            <button class="btn btn-secondary" id="artwork-center-robot" style="margin:0;">Поместить центр на робота</button>
+            <canvas id="artwork-preview" width="300" height="180"></canvas>
+            <div id="artwork-summary" style="font-size:10px;color:#8b9bb4;line-height:1.4;">Выберите SVG, PNG или ASCII DXF.</div>
+            <button class="btn" id="artwork-build-route" style="margin:0;">Подготовить маршрут</button>
         </div>
 
         <div class="section-title settings-only settings-autopilot">Все параметры автоматического движения</div>
@@ -4439,16 +4534,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             // Отрисовка нарисованного маршрута автопилота
             if (plannedPath.length > 0) {
-                ctx.strokeStyle = 'rgba(168, 85, 247, 0.8)';
                 ctx.lineWidth = 3;
-                ctx.beginPath();
-                ctx.moveTo(panX + plannedPath[0].x * zoom, panY - plannedPath[0].y * zoom);
                 for (let i = 1; i < plannedPath.length; i++) {
+                    const activeLaser = Number(plannedPath[i].laser ?? 1) > 0;
+                    ctx.strokeStyle = activeLaser ? 'rgba(168, 85, 247, 0.9)' : 'rgba(148, 163, 184, 0.55)';
+                    ctx.setLineDash(activeLaser ? [] : [5, 5]);
+                    ctx.beginPath();
+                    ctx.moveTo(panX + plannedPath[i - 1].x * zoom, panY - plannedPath[i - 1].y * zoom);
                     ctx.lineTo(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom);
+                    ctx.stroke();
                 }
-                ctx.stroke();
+                ctx.setLineDash([]);
                 
-                for (let i = 0; i < plannedPath.length; i++) {
+                const markerStride = Math.max(1, Math.ceil(plannedPath.length / 200));
+                for (let i = 0; i < plannedPath.length; i += markerStride) {
                     ctx.fillStyle = i === 0 ? '#2ecc71' : (i === plannedPath.length - 1 ? '#ff4d4d' : '#a855f7');
                     ctx.beginPath();
                     ctx.arc(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom, 5, 0, 2 * Math.PI);
@@ -4459,7 +4558,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     
                     ctx.fillStyle = '#fff';
                     ctx.font = '10px monospace';
-                    ctx.fillText(i + 1, panX + plannedPath[i].x * zoom + 8, panY - plannedPath[i].y * zoom - 4);
+                    if (plannedPath.length <= 200) ctx.fillText(i + 1, panX + plannedPath[i].x * zoom + 8, panY - plannedPath[i].y * zoom - 4);
                 }
             }
 
@@ -4890,6 +4989,285 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const btnRouteStop = document.getElementById('btn-route-stop');
         const btnClearPlan = document.getElementById('btn-clear-plan');
         const btnReturnHome = document.getElementById('btn-return-home');
+
+        async function uploadPlannedPath() {
+            const response = await fetch('/api/path', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({points: plannedPath.map((pt, index) => ({
+                    x: Number(pt.x), y: Number(pt.y), laser: Number(pt.laser ?? (index ? 1 : 0))
+                }))})
+            });
+            const result = await response.json();
+            if (!response.ok) throw new Error(result.error || 'маршрут отклонён сервером');
+            return result;
+        }
+
+        // Offline artwork import: no cloud/CDN is needed, which also makes it
+        // work when the Raspberry Pi is serving its fallback access point.
+        let importedArtwork = null;
+        const artworkPreview = document.getElementById('artwork-preview');
+        const artworkPreviewCtx = artworkPreview.getContext('2d');
+        const artworkSummary = document.getElementById('artwork-summary');
+        const artworkValue = (id, fallback=0) => {
+            const value = Number(document.getElementById(id).value);
+            return Number.isFinite(value) ? value : fallback;
+        };
+        function artworkCrop() {
+            const left = artworkValue('artwork-crop-left') / 100;
+            const right = artworkValue('artwork-crop-right') / 100;
+            const top = artworkValue('artwork-crop-top') / 100;
+            const bottom = artworkValue('artwork-crop-bottom') / 100;
+            if (left + right >= .95 || top + bottom >= .95) throw new Error('обрезка удаляет всё изображение');
+            return {left, right, top, bottom};
+        }
+        function contourBounds(contours) {
+            const points = contours.flat();
+            if (!points.length) throw new Error('в файле не найдено поддерживаемых линий');
+            return {
+                minX: Math.min(...points.map(p => p[0])), maxX: Math.max(...points.map(p => p[0])),
+                minY: Math.min(...points.map(p => p[1])), maxY: Math.max(...points.map(p => p[1]))
+            };
+        }
+        function parseSvgContours(text) {
+            const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+            if (doc.querySelector('parsererror')) throw new Error('ошибка синтаксиса SVG');
+            const svg = document.importNode(doc.documentElement, true);
+            svg.querySelectorAll('script,foreignObject,image,use').forEach(el => el.remove());
+            svg.style.cssText = 'position:fixed;left:-10000px;top:0;visibility:hidden;width:1000px;height:1000px;';
+            document.body.appendChild(svg);
+            const contours = [];
+            try {
+                svg.querySelectorAll('path,polyline,polygon,line,rect,circle,ellipse').forEach(el => {
+                    if (typeof el.getTotalLength !== 'function') return;
+                    let length;
+                    try { length = el.getTotalLength(); } catch (_) { return; }
+                    if (!Number.isFinite(length) || length <= 0) return;
+                    const samples = Math.min(2500, Math.max(2, Math.ceil(length / 2)));
+                    const matrix = el.getCTM();
+                    const contour = [];
+                    for (let i = 0; i <= samples; i++) {
+                        const p = el.getPointAtLength(length * i / samples);
+                        const q = matrix ? p.matrixTransform(matrix) : p;
+                        contour.push([q.x, q.y]);
+                    }
+                    if (contour.length > 1) contours.push(contour);
+                });
+            } finally { svg.remove(); }
+            return contours;
+        }
+        function parseDxfContours(text) {
+            const lines = text.replace(/\r/g, '').split('\n');
+            const pairs = [];
+            for (let i = 0; i + 1 < lines.length; i += 2) pairs.push([Number(lines[i].trim()), lines[i + 1].trim()]);
+            const contours = [];
+            let inEntities = false;
+            let legacyPolyline = null, legacyClosed = false;
+            for (let i = 0; i < pairs.length;) {
+                if (pairs[i][0] === 0 && pairs[i][1] === 'SECTION' && pairs[i + 1]?.[0] === 2) {
+                    inEntities = pairs[i + 1][1] === 'ENTITIES'; i += 2; continue;
+                }
+                if (pairs[i][0] === 0 && pairs[i][1] === 'ENDSEC') { inEntities = false; i++; continue; }
+                if (!inEntities || pairs[i][0] !== 0) { i++; continue; }
+                const type = pairs[i][1].toUpperCase();
+                let j = i + 1;
+                while (j < pairs.length && pairs[j][0] !== 0) j++;
+                const data = pairs.slice(i + 1, j);
+                const first = code => { const p = data.find(v => v[0] === code); return p ? Number(p[1]) : NaN; };
+                if (type === 'POLYLINE') {
+                    legacyPolyline = [];
+                    legacyClosed = Boolean((first(70) | 0) & 1);
+                } else if (type === 'VERTEX' && legacyPolyline) {
+                    const x=first(10), y=first(20);
+                    if (Number.isFinite(x) && Number.isFinite(y)) legacyPolyline.push([x,y]);
+                } else if (type === 'SEQEND' && legacyPolyline) {
+                    if (legacyClosed && legacyPolyline.length>1) legacyPolyline.push([...legacyPolyline[0]]);
+                    if (legacyPolyline.length>1) contours.push(legacyPolyline);
+                    legacyPolyline=null; legacyClosed=false;
+                } else if (type === 'LINE') {
+                    const p = [[first(10), first(20)], [first(11), first(21)]];
+                    if (p.flat().every(Number.isFinite)) contours.push(p);
+                } else if (type === 'LWPOLYLINE') {
+                    const p = [];
+                    for (let k = 0; k < data.length; k++) if (data[k][0] === 10) {
+                        const y = data.slice(k + 1).find(v => v[0] === 20);
+                        if (y) p.push([Number(data[k][1]), Number(y[1])]);
+                    }
+                    if ((first(70) | 0) & 1 && p.length > 1) p.push([...p[0]]);
+                    if (p.length > 1) contours.push(p);
+                } else if (type === 'CIRCLE' || type === 'ARC') {
+                    const cx = first(10), cy = first(20), radius = first(40);
+                    let a0 = type === 'ARC' ? first(50) : 0, a1 = type === 'ARC' ? first(51) : 360;
+                    if (a1 < a0) a1 += 360;
+                    if ([cx, cy, radius, a0, a1].every(Number.isFinite)) {
+                        const n = Math.max(12, Math.ceil(Math.abs(a1 - a0) / 4));
+                        const p = [];
+                        for (let k = 0; k <= n; k++) {
+                            const a = (a0 + (a1 - a0) * k / n) * Math.PI / 180;
+                            p.push([cx + radius * Math.cos(a), cy + radius * Math.sin(a)]);
+                        }
+                        contours.push(p);
+                    }
+                }
+                i = j;
+            }
+            return contours;
+        }
+        function clipLine(a, b, bounds) {
+            let t0 = 0, t1 = 1;
+            const dx = b[0] - a[0], dy = b[1] - a[1];
+            const tests = [[-dx, a[0] - bounds.minX], [dx, bounds.maxX - a[0]], [-dy, a[1] - bounds.minY], [dy, bounds.maxY - a[1]]];
+            for (const [p, q] of tests) {
+                if (Math.abs(p) < 1e-12) { if (q < 0) return null; continue; }
+                const r = q / p;
+                if (p < 0) { if (r > t1) return null; t0 = Math.max(t0, r); }
+                else { if (r < t0) return null; t1 = Math.min(t1, r); }
+            }
+            return [[a[0] + t0 * dx, a[1] + t0 * dy], [a[0] + t1 * dx, a[1] + t1 * dy]];
+        }
+        function cropContours(contours, crop) {
+            const full = contourBounds(contours), width = full.maxX - full.minX, height = full.maxY - full.minY;
+            const bounds = {minX: full.minX + width * crop.left, maxX: full.maxX - width * crop.right,
+                            minY: full.minY + height * crop.top, maxY: full.maxY - height * crop.bottom};
+            const result = [];
+            for (const contour of contours) {
+                let current = [];
+                for (let i = 1; i < contour.length; i++) {
+                    const clipped = clipLine(contour[i - 1], contour[i], bounds);
+                    if (!clipped) { if (current.length > 1) result.push(current); current = []; continue; }
+                    if (!current.length || Math.hypot(current.at(-1)[0] - clipped[0][0], current.at(-1)[1] - clipped[0][1]) > 1e-6) {
+                        if (current.length > 1) result.push(current);
+                        current = [clipped[0]];
+                    }
+                    current.push(clipped[1]);
+                }
+                if (current.length > 1) result.push(current);
+            }
+            return {contours: result, bounds};
+        }
+        function resampleContour(points, stepM) {
+            const output = [points[0]];
+            for (let i = 1; i < points.length; i++) {
+                const a = points[i - 1], b = points[i], length = Math.hypot(b.x - a.x, b.y - a.y);
+                const n = Math.max(1, Math.ceil(length / stepM));
+                for (let k = 1; k <= n; k++) output.push({x:a.x + (b.x-a.x)*k/n, y:a.y + (b.y-a.y)*k/n});
+            }
+            return output;
+        }
+        function buildVectorRoute() {
+            const cropped = cropContours(importedArtwork.contours, artworkCrop());
+            if (!cropped.contours.length) throw new Error('после обрезки контуры исчезли');
+            const widthM = artworkValue('artwork-width', 200) / 1000;
+            const heightM = artworkValue('artwork-height', 200) / 1000;
+            const cx = artworkValue('artwork-center-x'), cy = artworkValue('artwork-center-y');
+            const bw = Math.max(1e-9, cropped.bounds.maxX - cropped.bounds.minX);
+            const bh = Math.max(1e-9, cropped.bounds.maxY - cropped.bounds.minY);
+            const midX = (cropped.bounds.minX + cropped.bounds.maxX) / 2, midY = (cropped.bounds.minY + cropped.bounds.maxY) / 2;
+            const stepM = Math.max(.0005, artworkValue('artwork-vector-step', 5) / 1000);
+            let contours = cropped.contours.map(contour => resampleContour(contour.map(p => ({
+                x: cx + (p[0] - midX) * widthM / bw,
+                y: cy - (p[1] - midY) * heightM / bh
+            })), stepM)).filter(c => c.length > 1);
+            const ordered = [], cursor = {x:robotPos.x, y:robotPos.y};
+            while (contours.length) {
+                let best = 0, reverse = false, distance = Infinity;
+                contours.forEach((c, i) => {
+                    const d0 = Math.hypot(c[0].x-cursor.x, c[0].y-cursor.y), d1 = Math.hypot(c.at(-1).x-cursor.x, c.at(-1).y-cursor.y);
+                    if (Math.min(d0,d1) < distance) { best=i; reverse=d1<d0; distance=Math.min(d0,d1); }
+                });
+                const contour = contours.splice(best,1)[0];
+                if (reverse) contour.reverse();
+                ordered.push(contour); Object.assign(cursor, contour.at(-1));
+            }
+            const route = [];
+            ordered.forEach(contour => {
+                route.push({...contour[0], laser:0});
+                for (let i=1; i<contour.length; i++) route.push({...contour[i], laser:1});
+            });
+            return route;
+        }
+        function buildRasterRoute() {
+            if (importedArtwork.type !== 'png') throw new Error('растровый режим предназначен для PNG');
+            const crop = artworkCrop(), img = importedArtwork.image;
+            const sx = Math.round(img.width * crop.left), sy = Math.round(img.height * crop.top);
+            const sw = Math.max(1, Math.round(img.width * (1-crop.left-crop.right)));
+            const sh = Math.max(1, Math.round(img.height * (1-crop.top-crop.bottom)));
+            const scale = Math.min(1, 1000 / Math.max(sw, sh));
+            const w = Math.max(1, Math.round(sw*scale)), h = Math.max(1, Math.round(sh*scale));
+            const off = document.createElement('canvas'); off.width=w; off.height=h;
+            const oc = off.getContext('2d', {willReadFrequently:true}); oc.drawImage(img,sx,sy,sw,sh,0,0,w,h);
+            const pixels = oc.getImageData(0,0,w,h).data;
+            const widthM=artworkValue('artwork-width',200)/1000, heightM=artworkValue('artwork-height',200)/1000;
+            const cx=artworkValue('artwork-center-x'), cy=artworkValue('artwork-center-y');
+            const rowStep=Math.max(1,Math.round((artworkValue('artwork-raster-step',5)/1000)/heightM*h));
+            const threshold=artworkValue('artwork-threshold',160), invert=document.getElementById('artwork-invert').checked;
+            const route=[];
+            for (let y=0,row=0; y<h; y+=rowStep,row++) {
+                const runs=[]; let start=-1;
+                for (let x=0; x<=w; x++) {
+                    let dark=false;
+                    if (x<w) { const n=(y*w+x)*4, lum=.2126*pixels[n]+.7152*pixels[n+1]+.0722*pixels[n+2]; dark=pixels[n+3]>32 && (invert ? lum>threshold : lum<threshold); }
+                    if (dark && start<0) start=x;
+                    if (!dark && start>=0) { runs.push([start,Math.max(start,x-1)]); start=-1; }
+                }
+                if (row%2) runs.reverse();
+                for (const run of runs) {
+                    let [x0,x1]=run; if (row%2) [x0,x1]=[x1,x0];
+                    const point=(xv,laser)=>({x:cx+(xv/(Math.max(1,w-1))-.5)*widthM, y:cy-(y/(Math.max(1,h-1))-.5)*heightM, laser});
+                    route.push(point(x0,0),point(x1,1));
+                }
+            }
+            if (!route.length) throw new Error('по выбранному порогу тёмные области не найдены');
+            return route;
+        }
+        function renderArtworkPreview(route=null) {
+            const w=artworkPreview.width=artworkPreview.clientWidth*devicePixelRatio, h=artworkPreview.height=180*devicePixelRatio;
+            artworkPreviewCtx.fillStyle='#fff'; artworkPreviewCtx.fillRect(0,0,w,h);
+            if (!route?.length) {
+                if (importedArtwork?.type==='png') {
+                    const c=artworkCrop(), img=importedArtwork.image;
+                    artworkPreviewCtx.drawImage(img,img.width*c.left,img.height*c.top,img.width*(1-c.left-c.right),img.height*(1-c.top-c.bottom),0,0,w,h);
+                }
+                return;
+            }
+            const minX=Math.min(...route.map(p=>p.x)),maxX=Math.max(...route.map(p=>p.x)),minY=Math.min(...route.map(p=>p.y)),maxY=Math.max(...route.map(p=>p.y));
+            const scale=.9*Math.min(w/Math.max(1e-9,maxX-minX),h/Math.max(1e-9,maxY-minY));
+            const px=x=>(x-(minX+maxX)/2)*scale+w/2, py=y=>h/2-(y-(minY+maxY)/2)*scale;
+            artworkPreviewCtx.lineWidth=Math.max(1,devicePixelRatio);
+            for(let i=1;i<route.length;i++){
+                const active=route[i].laser>0; artworkPreviewCtx.strokeStyle=active?'#7c3aed':'#94a3b8'; artworkPreviewCtx.setLineDash(active?[]:[4,4]);
+                artworkPreviewCtx.beginPath(); artworkPreviewCtx.moveTo(px(route[i-1].x),py(route[i-1].y)); artworkPreviewCtx.lineTo(px(route[i].x),py(route[i].y)); artworkPreviewCtx.stroke();
+            }
+            artworkPreviewCtx.setLineDash([]);
+        }
+        document.getElementById('artwork-file').addEventListener('change', event => {
+            const file=event.target.files[0]; if(!file) return;
+            const ext=file.name.split('.').pop().toLowerCase(), reader=new FileReader();
+            reader.onerror=()=>artworkSummary.textContent='Ошибка чтения файла.';
+            if(ext==='png'){
+                reader.onload=()=>{ const img=new Image(); img.onload=()=>{ importedArtwork={type:'png',image:img,aspect:img.width/img.height,name:file.name}; document.getElementById('artwork-height').value=Math.round(artworkValue('artwork-width',200)/importedArtwork.aspect); artworkSummary.textContent=`PNG ${img.width}×${img.height}. Настройте обрезку и порог.`; renderArtworkPreview(); }; img.src=reader.result; }; reader.readAsDataURL(file);
+            }else if(ext==='svg'||ext==='dxf'){
+                reader.onload=()=>{ try{ const contours=ext==='svg'?parseSvgContours(reader.result):parseDxfContours(reader.result); const b=contourBounds(contours); importedArtwork={type:'vector',contours,aspect:Math.max(1e-9,b.maxX-b.minX)/Math.max(1e-9,b.maxY-b.minY),name:file.name}; document.getElementById('artwork-height').value=Math.round(artworkValue('artwork-width',200)/importedArtwork.aspect); artworkSummary.textContent=`${ext.toUpperCase()}: ${contours.length} контуров. Настройте размер и обрезку.`; renderArtworkPreview(); }catch(e){ importedArtwork=null; artworkSummary.textContent=`Ошибка: ${e.message}`; }}; reader.readAsText(file);
+            }else artworkSummary.textContent='Поддерживаются SVG, PNG и ASCII DXF.';
+        });
+        document.getElementById('artwork-width').addEventListener('input',()=>{ if(importedArtwork&&document.getElementById('artwork-lock-aspect').checked) document.getElementById('artwork-height').value=(artworkValue('artwork-width')/importedArtwork.aspect).toFixed(1); });
+        document.getElementById('artwork-height').addEventListener('input',()=>{ if(importedArtwork&&document.getElementById('artwork-lock-aspect').checked) document.getElementById('artwork-width').value=(artworkValue('artwork-height')*importedArtwork.aspect).toFixed(1); });
+        ['artwork-crop-left','artwork-crop-right','artwork-crop-top','artwork-crop-bottom'].forEach(id=>document.getElementById(id).addEventListener('input',()=>{ try{ renderArtworkPreview(); }catch(e){ artworkSummary.textContent=`Ошибка: ${e.message}`; } }));
+        document.getElementById('artwork-center-robot').addEventListener('click',()=>{ document.getElementById('artwork-center-x').value=robotPos.x.toFixed(3); document.getElementById('artwork-center-y').value=robotPos.y.toFixed(3); });
+        document.getElementById('artwork-build-route').addEventListener('click',async()=>{
+            if(!importedArtwork){ artworkSummary.textContent='Сначала выберите файл.'; return; }
+            try{
+                const requested=document.getElementById('artwork-mode').value;
+                const raster=requested==='raster'||(requested==='auto'&&importedArtwork.type==='png');
+                const route=raster?buildRasterRoute():buildVectorRoute();
+                if(route.length>10000) throw new Error(`получилось ${route.length} точек; увеличьте шаг или обрежьте изображение (максимум 10000)`);
+                plannedPath=route; const result=await uploadPlannedPath(); renderArtworkPreview(route);
+                const active=result.laser_segments, widthM=artworkValue('artwork-width')/1000, heightM=artworkValue('artwork-height')/1000;
+                const cx=artworkValue('artwork-center-x'),cy=artworkValue('artwork-center-y'); autoCenter=false; zoom=Math.max(15,Math.min(3000,.75*Math.min(canvas.width/Math.max(.02,widthM),canvas.height/Math.max(.02,heightM)))); panX=canvas.width/2-cx*zoom; panY=canvas.height/2+cy*zoom;
+                artworkSummary.textContent=`Маршрут готов: ${route.length} точек, рабочих сегментов ${active}. Проверьте карту и нажмите «Старт».`;
+                addLog(`Файл ${importedArtwork.name}: подготовлено ${route.length} точек, лазер включён на ${active} сегментах.`); draw();
+            }catch(e){ artworkSummary.textContent=`Ошибка: ${e.message}`; addLog(`Ошибка импорта: ${e.message}`); }
+        });
         
         btnDrawMode.addEventListener('click', () => {
             drawMode = !drawMode;
@@ -4916,7 +5294,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const x = (mouseX - panX) / zoom;
             const y = (panY - mouseY) / zoom;
             
-            plannedPath.push({ x, y });
+            plannedPath.push({ x, y, laser: plannedPath.length ? 1 : 0 });
             addLog(`Точка маршрута: X=${x.toFixed(2)}, Y=${y.toFixed(2)}`);
             draw();
         });
@@ -4935,10 +5313,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 canvas.style.cursor = 'grab';
             }
             
-            const ptsStr = plannedPath.map(pt => `${pt.x.toFixed(3)},${pt.y.toFixed(3)}`).join(';');
-            fetch(`/set_path?points=${ptsStr}`)
-                .then(res => res.json())
-                .then(data => {
+            uploadPlannedPath()
+                .then(() => {
                     fetch(`/start_route`)
                         .then(r => r.json())
                         .then(resData => {
@@ -5007,14 +5383,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 plannedPath = [];
                 for (let i = 0; i <= numPts; i++) {
                     const t = i / numPts;
-                    plannedPath.push({ x: rx * (1.0 - t), y: ry * (1.0 - t) });
+                plannedPath.push({ x: rx * (1.0 - t), y: ry * (1.0 - t), laser: 0 });
                 }
                 draw();
                 addLog(`🎯 Возврат в (0,0): дистанция ${dist.toFixed(2)}м (${plannedPath.length} точек).`);
                 
-                const ptsStr = plannedPath.map(pt => `${pt.x.toFixed(3)},${pt.y.toFixed(3)}`).join(';');
-                fetch(`/set_path?points=${ptsStr}`)
-                    .then(res => res.json())
+                uploadPlannedPath()
                     .then(() => fetch('/start_route'))
                     .then(r => r.json())
                     .then(() => addLog("▶ Автопилот запущен для возврата в ноль!"))
@@ -5436,7 +5810,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     badge.textContent = `ИЗЛУЧЕНИЕ ${laser.applied_power_pct.toFixed(1)}%`;
                     badge.style.color = '#ff3b30';
                 } else if (laser.permit) {
-                    badge.textContent = laser.interlock_closed ? 'РАЗРЕШЁН, PWM=0' : 'БЛОКИРОВКА РАЗОМКНУТА';
+                    badge.textContent = 'РАЗРЕШЁН, PWM=0';
                     badge.style.color = '#f39c12';
                 } else {
                     badge.textContent = 'ЗАПРЕЩЁН';
@@ -5444,7 +5818,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
                 button.textContent = laser.permit ? 'Запретить работу лазера' : 'Разрешить работу лазера';
                 button.style.borderColor = laser.permit ? '#2ecc71' : '#e74c3c';
-                details.textContent = `ESP32: ${laser.supported ? 'готов' : 'нет laser firmware'}; блокировка: ${laser.interlock_closed ? 'замкнута' : 'разомкнута'}; PWM ${laser.pwm_hz || 100} Гц; ${laser.fault || 'ошибок нет'}`;
+                details.textContent = `ESP32: ${laser.supported ? 'готов' : 'нет laser firmware'}; GPIO26 не используется; PWM ${laser.pwm_hz || 100} Гц; ${laser.fault || 'ошибок нет'}`;
             } catch (e) {}
         }
 

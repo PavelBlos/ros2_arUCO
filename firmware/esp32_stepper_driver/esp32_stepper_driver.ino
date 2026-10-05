@@ -7,7 +7,8 @@
  * w ms: motor watchdog; r: zero odom when stationary.
  * u F R L P: atomic wheel targets + requested laser duty (0..1000 permille).
  * la 0/1: software disarm/arm; lf Hz: PWM frequency; lw ms: laser watchdog.
- * Laser PWM GPIO25, duplicate onboard LED GPIO2, active-high interlock GPIO26.
+ * Laser PWM GPIO25, duplicate onboard LED GPIO2. Software permit and watchdog
+ * remain mandatory; the optional GPIO26 interlock is currently not required.
  */
 #include <FastAccelStepper.h>
 constexpr uint8_t STEP_PINS[] = {33, 23, 19};
@@ -15,11 +16,10 @@ constexpr uint8_t DIR_PINS[] = {32, 22, 18};
 constexpr uint8_t EN_PINS[] = {21, 17};
 constexpr uint8_t LASER_PWM_PIN = 25;
 constexpr uint8_t LASER_LED_PIN = 2;
-constexpr uint8_t LASER_INTERLOCK_PIN = 26;
 constexpr uint8_t LASER_PWM_BITS = 10;
 constexpr uint16_t LASER_PWM_MAX = (1U << LASER_PWM_BITS) - 1U;
 constexpr long MAX_SPEED = 8000;
-constexpr char VERSION[] = "TERMIT_FASTACCEL_V3_LASER";
+constexpr char VERSION[] = "TERMIT_FASTACCEL_V3_LASER_NO_INTERLOCK";
 FastAccelStepperEngine engine;
 FastAccelStepper* motors[3] = {};
 long targets[3] = {};
@@ -46,7 +46,7 @@ void laserSafeOff(bool disarm) {
   writeLaserPwm(0);
   if (disarm) laserArmed = false;
 }
-bool laserInterlockClosed() { return digitalRead(LASER_INTERLOCK_PIN) == HIGH; }
+bool laserInterlockClosed() { return true; }
 
 bool moving() {
   for (auto* m : motors) if (m && m->isRunning()) return true;
@@ -120,7 +120,7 @@ void parseCommand(const char* cmd) {
     setTargets(f, r, l);
   } else if (sscanf(cmd, "la %ld %c", &val, &extra) == 1 && (val == 0 || val == 1)) {
     if (val == 0) laserSafeOff(true);
-    else if (laserInterlockClosed()) { laserArmed = true; lastLaserFrame = millis(); }
+    else { laserArmed = true; lastLaserFrame = millis(); }
   } else if (sscanf(cmd, "lf %ld %c", &val, &extra) == 1) {
     if (val >= 20 && val <= 20000) {
       laserSafeOff(false);
@@ -169,7 +169,6 @@ void parseCommand(const char* cmd) {
 }
 void setup() {
   // Establish a safe electrical state before serial, steppers, or networking.
-  pinMode(LASER_INTERLOCK_PIN, INPUT_PULLDOWN);
   pinMode(LASER_PWM_PIN, OUTPUT);
   pinMode(LASER_LED_PIN, OUTPUT);
   digitalWrite(LASER_PWM_PIN, LOW);
@@ -207,9 +206,8 @@ void loop() {
   if (!ready) { delay(1); return; }
   if (timedTest && int32_t(now - testEnd) >= 0) halt(false);
   if (!timedTest && watchdogArmed && uint32_t(now - lastCmd) > watchdogMs) halt(false);
-  if (laserArmed && !laserInterlockClosed()) laserSafeOff(true);
   bool laserFrameFresh = uint32_t(now - lastLaserFrame) <= laserWatchdogMs;
-  bool laserAllowed = laserArmed && laserInterlockClosed() && laserFrameFresh && moving();
+  bool laserAllowed = laserArmed && laserFrameFresh && moving();
   uint16_t wanted = laserAllowed ? laserRequestedPermille : 0;
   if (wanted != laserAppliedPermille) writeLaserPwm(wanted);
   if (moving()) lastMotion = now;

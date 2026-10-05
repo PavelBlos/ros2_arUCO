@@ -1,0 +1,14 @@
+[Unit]
+Description=TERMiT fallback Wi-Fi access point
+After=systemd-networkd.service netplan-wpa-wlan0.service
+Wants=systemd-networkd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/termit-hotspot wait-and-start
+ExecStop=/usr/local/sbin/termit-hotspot stop
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

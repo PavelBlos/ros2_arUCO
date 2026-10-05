@@ -224,7 +224,7 @@ class TermitRobotAPI:
             version = b""
             while time.monotonic() < deadline:
                 line = self._ser.readline().strip()
-                if line in (b"TERMIT_FASTACCEL_V2", b"TERMIT_FASTACCEL_V3_LASER"):
+                if line == b"TERMIT_FASTACCEL_V2" or line.startswith(b"TERMIT_FASTACCEL_V3_LASER"):
                     version = line
                     break
             else:
@@ -232,7 +232,7 @@ class TermitRobotAPI:
                 raise ConnectionError("ESP32 requires TERMIT_FASTACCEL_V2 or newer firmware")
 
             self._firmware_version = version.decode('ascii', errors='replace')
-            self._laser_supported = version == b"TERMIT_FASTACCEL_V3_LASER"
+            self._laser_supported = version.startswith(b"TERMIT_FASTACCEL_V3_LASER")
             with self._laser_lock:
                 self._laser = LaserTelemetry(
                     supported=self._laser_supported,
@@ -502,7 +502,7 @@ class TermitRobotAPI:
             self._send_raw(f"lw {watchdog_ms}")
 
     def set_laser_permit(self, enabled: bool):
-        """Request software arming. Firmware still requires its physical interlock."""
+        """Request software arming; firmware watchdog still gates the output."""
         if enabled and not self._laser_supported:
             raise RuntimeError("laser-capable ESP32 firmware is not installed")
         with self._vel_lock:
@@ -514,7 +514,7 @@ class TermitRobotAPI:
             self._last_laser_frame = 0.0
 
     def set_laser_duty(self, duty_percent: float):
-        """Set requested optical duty; actual output remains firmware-interlocked."""
+        """Set requested optical duty; the firmware watchdog gates actual output."""
         duty = float(duty_percent)
         if not math.isfinite(duty) or not 0.0 <= duty <= 100.0:
             raise ValueError("laser duty must be between 0 and 100 percent")

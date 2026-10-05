@@ -118,6 +118,17 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
             if os.path.exists(fp):
                 files[f'firmware/esp32_stepper_driver/{firmware_name}'] = fp
 
+    # 5. Boot service and offline fallback Wi-Fi configuration.
+    system_dir = os.path.join(base_dir, 'system')
+    if os.path.exists(system_dir):
+        for system_name in [
+            'termit.service', 'termit-hotspot.service', 'termit-hotspot.sh',
+            'hostapd.conf', 'dnsmasq.conf', 'install_pi_services.sh',
+        ]:
+            sp = os.path.join(system_dir, system_name)
+            if os.path.exists(sp):
+                files[f'system/{system_name}'] = sp
+
     return files
 
 def generate_manifest(files_map, commit_hash=None, release_tag=None):

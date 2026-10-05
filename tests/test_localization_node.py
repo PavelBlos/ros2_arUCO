@@ -156,7 +156,21 @@ def test_laser_speed_compensation_and_stationary_cutoff(mock_node):
 
     assert mock_node.laser_power_for_route_motion(0.045, 0.0, 0.0) == pytest.approx(10.0)
     assert mock_node.laser_power_for_route_motion(0.09, 0.0, 0.0) == pytest.approx(20.0)
+    assert mock_node.laser_power_for_route_motion(0.09, 0.0, 0.0, 0.5) == pytest.approx(10.0)
+    assert mock_node.laser_power_for_route_motion(0.09, 0.0, 0.0, 0.0) == 0.0
     assert mock_node.laser_power_for_route_motion(0.005, 0.0, 0.0) == 0.0
+
+
+def test_path_plan_preserves_per_segment_laser_factors(mock_node):
+    mock_node.set_path_plan([
+        {"x": 0.0, "y": 0.0, "laser": 0.0},
+        {"x": 0.1, "y": 0.0, "laser": 1.0},
+        {"x": 0.2, "y": 0.0, "laser": 0.25},
+    ])
+    assert mock_node.route_waypoints == [[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]]
+    assert mock_node.route_laser_factors == [0.0, 1.0, 0.25]
+    with pytest.raises(ValueError):
+        mock_node.set_path_plan([{"x": float("nan"), "y": 0.0, "laser": 0.0}])
 
 
 def test_laser_runtime_settings_validation(mock_node):
