@@ -80,6 +80,42 @@ def waypoint_capture_tolerance(is_first_connector, goal_tolerance, waypoint_tole
     return float(goal_tolerance if is_first_connector else waypoint_tolerance)
 
 
+def curvature_limited_speed(speed_limit, min_speed, brake_accel, turn_factor,
+                            turn_angle, incoming_length, outgoing_length):
+    """Return a corner speed that also handles many small turns on tight curves."""
+    speed_limit = max(0.0, float(speed_limit))
+    min_speed = max(0.0, min(float(min_speed), speed_limit))
+    turn_angle = abs(float(turn_angle))
+    mean_span = 0.5 * (float(incoming_length) + float(outgoing_length))
+    if turn_angle <= 1e-6 or mean_span <= 1e-6:
+        return speed_limit
+
+    # For a sampled arc, curvature is approximately heading change / arc length.
+    # The available lateral acceleration is intentionally below longitudinal
+    # braking acceleration, scaled by the user's existing turn factor.
+    curvature = turn_angle / mean_span
+    lateral_accel = max(0.005, float(brake_accel) * max(0.10, float(turn_factor)))
+    curve_speed = math.sqrt(lateral_accel / max(curvature, 1e-9))
+
+    # Preserve the established strong slowdown for visibly sharp vertices.
+    if turn_angle > math.radians(15.0):
+        sharp_speed = speed_limit * max(0.05, float(turn_factor)) * max(
+            0.0, math.cos(turn_angle / 2.0)
+        )
+        curve_speed = min(curve_speed, sharp_speed)
+    return float(np.clip(curve_speed, min_speed, speed_limit))
+
+
+def cross_track_limited_speed(speed_limit, min_speed, cross_error, waypoint_tolerance):
+    """Slow forward progress while the lateral controller recovers the path."""
+    speed_limit = max(0.0, float(speed_limit))
+    min_speed = max(0.0, min(float(min_speed), speed_limit))
+    recovery_width = max(0.008, 2.0 * float(waypoint_tolerance))
+    ratio = abs(float(cross_error)) / recovery_width
+    scale = 1.0 / (1.0 + ratio * ratio)
+    return float(np.clip(speed_limit * scale, min_speed, speed_limit))
+
+
 def _rdp_indices(points, tolerance):
     """Return indices retained by iterative Ramer-Douglas-Peucker simplification."""
     pts = np.asarray(points, dtype=float)
@@ -322,12 +358,12 @@ class LocalizationNode(Node):
         # Параметры векторного контроллера (Cross-track follower & Corner speed profile)
         self.ap_cruise_speed = 0.09       # Крейсерская скорость по прямой (м/с)
         self.ap_max_lin = 0.11
-        self.ap_min_lin = 0.012           # Минимальная скорость движения (м/с)
-        self.ap_goal_tol = 0.010          # Радиус попадания в цель (м)
-        self.ap_wp_tol = 0.015            # Радиус прохождения вершины угла для переключения сегмента (м)
+        self.ap_min_lin = 0.004           # Минимальная скорость движения (м/с)
+        self.ap_goal_tol = 0.005          # Радиус попадания в цель (м)
+        self.ap_wp_tol = 0.006            # Радиус прохождения вершины угла для переключения сегмента (м)
         self.ap_kp_cross = 1.20           # Пропорциональный коэффициент возврата на траекторию (1/с)
-        self.ap_v_cross_max = 0.08        # Максимальная скорость боковой коррекции (м/с)
-        self.ap_brake_accel = 0.16        # Тормозное кинематическое замедление (м/с^2)
+        self.ap_v_cross_max = 0.045       # Максимальная скорость боковой коррекции (м/с)
+        self.ap_brake_accel = 0.08        # Тормозное кинематическое замедление (м/с^2)
         self.ap_turn_factor = 0.25        # Множитель скорости прохождения углов
         self.ap_max_ang = 0.60            # Предельная угловая скорость вращения (рад/с)
         self.ap_kp_ang = 1.80             # Пропорциональный коэффициент ориентации
@@ -619,12 +655,12 @@ class LocalizationNode(Node):
             "filter_alpha": float(getattr(self, 'filter_alpha', 0.15)),
             "ap_cruise_speed": float(getattr(self, 'ap_cruise_speed', 0.14)),
             "ap_max_lin": float(getattr(self, 'ap_max_lin', 0.14)),
-            "ap_min_lin": float(getattr(self, 'ap_min_lin', 0.03)),
-            "ap_goal_tol": float(getattr(self, 'ap_goal_tol', 0.03)),
-            "ap_wp_tol": float(getattr(self, 'ap_wp_tol', 0.05)),
+            "ap_min_lin": float(getattr(self, 'ap_min_lin', 0.004)),
+            "ap_goal_tol": float(getattr(self, 'ap_goal_tol', 0.005)),
+            "ap_wp_tol": float(getattr(self, 'ap_wp_tol', 0.006)),
             "ap_kp_cross": float(getattr(self, 'ap_kp_cross', 1.20)),
-            "ap_v_cross_max": float(getattr(self, 'ap_v_cross_max', 0.08)),
-            "ap_brake_accel": float(getattr(self, 'ap_brake_accel', 0.25)),
+            "ap_v_cross_max": float(getattr(self, 'ap_v_cross_max', 0.045)),
+            "ap_brake_accel": float(getattr(self, 'ap_brake_accel', 0.08)),
             "ap_turn_factor": float(getattr(self, 'ap_turn_factor', 0.65)),
             "ap_max_ang": float(getattr(self, 'ap_max_ang', 0.60)),
             "ap_kp_ang": float(getattr(self, 'ap_kp_ang', 1.80)),
@@ -1632,9 +1668,10 @@ class LocalizationNode(Node):
                 u_out = v_out / l_out
                 cos_turn = float(np.clip(np.dot(u_in, u_out), -1.0, 1.0))
                 turn_angle = float(np.arccos(cos_turn))
-                if turn_angle > np.radians(15.0):
-                    v_c = speed_limit * np.cos(turn_angle / 2.0) * self.ap_turn_factor
-                    self.path_corner_speeds[i] = max(self.ap_min_lin, float(v_c))
+                self.path_corner_speeds[i] = curvature_limited_speed(
+                    speed_limit, self.ap_min_lin, self.ap_brake_accel,
+                    self.ap_turn_factor, turn_angle, l_in, l_out,
+                )
 
         self.publish_plan(self.route_waypoints)
         self.notify_ui_event()
@@ -1843,11 +1880,10 @@ class LocalizationNode(Node):
                     np.dot(incoming / len_in, outgoing / len_out), -1.0, 1.0
                 )))
                 control_corner_angles[i] = turn_angle
-                if turn_angle > np.radians(15.0):
-                    control_corner_speeds[i] = max(
-                        self.ap_min_lin,
-                        float(speed_limit * np.cos(turn_angle / 2.0) * self.ap_turn_factor),
-                    )
+                control_corner_speeds[i] = curvature_limited_speed(
+                    speed_limit, self.ap_min_lin, self.ap_brake_accel,
+                    self.ap_turn_factor, turn_angle, len_in, len_out,
+                )
 
         total_path_len = control_path_s[-1]
         total_wps = len(control_waypoints)
@@ -1858,7 +1894,9 @@ class LocalizationNode(Node):
         smooth_forward = 0.0
         smooth_strafe = 0.0
         smooth_w = 0.0
-        alpha = 0.40
+        # The ESP32 already applies an acceleration ramp. A responsive command
+        # filter avoids adding another large phase delay to lateral correction.
+        alpha = 0.70
         self.get_logger().info(f"▶ Старт векторного контроллера: длина пути {total_path_len:.2f}м, режим курса: {self.ap_yaw_mode}")
 
         while self.autopilot_active and self.route_state == "running":
@@ -1985,7 +2023,16 @@ class LocalizationNode(Node):
                     v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
                     v_corners.append(v_brake_c)
 
-            v_along_target = min([speed_limit, v_finish] + v_corners)
+            local_curve_limit = min(
+                control_corner_speeds[max(0, seg_idx)],
+                control_corner_speeds[min(seg_idx + 1, total_wps - 1)],
+            )
+            cross_error_limit = cross_track_limited_speed(
+                speed_limit, self.ap_min_lin, e_cross, self.ap_wp_tol
+            )
+            v_along_target = min(
+                [speed_limit, v_finish, local_curve_limit, cross_error_limit] + v_corners
+            )
             v_along_target = float(np.clip(v_along_target, self.ap_min_lin, speed_limit))
 
             # 6. Векторное боковое управление (cross-track velocity)
@@ -1993,6 +2040,7 @@ class LocalizationNode(Node):
 
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
+            vector_speed_limit = speed_limit
             terminal_radius = max(0.08, 2.0 * self.ap_wp_tol)
             precision_corner_capture = (
                 seg_idx < total_wps - 2
@@ -2027,9 +2075,12 @@ class LocalizationNode(Node):
                 # Outside the endpoint plane, drive toward the actual vertex;
                 # path projection alone must not report a remote finish.
                 v_map = .8 * (p_b - np.array([rx, ry]))
+                vector_speed_limit = max(
+                    self.ap_min_lin, min(0.035, local_curve_limit)
+                )
             v_norm = float(np.linalg.norm(v_map))
-            if v_norm > speed_limit:
-                v_map = v_map * (speed_limit / v_norm)
+            if v_norm > vector_speed_limit:
+                v_map = v_map * (vector_speed_limit / v_norm)
 
             # 8. Проекция скорости карты в REP-103 оси робота:
             # +X вперед, +Y влево.
@@ -2093,6 +2144,8 @@ class LocalizationNode(Node):
                 "dist_finish": round(float(dist_to_finish), 4),
                 "v_along": round(float(v_along_target), 4),
                 "v_cross": round(float(v_cross_cmd), 4),
+                "v_curve_limit": round(float(local_curve_limit), 4),
+                "v_error_limit": round(float(cross_error_limit), 4),
                 "cmd_fwd": round(float(smooth_forward), 4),
                 "cmd_strafe": round(float(smooth_strafe), 4),
                 "cmd_w": round(float(smooth_w), 4),

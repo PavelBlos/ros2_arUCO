@@ -63,8 +63,9 @@ class MockNode:
 sys.modules['rclpy.node'].Node = MockNode
 import rclpy
 from localization_node import (
-    LocalizationNode, WebServerHandler, point_target_velocity,
-    simplify_route_with_factors, waypoint_capture_tolerance,
+    LocalizationNode, WebServerHandler, cross_track_limited_speed,
+    curvature_limited_speed, point_target_velocity, simplify_route_with_factors,
+    waypoint_capture_tolerance,
 )
 
 @pytest.fixture
@@ -206,6 +207,31 @@ def test_route_simplification_keeps_real_corners():
 
     assert simplified == points
     assert simplified_factors == [0.0, 1.0, 1.0]
+
+
+def test_curvature_limit_slows_tight_arc_but_not_straight_line():
+    straight = curvature_limited_speed(
+        0.09, 0.004, 0.08, 0.25, 0.0, 0.01, 0.01
+    )
+    tight_arc = curvature_limited_speed(
+        0.09, 0.004, 0.08, 0.25, math.radians(10.0), 0.005, 0.005
+    )
+    wide_arc = curvature_limited_speed(
+        0.09, 0.004, 0.08, 0.25, math.radians(10.0), 0.05, 0.05
+    )
+
+    assert straight == pytest.approx(0.09)
+    assert 0.004 < tight_arc < wide_arc < straight
+
+
+def test_cross_track_error_reduces_forward_speed_without_stalling():
+    on_path = cross_track_limited_speed(0.09, 0.004, 0.0, 0.006)
+    six_mm_off = cross_track_limited_speed(0.09, 0.004, 0.006, 0.006)
+    far_off = cross_track_limited_speed(0.09, 0.004, 0.10, 0.006)
+
+    assert on_path == pytest.approx(0.09)
+    assert 0.004 < six_mm_off < on_path
+    assert far_off == pytest.approx(0.004)
 
 
 def test_laser_runtime_settings_validation(mock_node):
