@@ -79,6 +79,9 @@ start_video_detector() {
     echo "[+] Starting Video Tag Detector (CSI Camera via libcamerify)..."
     /usr/local/bin/libcamerify python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &
     PID_VID=$!
+    # Camera initialization and DDS discovery can take several seconds. Do not
+    # mistake that startup interval for another frozen stream.
+    CAMERA_GRACE_UNTIL=$((SECONDS + 15))
 }
 
 stop_video_detector() {
@@ -122,6 +125,10 @@ while kill -0 "${PID_LOC}" 2>/dev/null; do
     sleep 2
     if ! kill -0 "${PID_VID}" 2>/dev/null; then
         restart_video_detector
+        STALE_CAMERA_POLLS=0
+        continue
+    fi
+    if (( SECONDS < CAMERA_GRACE_UNTIL )); then
         STALE_CAMERA_POLLS=0
         continue
     fi
