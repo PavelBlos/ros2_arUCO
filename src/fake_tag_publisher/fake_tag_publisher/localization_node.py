@@ -79,6 +79,63 @@ def waypoint_capture_tolerance(is_first_connector, goal_tolerance, waypoint_tole
     """Use one identical tolerance for capture control and its transition gate."""
     return float(goal_tolerance if is_first_connector else waypoint_tolerance)
 
+
+def _rdp_indices(points, tolerance):
+    """Return indices retained by iterative Ramer-Douglas-Peucker simplification."""
+    pts = np.asarray(points, dtype=float)
+    count = len(pts)
+    if count <= 2:
+        return list(range(count))
+    keep = np.zeros(count, dtype=bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, count - 1)]
+    tolerance = max(0.0, float(tolerance))
+    while stack:
+        start, end = stack.pop()
+        if end <= start + 1:
+            continue
+        a, b = pts[start], pts[end]
+        segment = b - a
+        length_sq = float(np.dot(segment, segment))
+        candidates = pts[start + 1:end]
+        if length_sq <= 1e-18:
+            distances = np.linalg.norm(candidates - a, axis=1)
+        else:
+            projection = np.clip(((candidates - a) @ segment) / length_sq, 0.0, 1.0)
+            closest = a + projection[:, None] * segment
+            distances = np.linalg.norm(candidates - closest, axis=1)
+        relative = int(np.argmax(distances))
+        if float(distances[relative]) > tolerance:
+            index = start + 1 + relative
+            keep[index] = True
+            stack.append((start, index))
+            stack.append((index, end))
+    return np.flatnonzero(keep).tolist()
+
+
+def simplify_route_with_factors(points, factors, tolerance=0.001):
+    """Simplify geometry without crossing laser-power transition boundaries."""
+    if len(points) != len(factors):
+        raise ValueError("Route points and laser factors must have equal length")
+    if len(points) <= 2:
+        return [list(p) for p in points], [float(v) for v in factors]
+    output_points = [list(points[0])]
+    output_factors = [float(factors[0])]
+    edge_start = 1
+    while edge_start < len(points):
+        factor = float(factors[edge_start])
+        edge_end = edge_start
+        while edge_end + 1 < len(points) and abs(float(factors[edge_end + 1]) - factor) <= 1e-9:
+            edge_end += 1
+        chunk_start = edge_start - 1
+        chunk = points[chunk_start:edge_end + 1]
+        retained = _rdp_indices(chunk, tolerance)
+        for relative_index in retained[1:]:
+            output_points.append(list(chunk[relative_index]))
+            output_factors.append(factor)
+        edge_start = edge_end + 1
+    return output_points, output_factors
+
 class LocalizationNode(Node):
     def __init__(self):
         super().__init__('localization_node')
@@ -1301,6 +1358,7 @@ class LocalizationNode(Node):
 
         if time.time() - self.last_valid_tag_time > 0.6:
             self.tracking_mode = "dead_reckoning"
+            self.last_detected_tags = []
 
         now = self.get_clock().now()
         self.publish_fused_pose(now.to_msg())
@@ -1539,6 +1597,10 @@ class LocalizationNode(Node):
                 raise ValueError("Точка маршрута выходит за пределы ±20 м")
             normalized.append([x, y])
             laser_factors.append(float(np.clip(laser, 0.0, 1.0)))
+        input_count = len(normalized)
+        normalized, laser_factors = simplify_route_with_factors(
+            normalized, laser_factors, tolerance=0.001
+        )
         self.route_waypoints = normalized
         self.route_laser_factors = laser_factors
         self.current_seg_idx = 0
@@ -1576,7 +1638,10 @@ class LocalizationNode(Node):
 
         self.publish_plan(self.route_waypoints)
         self.notify_ui_event()
-        self.get_logger().info(f"Загружен маршрут: {len(waypoints)} точек, общая длина {self.path_s_accum[-1]:.2f}м")
+        self.get_logger().info(
+            f"Загружен маршрут: {input_count} → {len(self.route_waypoints)} точек после упрощения, "
+            f"общая длина {self.path_s_accum[-1]:.2f}м"
+        )
 
     def start_route(self):
         """Запуск автономного движения по маршруту"""
@@ -1813,71 +1878,70 @@ class LocalizationNode(Node):
             ry = float(self.fused_y)
             ryaw = float(self.fused_yaw)
 
-            # 1. Текущий сегмент пути
-            p_a = np.array(control_waypoints[seg_idx])
-            p_b = np.array(control_waypoints[seg_idx + 1])
-            ab = p_b - p_a
-            seg_len = float(np.linalg.norm(ab))
-            if seg_len < 1e-6:
-                seg_len = 1e-6
-            tangent = ab / seg_len
-            normal = np.array([-tangent[1], tangent[0]])
-
-            ap = np.array([rx, ry]) - p_a
-            t_param = float(np.dot(ap, tangent) / seg_len)
-            dist_to_next_wp = float(np.hypot(p_b[0] - rx, p_b[1] - ry))
-            is_first_connector = route_index_offset == 1 and seg_idx == 0
-            target_corner_angle = control_corner_angles[seg_idx + 1]
-            is_precision_corner = target_corner_angle >= np.radians(25.0)
-            capture_tolerance = waypoint_capture_tolerance(
-                is_first_connector, self.ap_goal_tol, self.ap_wp_tol
-            )
-
-            # 2. Продвижение на следующий сегмент
-            if seg_idx < total_wps - 2:
-                line_cross_error = abs(float(np.dot(ap, normal)))
-                reached_waypoint = (
-                    dist_to_next_wp <= capture_tolerance
-                    if is_first_connector
-                    else (
-                        dist_to_next_wp <= self.ap_wp_tol
-                        if is_precision_corner
-                        else ((t_param >= 0.98 and line_cross_error <= self.ap_wp_tol)
-                              or dist_to_next_wp <= self.ap_wp_tol)
-                    )
+            # 1–2. Find the current segment and advance across every dense
+            # waypoint already crossed during this 20 Hz control interval.
+            # The old single-step gate made a 0.5 mm SVG advance at no more
+            # than 10 mm/s while the chassis travelled up to 90 mm/s, so it
+            # repeatedly reversed toward stale waypoints.
+            advanced_segments = 0
+            retry_precision_capture = False
+            while True:
+                p_a = np.array(control_waypoints[seg_idx])
+                p_b = np.array(control_waypoints[seg_idx + 1])
+                ab = p_b - p_a
+                seg_len = float(np.linalg.norm(ab))
+                segment_is_degenerate = seg_len < 1e-6
+                if segment_is_degenerate:
+                    seg_len = 1e-6
+                tangent = ab / seg_len
+                normal = np.array([-tangent[1], tangent[0]])
+                ap = np.array([rx, ry]) - p_a
+                t_param = float(np.dot(ap, tangent) / seg_len)
+                dist_to_next_wp = float(np.hypot(p_b[0] - rx, p_b[1] - ry))
+                is_first_connector = route_index_offset == 1 and seg_idx == 0
+                target_corner_angle = control_corner_angles[seg_idx + 1]
+                is_precision_corner = target_corner_angle >= np.radians(25.0)
+                capture_tolerance = waypoint_capture_tolerance(
+                    is_first_connector, self.ap_goal_tol, self.ap_wp_tol
                 )
-                if reached_waypoint:
-                    if is_first_connector or is_precision_corner:
-                        # Remove the previous segment's velocity before asking
-                        # the omni chassis to leave in a new direction.
-                        self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
-                        smooth_forward = smooth_strafe = smooth_w = 0.0
-                        pytime.sleep(0.15)
-                        verified_corner_error = float(np.hypot(
-                            p_b[0] - self.fused_x, p_b[1] - self.fused_y
-                        ))
-                        if verified_corner_error > capture_tolerance:
-                            continue
-                    seg_idx += 1
-                    self.current_seg_idx = max(0, seg_idx - route_index_offset)
-                    self.current_wp_idx = max(0, seg_idx - route_index_offset)
-                    self.notify_ui_event()
-                    if is_first_connector:
-                        self.get_logger().info(
-                            f"✅ Точка 1 достигнута (ошибка {dist_to_next_wp*100:.1f} см); "
-                            "начинаем следование по маршруту"
-                        )
-                    self.get_logger().info(f"📍 Вершина пройдена! Переход на сегмент {seg_idx + 1}/{total_wps - 1}")
-                    p_a = np.array(control_waypoints[seg_idx])
-                    p_b = np.array(control_waypoints[seg_idx + 1])
-                    ab = p_b - p_a
-                    seg_len = float(np.linalg.norm(ab))
-                    if seg_len < 1e-6:
-                        seg_len = 1e-6
-                    tangent = ab / seg_len
-                    normal = np.array([-tangent[1], tangent[0]])
-                    ap = np.array([rx, ry]) - p_a
-                    t_param = float(np.dot(ap, tangent) / seg_len)
+                if seg_idx >= total_wps - 2:
+                    break
+                line_cross_error = abs(float(np.dot(ap, normal)))
+                if segment_is_degenerate:
+                    reached_waypoint = True
+                elif is_first_connector or is_precision_corner:
+                    reached_waypoint = dist_to_next_wp <= capture_tolerance
+                else:
+                    reached_waypoint = t_param >= 0.98 and line_cross_error <= self.ap_wp_tol
+                if not reached_waypoint:
+                    break
+                if is_first_connector or is_precision_corner:
+                    self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
+                    smooth_forward = smooth_strafe = smooth_w = 0.0
+                    pytime.sleep(0.15)
+                    verified_corner_error = float(np.hypot(
+                        p_b[0] - self.fused_x, p_b[1] - self.fused_y
+                    ))
+                    if verified_corner_error > capture_tolerance:
+                        retry_precision_capture = True
+                        break
+                if is_first_connector:
+                    self.get_logger().info(
+                        f"✅ Точка 1 достигнута (ошибка {dist_to_next_wp*100:.1f} см); "
+                        "начинаем следование по маршруту"
+                    )
+                seg_idx += 1
+                advanced_segments += 1
+            if retry_precision_capture:
+                continue
+            if advanced_segments:
+                self.current_seg_idx = max(0, seg_idx - route_index_offset)
+                self.current_wp_idx = max(0, seg_idx - route_index_offset)
+                self.notify_ui_event()
+                self.get_logger().info(
+                    f"📍 Пройдено сегментов за цикл: {advanced_segments}; "
+                    f"текущий {seg_idx + 1}/{total_wps - 1}"
+                )
 
             self.current_wp_idx = max(0, seg_idx + 1 - route_index_offset)
 
@@ -2498,7 +2562,12 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 self._send_json(200, {
                     "status": "ok",
                     "count": len(node.route_waypoints),
+                    "input_count": len(points),
                     "laser_segments": sum(1 for factor in node.route_laser_factors if factor > 0.0),
+                    "points": [
+                        {"x": point[0], "y": point[1], "laser": node.route_laser_factors[index]}
+                        for index, point in enumerate(node.route_waypoints)
+                    ],
                 })
             except (TypeError, ValueError) as exc:
                 self._send_json(400, {"error": str(exc)})
@@ -4932,7 +5001,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 progress.textContent = `${cur} / ${data.total_wps}`;
             }
             if (modeBadge && data.tracking_mode) {
-                if (data.tracking_mode === 'aruco_fused') {
+                if (String(data.tracking_mode).startsWith('aruco_')) {
                     modeBadge.textContent = "ArUco Fusion";
                     modeBadge.style.color = "#2ecc71";
                 } else {
@@ -5107,6 +5176,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             });
             const result = await response.json();
             if (!response.ok) throw new Error(result.error || 'маршрут отклонён сервером');
+            if(Array.isArray(result.points)){
+                plannedPath=result.points.map((point,index)=>({x:Number(point.x),y:Number(point.y),laser:Number(point.laser??(index?1:0))}));
+                selectedRoutePoint=-1;plannedPathRenderCache=null;
+            }
             return result;
         }
 
@@ -5430,8 +5503,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const active=result.laser_segments, widthM=artworkValue('artwork-width')/1000, heightM=artworkValue('artwork-height')/1000;
                 const cx=artworkValue('artwork-center-x'),cy=artworkValue('artwork-center-y'); autoCenter=false; zoom=Math.max(15,Math.min(3000,.75*Math.min(canvas.width/Math.max(.02,widthM),canvas.height/Math.max(.02,heightM)))); panX=canvas.width/2-cx*zoom; panY=canvas.height/2+cy*zoom;
                 const resolutionNote=raster&&lastRasterBuild?.adjusted?` Разрешение автоматически ограничено для стабильной работы: X ${lastRasterBuild.columnStepMm.toFixed(1)} мм, строки ${lastRasterBuild.rowStepMm.toFixed(1)} мм (${lastRasterBuild.cells} ячеек вместо ${lastRasterBuild.requestedCells}).`:'';
-                artworkSummary.textContent=`Маршрут готов: ${route.length} точек, рабочих сегментов ${active}.${resolutionNote} Проверьте карту и нажмите «Старт».`;
-                addLog(`Файл ${importedArtwork.name}: подготовлено ${route.length} точек, лазер включён на ${active} сегментах.`); draw();
+                const simplifyNote=result.input_count>result.count?` Геометрия оптимизирована: ${result.input_count} → ${result.count} управляющих точек без заметного изменения формы.`:'';
+                artworkSummary.textContent=`Маршрут готов: ${result.count} точек, рабочих сегментов ${active}.${simplifyNote}${resolutionNote} Проверьте карту и нажмите «Старт».`;
+                addLog(`Файл ${importedArtwork.name}: подготовлено ${result.count} точек, лазер включён на ${active} сегментах.`); draw();
             }catch(e){ artworkSummary.textContent=`Ошибка: ${e.message}`; addLog(`Ошибка импорта: ${e.message}`); }
             finally{buildButton.disabled=false;}
         });

@@ -64,7 +64,7 @@ sys.modules['rclpy.node'].Node = MockNode
 import rclpy
 from localization_node import (
     LocalizationNode, WebServerHandler, point_target_velocity,
-    waypoint_capture_tolerance,
+    simplify_route_with_factors, waypoint_capture_tolerance,
 )
 
 @pytest.fixture
@@ -171,6 +171,41 @@ def test_path_plan_preserves_per_segment_laser_factors(mock_node):
     assert mock_node.route_laser_factors == [0.0, 1.0, 0.25]
     with pytest.raises(ValueError):
         mock_node.set_path_plan([{"x": float("nan"), "y": 0.0, "laser": 0.0}])
+
+
+def test_dense_straight_route_is_reduced_to_endpoints():
+    points = [[index / 1000.0, 0.0] for index in range(201)]
+    factors = [0.0] + [1.0] * 200
+
+    simplified, simplified_factors = simplify_route_with_factors(
+        points, factors, tolerance=0.001
+    )
+
+    assert simplified == [[0.0, 0.0], [0.2, 0.0]]
+    assert simplified_factors == [0.0, 1.0]
+
+
+def test_route_simplification_preserves_laser_transitions():
+    points = [[0.00, 0.0], [0.01, 0.0], [0.02, 0.0], [0.03, 0.0], [0.04, 0.0]]
+    factors = [0.0, 1.0, 1.0, 0.0, 0.0]
+
+    simplified, simplified_factors = simplify_route_with_factors(
+        points, factors, tolerance=0.001
+    )
+
+    assert simplified == [[0.00, 0.0], [0.02, 0.0], [0.04, 0.0]]
+    assert simplified_factors == [0.0, 1.0, 0.0]
+
+
+def test_route_simplification_keeps_real_corners():
+    points = [[0.0, 0.0], [0.05, 0.0], [0.05, 0.05]]
+
+    simplified, simplified_factors = simplify_route_with_factors(
+        points, [0.0, 1.0, 1.0], tolerance=0.001
+    )
+
+    assert simplified == points
+    assert simplified_factors == [0.0, 1.0, 1.0]
 
 
 def test_laser_runtime_settings_validation(mock_node):
