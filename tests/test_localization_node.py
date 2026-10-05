@@ -137,6 +137,47 @@ def test_dynamic_api_health(mock_node):
     assert payload["anchor_tag_id"] == 17
     assert payload["anchor_confirmed"] is False
     assert payload["is_nav_locked"] is False
+    assert payload["laser"]["permit"] is False
+
+
+def test_laser_speed_compensation_and_stationary_cutoff(mock_node):
+    mock_node.laser_mode = "ROUTE_SPEED"
+    mock_node.laser_permit = True
+    mock_node.route_state = "running"
+    mock_node.last_valid_tag_time = time.time()
+    mock_node.laser_nominal_power_pct = 20.0
+    mock_node.laser_max_power_pct = 30.0
+    mock_node.laser_min_active_power_pct = 2.0
+    mock_node.laser_reference_speed_mps = 0.09
+    mock_node.laser_min_motion_speed_mps = 0.01
+    mock_node.laser_speed_gamma = 1.0
+    mock_node.laser_offset_x_mm = 0.0
+    mock_node.laser_offset_y_mm = 0.0
+
+    assert mock_node.laser_power_for_route_motion(0.045, 0.0, 0.0) == pytest.approx(10.0)
+    assert mock_node.laser_power_for_route_motion(0.09, 0.0, 0.0) == pytest.approx(20.0)
+    assert mock_node.laser_power_for_route_motion(0.005, 0.0, 0.0) == 0.0
+
+
+def test_laser_runtime_settings_validation(mock_node):
+    settings = mock_node.update_runtime_settings({
+        "laser_mode": "ROUTE_SPEED",
+        "laser_pwm_hz": 100,
+        "laser_watchdog_ms": 400,
+        "laser_min_active_power_pct": 2,
+        "laser_nominal_power_pct": 10,
+        "laser_max_power_pct": 20,
+        "laser_offset_x_mm": 45,
+        "laser_offset_y_mm": -12,
+    })
+    assert settings["laser_pwm_hz"] == 100
+    assert settings["laser_offset_x_mm"] == 45
+    with pytest.raises(ValueError):
+        mock_node.update_runtime_settings({
+            "laser_min_active_power_pct": 30,
+            "laser_nominal_power_pct": 10,
+            "laser_max_power_pct": 20,
+        })
 
 def test_api_tags_crud_and_optimistic_locking(mock_node):
     handler = WebServerHandler.__new__(WebServerHandler)

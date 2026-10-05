@@ -16,4 +16,16 @@ wheel_diameter_mm: 70.0
 drive_linear_scale: 0.4940752942
 drive_angular_scale: 0.5423793646
 default_marker_size_mm: 100.0
+laser_mode: OFF
+laser_pwm_hz: 100
+laser_watchdog_ms: 400
+laser_max_power_pct: 0.0
+laser_nominal_power_pct: 0.0
+laser_min_active_power_pct: 0.0
+laser_reference_speed_mps: 0.09
+laser_min_motion_speed_mps: 0.01
+laser_speed_gamma: 1.0
+laser_offset_x_mm: 0.0
+laser_offset_y_mm: 0.0
+laser_offset_z_mm: 0.0
 ceiling_height_m: 2.1677131734

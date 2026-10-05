@@ -1,26 +1,52 @@
-/* Termit Omni hardware stepping, protocol v2.
+/* Termit Omni hardware stepping and fail-safe laser PWM, protocol v3.
  * Build: esp32:esp32:esp32 core 3.3.11, FastAccelStepper 1.2.7.
  * F STEP33 DIR32; R STEP23 DIR22; L STEP19 DIR18.
  * F/R shared EN21, L EN17; LOW = powered.
  * s F R L: ramped steps/s; c N: steps/s^2; k: heartbeat; v: version.
  * stop/x: emergency stop; e 0/1: power on/off; a 0/1: hold/auto-sleep.
- * w ms: watchdog; r: zero odom when stationary.
+ * w ms: motor watchdog; r: zero odom when stationary.
+ * u F R L P: atomic wheel targets + requested laser duty (0..1000 permille).
+ * la 0/1: software disarm/arm; lf Hz: PWM frequency; lw ms: laser watchdog.
+ * Laser PWM GPIO25, duplicate onboard LED GPIO2, active-high interlock GPIO26.
  */
 #include <FastAccelStepper.h>
 constexpr uint8_t STEP_PINS[] = {33, 23, 19};
 constexpr uint8_t DIR_PINS[] = {32, 22, 18};
 constexpr uint8_t EN_PINS[] = {21, 17};
+constexpr uint8_t LASER_PWM_PIN = 25;
+constexpr uint8_t LASER_LED_PIN = 2;
+constexpr uint8_t LASER_INTERLOCK_PIN = 26;
+constexpr uint8_t LASER_PWM_BITS = 10;
+constexpr uint16_t LASER_PWM_MAX = (1U << LASER_PWM_BITS) - 1U;
 constexpr long MAX_SPEED = 8000;
-constexpr char VERSION[] = "TERMIT_FASTACCEL_V2";
+constexpr char VERSION[] = "TERMIT_FASTACCEL_V3_LASER";
 FastAccelStepperEngine engine;
 FastAccelStepper* motors[3] = {};
 long targets[3] = {};
-char inputBuf[96];
+char inputBuf[128];
 size_t bufIdx = 0;
 bool overflowLine = false, driversActive = false, autoSleepEnabled = true;
 bool ready = false, timedTest = false, watchdogArmed = false;
+bool laserArmed = false;
+uint16_t laserRequestedPermille = 0, laserAppliedPermille = 0;
+uint32_t laserPwmHz = 100, laserWatchdogMs = 400;
 uint32_t testEnd = 0, lastCmd = 0, lastMotion = 0, lastOdom = 0;
+uint32_t lastLaserFrame = 0, lastLaserTelemetry = 0;
 uint32_t watchdogMs = 500;
+
+void writeLaserPwm(uint16_t permille) {
+  permille = constrain(permille, 0, 1000);
+  uint32_t duty = (uint32_t(permille) * LASER_PWM_MAX + 500U) / 1000U;
+  ledcWrite(LASER_PWM_PIN, duty);
+  ledcWrite(LASER_LED_PIN, duty);
+  laserAppliedPermille = permille;
+}
+void laserSafeOff(bool disarm) {
+  laserRequestedPermille = 0;
+  writeLaserPwm(0);
+  if (disarm) laserArmed = false;
+}
+bool laserInterlockClosed() { return digitalRead(LASER_INTERLOCK_PIN) == HIGH; }
 
 bool moving() {
   for (auto* m : motors) if (m && m->isRunning()) return true;
@@ -34,6 +60,8 @@ void power(bool on) {
   lastMotion = millis();
 }
 void halt(bool emergency) {
+  // Optical output is removed before any motor deceleration/abort begins.
+  laserSafeOff(true);
   for (int i = 0; i < 3; ++i) {
     targets[i] = 0;
     if (!motors[i]) continue;
@@ -66,7 +94,7 @@ void setTargets(long f, long r, long l) {
 }
 void parseCommand(const char* cmd) {
   char extra;
-  long f, r, l, val;
+  long f, r, l, val, pwm;
   int idx, dir;
   if (!strcmp(cmd, "v")) { if (ready) Serial.println(VERSION); return; }
   if (!strcmp(cmd, "stop") || !strcmp(cmd, "x")) { halt(true); return; }
@@ -75,9 +103,33 @@ void parseCommand(const char* cmd) {
     Serial.printf("q %d %d %lu\n", driversActive, moving(), (unsigned long)watchdogMs);
     return;
   }
+  if (!strcmp(cmd, "lq")) {
+    Serial.printf("l %d %d %u %u %lu %lu\n", laserArmed, laserInterlockClosed(),
+      laserRequestedPermille, laserAppliedPermille,
+      (unsigned long)laserPwmHz, (unsigned long)laserWatchdogMs);
+    return;
+  }
   if (!strcmp(cmd, "k")) { lastCmd = millis(); return; }
-  if (sscanf(cmd, "s %ld %ld %ld %c", &f, &r, &l, &extra) == 3) {
+  if (sscanf(cmd, "u %ld %ld %ld %ld %c", &f, &r, &l, &pwm, &extra) == 4) {
     setTargets(f, r, l);
+    laserRequestedPermille = constrain(pwm, 0L, 1000L);
+    lastLaserFrame = millis();
+  } else if (sscanf(cmd, "s %ld %ld %ld %c", &f, &r, &l, &extra) == 3) {
+    // Legacy motor-only frames are always optically safe.
+    laserSafeOff(false);
+    setTargets(f, r, l);
+  } else if (sscanf(cmd, "la %ld %c", &val, &extra) == 1 && (val == 0 || val == 1)) {
+    if (val == 0) laserSafeOff(true);
+    else if (laserInterlockClosed()) { laserArmed = true; lastLaserFrame = millis(); }
+  } else if (sscanf(cmd, "lf %ld %c", &val, &extra) == 1) {
+    if (val >= 20 && val <= 20000) {
+      laserSafeOff(false);
+      laserPwmHz = val;
+      ledcChangeFrequency(LASER_PWM_PIN, laserPwmHz, LASER_PWM_BITS);
+      ledcChangeFrequency(LASER_LED_PIN, laserPwmHz, LASER_PWM_BITS);
+    }
+  } else if (sscanf(cmd, "lw %ld %c", &val, &extra) == 1) {
+    if (val >= 100 && val <= 2000) laserWatchdogMs = val;
   } else if (sscanf(cmd, "c %ld %c", &val, &extra) == 1) {
     if (val >= 100 && val <= 20000)
       for (auto* m : motors) { m->setAcceleration(val); m->applySpeedAcceleration(); }
@@ -116,8 +168,16 @@ void parseCommand(const char* cmd) {
   }
 }
 void setup() {
+  // Establish a safe electrical state before serial, steppers, or networking.
+  pinMode(LASER_INTERLOCK_PIN, INPUT_PULLDOWN);
+  pinMode(LASER_PWM_PIN, OUTPUT);
+  pinMode(LASER_LED_PIN, OUTPUT);
+  digitalWrite(LASER_PWM_PIN, LOW);
+  digitalWrite(LASER_LED_PIN, LOW);
+  ledcAttach(LASER_PWM_PIN, laserPwmHz, LASER_PWM_BITS);
+  ledcAttach(LASER_LED_PIN, laserPwmHz, LASER_PWM_BITS);
+  writeLaserPwm(0);
   for (auto pin : EN_PINS) { digitalWrite(pin, HIGH); pinMode(pin, OUTPUT); }
-  pinMode(2, OUTPUT);
   Serial.begin(115200);
   engine.init();
   ready = true;
@@ -147,9 +207,19 @@ void loop() {
   if (!ready) { delay(1); return; }
   if (timedTest && int32_t(now - testEnd) >= 0) halt(false);
   if (!timedTest && watchdogArmed && uint32_t(now - lastCmd) > watchdogMs) halt(false);
+  if (laserArmed && !laserInterlockClosed()) laserSafeOff(true);
+  bool laserFrameFresh = uint32_t(now - lastLaserFrame) <= laserWatchdogMs;
+  bool laserAllowed = laserArmed && laserInterlockClosed() && laserFrameFresh && moving();
+  uint16_t wanted = laserAllowed ? laserRequestedPermille : 0;
+  if (wanted != laserAppliedPermille) writeLaserPwm(wanted);
   if (moving()) lastMotion = now;
   if (autoSleepEnabled && !moving() && uint32_t(now - lastMotion) >= 2000) power(false);
-  digitalWrite(2, (now / 250) % 2);
+  if (uint32_t(now - lastLaserTelemetry) >= 100) {
+    lastLaserTelemetry = now;
+    Serial.printf("l %d %d %u %u %lu %lu\n", laserArmed, laserInterlockClosed(),
+      laserRequestedPermille, laserAppliedPermille,
+      (unsigned long)laserPwmHz, (unsigned long)laserWatchdogMs);
+  }
   if (uint32_t(now - lastOdom) >= 50) {
     lastOdom = now;
     char line[96];

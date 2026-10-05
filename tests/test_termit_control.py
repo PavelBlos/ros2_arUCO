@@ -54,6 +54,39 @@ class ControlTests(unittest.TestCase):
         self.api._control_tick(1.05)
         self.assertEqual(self.sent, ['k'])
 
+    def test_laser_requires_v3_and_software_permit(self):
+        with self.assertRaises(RuntimeError):
+            self.api.set_laser_permit(True)
+        with self.assertRaises(RuntimeError):
+            self.api.set_laser_duty(1.0)
+
+    def test_v3_laser_frame_is_atomic_and_refreshed(self):
+        self.api._laser_supported = True
+        self.api.set_laser_permit(True)
+        self.api.drive(0.0, 0.10, 0.0, laser_duty_percent=12.5)
+        self.sent.clear()
+        self.api._control_tick(1.0)
+        self.assertTrue(self.sent[0].startswith('u '))
+        self.assertTrue(self.sent[0].endswith(' 125'))
+        self.sent.clear()
+        self.api._control_tick(1.05)
+        self.assertEqual(self.sent, [])
+        self.api._control_tick(1.11)
+        self.assertEqual(len(self.sent), 1)
+        self.assertTrue(self.sent[0].startswith('u '))
+
+    def test_stop_and_disable_remove_laser_output(self):
+        self.api._laser_supported = True
+        self.api.set_laser_permit(True)
+        self.api.drive(0.0, 0.10, 0.0, laser_duty_percent=10.0)
+        self.api.stop()
+        self.assertEqual(self.api._laser_duty_permille, 0)
+        self.assertEqual(self.sent[-1], 's 0 0 0')
+        self.api.set_laser_permit(True)
+        self.api.set_holding_mode(HoldMode.DISABLED)
+        self.assertFalse(self.api._laser_permit_requested)
+        self.assertIn('la 0', self.sent)
+
     def test_finite_move_not_overwritten(self):
         self.api.microstep(1, 50)
         self.api._control_tick(1)

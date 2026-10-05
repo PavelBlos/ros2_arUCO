@@ -110,6 +110,14 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
         if os.path.exists(rp):
             files[root_f] = rp
 
+    # 4. Firmware sources and the guarded Raspberry Pi flashing helper.
+    firmware_dir = os.path.join(base_dir, 'firmware', 'esp32_stepper_driver')
+    if os.path.exists(firmware_dir):
+        for firmware_name in ['esp32_stepper_driver.ino', 'README.md', 'flash_from_pi.sh']:
+            fp = os.path.join(firmware_dir, firmware_name)
+            if os.path.exists(fp):
+                files[f'firmware/esp32_stepper_driver/{firmware_name}'] = fp
+
     return files
 
 def generate_manifest(files_map, commit_hash=None, release_tag=None):

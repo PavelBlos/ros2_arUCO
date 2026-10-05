@@ -57,6 +57,8 @@ class RobotConfig:
     min_start_speed_steps: float = 0.0   # Legacy field, ignored: firmware ramps from rest
     max_motor_speed_steps: int = 1100    # Предельная стабильная частота шагов ESP32 драйвера (шагов/сек)
     watchdog_timeout_ms: int = 1500      # Аппаратный таймаут watchdog на ESP32 (мс)
+    laser_pwm_hz: int = 100              # Частота PWM лазера по умолчанию
+    laser_watchdog_ms: int = 400         # Отдельный короткий watchdog оптического выхода
     default_hold_mode: HoldMode = HoldMode.CONTINUOUS_HOLD # Режим удержания по умолчанию (жесткий вал, без щелчков)
     
     # Инверсии моторов (если перепутана фазировка)
@@ -100,6 +102,18 @@ class OdometryData:
     epoch: int = 0                       # Эпоха соединения (защита от скачков при перезагрузке)
 
 
+@dataclass
+class LaserTelemetry:
+    supported: bool = False
+    armed: bool = False
+    interlock_closed: bool = False
+    requested_permille: int = 0
+    applied_permille: int = 0
+    pwm_hz: int = 100
+    watchdog_ms: int = 400
+    timestamp: float = 0.0
+
+
 class TermitRobotAPI:
     """
     Основной класс API для управления роботом через Serial/UART порт.
@@ -135,6 +149,13 @@ class TermitRobotAPI:
         self._direct_speeds = None
         self._finite_move = False
         self._last_heartbeat = 0.0
+        self._firmware_version = ""
+        self._laser_supported = False
+        self._laser_permit_requested = False
+        self._laser_duty_permille = 0
+        self._last_laser_frame = 0.0
+        self._laser_lock = threading.Lock()
+        self._laser = LaserTelemetry()
 
         # Потоки чтения телеметрии и управления
         self._stop_event = threading.Event()
@@ -200,12 +221,24 @@ class TermitRobotAPI:
             # Refuse direct target control on firmware without onboard ramps.
             self._ser.write(b"x\nv\n")
             deadline = time.monotonic() + 3.0
+            version = b""
             while time.monotonic() < deadline:
-                if self._ser.readline().strip() == b"TERMIT_FASTACCEL_V2":
+                line = self._ser.readline().strip()
+                if line in (b"TERMIT_FASTACCEL_V2", b"TERMIT_FASTACCEL_V3_LASER"):
+                    version = line
                     break
             else:
                 self._ser.close()
-                raise ConnectionError("ESP32 requires TERMIT_FASTACCEL_V2 firmware")
+                raise ConnectionError("ESP32 requires TERMIT_FASTACCEL_V2 or newer firmware")
+
+            self._firmware_version = version.decode('ascii', errors='replace')
+            self._laser_supported = version == b"TERMIT_FASTACCEL_V3_LASER"
+            with self._laser_lock:
+                self._laser = LaserTelemetry(
+                    supported=self._laser_supported,
+                    pwm_hz=self.config.laser_pwm_hz,
+                    watchdog_ms=self.config.laser_watchdog_ms,
+                )
 
             self._port_name = port
             self._is_connected = True
@@ -226,6 +259,11 @@ class TermitRobotAPI:
             self._direct_speeds = None
             self._finite_move = False
             self._send_raw(f"c {int(self.config.max_wheel_accel_steps)}")
+
+            if self._laser_supported:
+                self._send_raw("la 0")
+                self._send_raw(f"lf {int(self.config.laser_pwm_hz)}")
+                self._send_raw(f"lw {int(self.config.laser_watchdog_ms)}")
 
             # Запуск потока отправки целевых скоростей
             self._control_thread = threading.Thread(target=self._control_loop, daemon=True, name="TermitControl")
@@ -256,6 +294,8 @@ class TermitRobotAPI:
                 pass
 
         self._is_connected = False
+        self._laser_permit_requested = False
+        self._laser_duty_permille = 0
         self._stop_event.set()
 
         if self._reader_thread and self._reader_thread.is_alive():
@@ -278,6 +318,14 @@ class TermitRobotAPI:
         """Проверяет статус подключения к контроллеру."""
         return self._is_connected and (time.time() - self._last_telemetry_time < 2.0)
 
+    @property
+    def firmware_version(self) -> str:
+        return self._firmware_version
+
+    @property
+    def laser_supported(self) -> bool:
+        return self._laser_supported
+
     # =========================================================================
     # Кинематика и управление движением
     # =========================================================================
@@ -293,7 +341,8 @@ class TermitRobotAPI:
             self._steps_per_meter = (self.config.steps_per_rev * self.config.gear_ratio) / self._wheel_circumference
             self._meters_per_step = 1.0 / self._steps_per_meter
 
-    def drive(self, vx: float, vy: float, omega: float = 0.0):
+    def drive(self, vx: float, vy: float, omega: float = 0.0,
+              laser_duty_percent: Optional[float] = None):
         """
         ВЫСОКИЙ УРОВЕНЬ: Управление вектором движения тела робота (Twist).
         Плавный разгон и торможение производятся автоматически.
@@ -306,6 +355,14 @@ class TermitRobotAPI:
         vx = max(min(vx, self.config.max_linear_speed), -self.config.max_linear_speed)
         vy = max(min(vy, self.config.max_linear_speed), -self.config.max_linear_speed)
         omega = max(min(omega, self.config.max_angular_speed), -self.config.max_angular_speed)
+        laser_permille = None
+        if laser_duty_percent is not None:
+            duty = float(laser_duty_percent)
+            if not math.isfinite(duty) or not 0.0 <= duty <= 100.0:
+                raise ValueError("laser duty must be between 0 and 100 percent")
+            if duty > 0.0 and not self._laser_permit_requested:
+                raise RuntimeError("laser software permit is off")
+            laser_permille = int(round(duty * 10.0))
 
         with self._vel_lock:
             self._direct_speeds = None
@@ -313,6 +370,8 @@ class TermitRobotAPI:
             self._target_vx = float(vx)
             self._target_vy = float(vy)
             self._target_omega = float(omega)
+            if laser_permille is not None:
+                self._laser_duty_permille = laser_permille
 
     def _clear_motion_locked(self):
         self._target_vx = self._target_vy = self._target_omega = 0.0
@@ -324,6 +383,7 @@ class TermitRobotAPI:
         """Плавное торможение выполняется на ESP32."""
         with self._vel_lock:
             self._clear_motion_locked()
+            self._laser_duty_permille = 0
             self._send_raw("s 0 0 0")
             self._last_cmd_sent = "s 0 0 0"
 
@@ -331,6 +391,8 @@ class TermitRobotAPI:
         """Немедленно отменяет шаги, включая аппаратную очередь ESP32."""
         with self._vel_lock:
             self._clear_motion_locked()
+            self._laser_permit_requested = False
+            self._laser_duty_permille = 0
             self._send_raw("x")
             self._last_cmd_sent = "s 0 0 0"
 
@@ -353,10 +415,19 @@ class TermitRobotAPI:
         with self._vel_lock:
             if not self._finite_move:
                 speeds = self._target_steps_locked()
-                cmd = "s %d %d %d" % speeds
-                if cmd != self._last_cmd_sent:
+                if self._laser_supported and self._laser_permit_requested:
+                    cmd = "u %d %d %d %d" % (*speeds, self._laser_duty_permille)
+                    must_refresh_laser = now - self._last_laser_frame >= min(
+                        0.1, self.config.laser_watchdog_ms / 3000.0
+                    )
+                else:
+                    cmd = "s %d %d %d" % speeds
+                    must_refresh_laser = False
+                if cmd != self._last_cmd_sent or must_refresh_laser:
                     self._send_raw(cmd)
                     self._last_cmd_sent = cmd
+                    if self._laser_supported and self._laser_permit_requested:
+                        self._last_laser_frame = now
                 self._is_moving = any(speeds)
             interval = min(0.2, self.config.watchdog_timeout_ms / 3000.0)
             if now - self._last_heartbeat >= interval:
@@ -406,8 +477,67 @@ class TermitRobotAPI:
         elif mode == HoldMode.DISABLED:
             with self._vel_lock:
                 self._clear_motion_locked()
+                self._laser_permit_requested = False
+                self._laser_duty_permille = 0
+                if self._laser_supported:
+                    self._send_raw("la 0")
                 self._send_raw("e 1")
                 self._last_cmd_sent = "s 0 0 0"
+
+    def configure_laser(self, pwm_hz: int = 100, watchdog_ms: int = 400):
+        """Configure fail-safe laser PWM. This never arms or emits light."""
+        pwm_hz = int(pwm_hz)
+        watchdog_ms = int(watchdog_ms)
+        if not 20 <= pwm_hz <= 20000:
+            raise ValueError("laser PWM frequency must be 20..20000 Hz")
+        if not 100 <= watchdog_ms <= 2000:
+            raise ValueError("laser watchdog must be 100..2000 ms")
+        self.config.laser_pwm_hz = pwm_hz
+        self.config.laser_watchdog_ms = watchdog_ms
+        self._laser_permit_requested = False
+        self._laser_duty_permille = 0
+        if self._laser_supported:
+            self._send_raw("la 0")
+            self._send_raw(f"lf {pwm_hz}")
+            self._send_raw(f"lw {watchdog_ms}")
+
+    def set_laser_permit(self, enabled: bool):
+        """Request software arming. Firmware still requires its physical interlock."""
+        if enabled and not self._laser_supported:
+            raise RuntimeError("laser-capable ESP32 firmware is not installed")
+        with self._vel_lock:
+            self._laser_permit_requested = bool(enabled)
+            if not enabled:
+                self._laser_duty_permille = 0
+            if self._laser_supported:
+                self._send_raw(f"la {1 if enabled else 0}")
+            self._last_laser_frame = 0.0
+
+    def set_laser_duty(self, duty_percent: float):
+        """Set requested optical duty; actual output remains firmware-interlocked."""
+        duty = float(duty_percent)
+        if not math.isfinite(duty) or not 0.0 <= duty <= 100.0:
+            raise ValueError("laser duty must be between 0 and 100 percent")
+        with self._vel_lock:
+            if duty > 0.0 and not self._laser_permit_requested:
+                raise RuntimeError("laser software permit is off")
+            self._laser_duty_permille = int(round(duty * 10.0))
+
+    def laser_off(self, disarm: bool = False):
+        with self._vel_lock:
+            self._laser_duty_permille = 0
+            if disarm:
+                self._laser_permit_requested = False
+                if self._laser_supported:
+                    self._send_raw("la 0")
+            elif self._laser_supported and self._laser_permit_requested:
+                speeds = self._target_steps_locked()
+                self._send_raw("u %d %d %d 0" % speeds)
+                self._last_cmd_sent = "u %d %d %d 0" % speeds
+
+    def get_laser_telemetry(self) -> LaserTelemetry:
+        with self._laser_lock:
+            return LaserTelemetry(**self._laser.__dict__)
 
     def set_watchdog_timeout(self, timeout_ms: int):
         """Устанавливает аппаратный таймаут безопасности Watchdog на ESP32 (мс)."""
@@ -549,6 +679,23 @@ class TermitRobotAPI:
                         p1, p2, p3 = int(parts[0]), int(parts[1]), int(parts[2])
                         s1, s2, s3 = int(parts[3]), int(parts[4]), int(parts[5])
                         self._process_odometry_update(p1, p2, p3, s1, s2, s3)
+                except (ValueError, IndexError):
+                    pass
+            elif line.startswith('l '):
+                try:
+                    parts = line[2:].split()
+                    if len(parts) >= 6:
+                        with self._laser_lock:
+                            self._laser = LaserTelemetry(
+                                supported=True,
+                                armed=bool(int(parts[0])),
+                                interlock_closed=bool(int(parts[1])),
+                                requested_permille=int(parts[2]),
+                                applied_permille=int(parts[3]),
+                                pwm_hz=int(parts[4]),
+                                watchdog_ms=int(parts[5]),
+                                timestamp=time.time(),
+                            )
                 except (ValueError, IndexError):
                     pass
 

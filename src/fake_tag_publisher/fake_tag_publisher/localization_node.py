@@ -286,6 +286,25 @@ class LocalizationNode(Node):
         self.drive_angular_scale = 1.0
         self.default_marker_size_mm = 100.0
         self.ceiling_height_m = 2.5
+        # Laser output starts inert on every process start. Persistent settings
+        # describe limits and geometry; software permission is deliberately not
+        # persisted.
+        self.laser_mode = "OFF"
+        self.laser_pwm_hz = 100.0
+        self.laser_watchdog_ms = 400.0
+        self.laser_max_power_pct = 0.0
+        self.laser_nominal_power_pct = 0.0
+        self.laser_min_active_power_pct = 0.0
+        self.laser_reference_speed_mps = 0.09
+        self.laser_min_motion_speed_mps = 0.01
+        self.laser_speed_gamma = 1.0
+        self.laser_offset_x_mm = 0.0
+        self.laser_offset_y_mm = 0.0
+        self.laser_offset_z_mm = 0.0
+        self.laser_permit = False
+        self.laser_permit_deadline = 0.0
+        self.laser_last_command_pct = 0.0
+        self.laser_fault = "software permit is off"
         self.load_runtime_settings()
 
         # Состояние слияния и фильтрации выбросов
@@ -299,6 +318,7 @@ class LocalizationNode(Node):
         
         # Таймер автоматического снятия тока с обмоток при отсутствии команд 2 секунды (5 Гц)
         self.power_watchdog_timer = self.create_timer(0.2, self.check_motor_power_watchdog)
+        self.laser_watchdog_timer = self.create_timer(0.1, self.check_laser_safety)
 
         # UPS HAT telemetry. This reads the same I2C registers as ~/scripts/bat.py,
         # but keeps the I2C operation out of HTTP request handlers.
@@ -503,6 +523,15 @@ class LocalizationNode(Node):
                 self.drive_angular_scale = float(cfg.get('drive_angular_scale', 1.))
                 if "default_marker_size_mm" in cfg: self.default_marker_size_mm = float(cfg["default_marker_size_mm"])
                 if "ceiling_height_m" in cfg: self.ceiling_height_m = float(cfg["ceiling_height_m"])
+                if "laser_mode" in cfg: self.laser_mode = str(cfg["laser_mode"]).upper()
+                for key in (
+                    'laser_pwm_hz', 'laser_watchdog_ms', 'laser_max_power_pct',
+                    'laser_nominal_power_pct', 'laser_min_active_power_pct',
+                    'laser_reference_speed_mps', 'laser_min_motion_speed_mps',
+                    'laser_speed_gamma', 'laser_offset_x_mm', 'laser_offset_y_mm',
+                    'laser_offset_z_mm'
+                ):
+                    if key in cfg: setattr(self, key, float(cfg[key]))
                 self.get_logger().info(f"Loaded runtime settings from {self.runtime_settings_path}")
             except Exception as e:
                 self.get_logger().warn(f"Failed loading runtime settings: {e}")
@@ -548,6 +577,18 @@ class LocalizationNode(Node):
             "drive_angular_scale": float(getattr(self, 'drive_angular_scale', 1.)),
             "default_marker_size_mm": float(getattr(self, 'default_marker_size_mm', 100.0)),
             "ceiling_height_m": float(getattr(self, 'ceiling_height_m', 2.5)),
+            "laser_mode": str(getattr(self, 'laser_mode', 'OFF')),
+            "laser_pwm_hz": int(getattr(self, 'laser_pwm_hz', 100)),
+            "laser_watchdog_ms": int(getattr(self, 'laser_watchdog_ms', 400)),
+            "laser_max_power_pct": float(getattr(self, 'laser_max_power_pct', 0.0)),
+            "laser_nominal_power_pct": float(getattr(self, 'laser_nominal_power_pct', 0.0)),
+            "laser_min_active_power_pct": float(getattr(self, 'laser_min_active_power_pct', 0.0)),
+            "laser_reference_speed_mps": float(getattr(self, 'laser_reference_speed_mps', 0.09)),
+            "laser_min_motion_speed_mps": float(getattr(self, 'laser_min_motion_speed_mps', 0.01)),
+            "laser_speed_gamma": float(getattr(self, 'laser_speed_gamma', 1.0)),
+            "laser_offset_x_mm": float(getattr(self, 'laser_offset_x_mm', 0.0)),
+            "laser_offset_y_mm": float(getattr(self, 'laser_offset_y_mm', 0.0)),
+            "laser_offset_z_mm": float(getattr(self, 'laser_offset_z_mm', 0.0)),
         }
 
     def update_runtime_settings(self, new_settings: dict):
@@ -561,9 +602,13 @@ class LocalizationNode(Node):
             'ap_goal_tol', 'ap_wp_tol', 'ap_kp_cross', 'ap_v_cross_max',
             'ap_brake_accel', 'ap_turn_factor', 'ap_max_ang', 'ap_kp_ang',
             'ap_final_yaw', 'wheel_diameter_mm',
-            'default_marker_size_mm', 'ceiling_height_m', 'drive_linear_scale', 'drive_angular_scale'
+            'default_marker_size_mm', 'ceiling_height_m', 'drive_linear_scale', 'drive_angular_scale',
+            'laser_pwm_hz', 'laser_watchdog_ms', 'laser_max_power_pct',
+            'laser_nominal_power_pct', 'laser_min_active_power_pct',
+            'laser_reference_speed_mps', 'laser_min_motion_speed_mps', 'laser_speed_gamma',
+            'laser_offset_x_mm', 'laser_offset_y_mm', 'laser_offset_z_mm'
         }
-        str_keys = {'ap_yaw_mode'}
+        str_keys = {'ap_yaw_mode', 'laser_mode'}
 
         validated = {}
         for k, v in new_settings.items():
@@ -590,20 +635,38 @@ class LocalizationNode(Node):
                     'ap_max_ang': (0.0, 5.0),
                     'ap_kp_ang': (0.0, 10.0),
                     'ap_final_yaw': (-math.pi, math.pi),
+                    'laser_pwm_hz': (20.0, 20000.0),
+                    'laser_watchdog_ms': (100.0, 2000.0),
+                    'laser_max_power_pct': (0.0, 100.0),
+                    'laser_nominal_power_pct': (0.0, 100.0),
+                    'laser_min_active_power_pct': (0.0, 100.0),
+                    'laser_reference_speed_mps': (0.005, 0.5),
+                    'laser_min_motion_speed_mps': (0.001, 0.1),
+                    'laser_speed_gamma': (0.1, 3.0),
+                    'laser_offset_x_mm': (-1000.0, 1000.0),
+                    'laser_offset_y_mm': (-1000.0, 1000.0),
+                    'laser_offset_z_mm': (-1000.0, 2000.0),
                 }
                 if k in limits and not (limits[k][0] <= val <= limits[k][1]):
                     raise ValueError(f'{k} outside allowed range {limits[k]}')
                 validated[k] = val
             elif k in str_keys:
                 value = str(v).upper()
-                if value not in {'FREE', 'HOLD_INITIAL', 'PATH_TANGENT', 'FINAL_YAW'}:
+                if k == 'ap_yaw_mode' and value not in {'FREE', 'HOLD_INITIAL', 'PATH_TANGENT', 'FINAL_YAW'}:
                     raise ValueError('ap_yaw_mode must be FREE, HOLD_INITIAL, PATH_TANGENT or FINAL_YAW')
+                if k == 'laser_mode' and value not in {'OFF', 'ROUTE_SPEED'}:
+                    raise ValueError('laser_mode must be OFF or ROUTE_SPEED')
                 validated[k] = value
         effective_min = validated.get('ap_min_lin', self.ap_min_lin)
         effective_cruise = validated.get('ap_cruise_speed', self.ap_cruise_speed)
         effective_max = validated.get('ap_max_lin', self.ap_max_lin)
         if not effective_min <= effective_cruise <= effective_max:
             raise ValueError('speeds must satisfy ap_min_lin <= ap_cruise_speed <= ap_max_lin')
+        laser_min = validated.get('laser_min_active_power_pct', self.laser_min_active_power_pct)
+        laser_nom = validated.get('laser_nominal_power_pct', self.laser_nominal_power_pct)
+        laser_max = validated.get('laser_max_power_pct', self.laser_max_power_pct)
+        if not 0.0 <= laser_min <= laser_nom <= laser_max <= 100.0:
+            raise ValueError('laser powers must satisfy minimum <= nominal <= maximum')
         old_wheel = self.wheel_diameter_mm
         old_scales = (getattr(self, 'drive_linear_scale', 1.), getattr(self, 'drive_angular_scale', 1.))
         for k, val in validated.items():
@@ -615,6 +678,9 @@ class LocalizationNode(Node):
             self.robot.config.angular_scale = self.drive_angular_scale
             self.map_odom_initialized = False
             self.odom_covariance = np.diag([0.02 ** 2, 0.02 ** 2, math.radians(2.0) ** 2])
+        if self.robot and any(k in validated for k in ('laser_pwm_hz', 'laser_watchdog_ms')):
+            self.laser_safe_off(disarm=True, reason="laser configuration changed")
+            self.robot.configure_laser(int(self.laser_pwm_hz), int(self.laser_watchdog_ms))
         if not self.save_runtime_settings():
             raise OSError("could not persist runtime settings")
         if self.tag_registry and (
@@ -1121,6 +1187,8 @@ class LocalizationNode(Node):
                 base_radius=0.122,
                 steps_per_rev=1600,
                 watchdog_timeout_ms=1500,
+                laser_pwm_hz=int(self.laser_pwm_hz),
+                laser_watchdog_ms=int(self.laser_watchdog_ms),
                 max_linear_speed=0.15,
                 max_motor_speed_steps=1100,
                 min_start_speed_steps=120.0,
@@ -1139,6 +1207,7 @@ class LocalizationNode(Node):
             if port:
                 self.get_logger().info(f"Connecting TermitRobotAPI to ESP32 on {port}...")
                 self.robot.connect(port=port)
+                self.firmware_version = self.robot.firmware_version
                 self.robot.set_holding_mode(HoldMode.CONTINUOUS_HOLD)
                 self.robot.add_odometry_callback(self.on_esp32_odometry)
                 self.get_logger().info(f"✅ TermitRobotAPI successfully connected to ESP32 on {port} (Continuous Hold enabled)")
@@ -1244,6 +1313,110 @@ class LocalizationNode(Node):
                     self.set_motor_power("disable")
                     self.get_logger().info("💤 Нет команд 2 секунды: ток с обмоток моторов снят автоматически")
 
+    def laser_status(self):
+        telemetry = None
+        if self.robot:
+            try:
+                telemetry = self.robot.get_laser_telemetry()
+            except Exception:
+                telemetry = None
+        telemetry_fresh = bool(telemetry and telemetry.timestamp and time.time() - telemetry.timestamp < 0.5)
+        return {
+            "supported": bool(self.robot and getattr(self.robot, 'laser_supported', False)),
+            "permit": bool(self.laser_permit),
+            "permit_lease_fresh": bool(self.laser_permit and time.monotonic() <= self.laser_permit_deadline),
+            "mode": self.laser_mode,
+            "interlock_closed": bool(telemetry.interlock_closed) if telemetry_fresh else False,
+            "armed": bool(telemetry.armed) if telemetry_fresh else False,
+            "requested_power_pct": round(float(self.laser_last_command_pct), 2),
+            "applied_power_pct": round(float(telemetry.applied_permille) / 10.0, 2) if telemetry_fresh else 0.0,
+            "pwm_hz": int(telemetry.pwm_hz) if telemetry_fresh else int(self.laser_pwm_hz),
+            "watchdog_ms": int(telemetry.watchdog_ms) if telemetry_fresh else int(self.laser_watchdog_ms),
+            "telemetry_fresh": telemetry_fresh,
+            "fault": self.laser_fault,
+            "pins": {"pwm": 25, "indicator_led": 2, "interlock": 26},
+        }
+
+    def laser_safe_off(self, disarm=False, reason="laser output disabled"):
+        self.laser_last_command_pct = 0.0
+        if disarm:
+            self.laser_permit = False
+            self.laser_permit_deadline = 0.0
+        self.laser_fault = reason
+        if self.robot:
+            try:
+                self.robot.laser_off(disarm=disarm)
+            except Exception:
+                pass
+
+    def set_laser_permit(self, enabled):
+        enabled = bool(enabled)
+        if not enabled:
+            self.laser_safe_off(disarm=True, reason="software permit is off")
+            return self.laser_status()
+        if self.laser_mode != 'ROUTE_SPEED':
+            raise ValueError("select the speed-compensated route laser mode first")
+        if self.laser_max_power_pct <= 0.0 or self.laser_nominal_power_pct <= 0.0:
+            raise ValueError("laser maximum and nominal power must be greater than zero")
+        if not self.robot or not self.robot.is_connected:
+            raise RuntimeError("ESP32 controller is not connected")
+        if not getattr(self.robot, 'laser_supported', False):
+            raise RuntimeError("laser-capable ESP32 firmware is not installed")
+        status = self.laser_status()
+        if not status['telemetry_fresh']:
+            raise RuntimeError("laser telemetry is not fresh")
+        if not status['interlock_closed']:
+            raise RuntimeError("physical laser interlock on GPIO26 is open")
+        self.robot.set_laser_permit(True)
+        self.laser_permit = True
+        self.laser_permit_deadline = time.monotonic() + 1.0
+        self.laser_fault = "ready; waiting for a running route"
+        return self.laser_status()
+
+    def laser_heartbeat(self):
+        if not self.laser_permit:
+            raise RuntimeError("laser permit is off")
+        self.laser_permit_deadline = time.monotonic() + 1.0
+        return self.laser_status()
+
+    def check_laser_safety(self):
+        if not self.laser_permit:
+            return
+        if time.monotonic() > self.laser_permit_deadline:
+            self.laser_safe_off(disarm=True, reason="operator heartbeat expired")
+            return
+        if not self.robot or not self.robot.is_connected:
+            self.laser_safe_off(disarm=True, reason="ESP32 connection lost")
+            return
+        status = self.laser_status()
+        if not status['telemetry_fresh']:
+            self.laser_safe_off(disarm=True, reason="laser telemetry timeout")
+        elif not status['interlock_closed']:
+            self.laser_safe_off(disarm=True, reason="physical interlock opened")
+
+    def laser_power_for_route_motion(self, forward, strafe, omega):
+        """Apply speed compensation using velocity of the offset laser spot."""
+        if not self.laser_permit or self.laser_mode != 'ROUTE_SPEED' or self.route_state != 'running':
+            self.laser_safe_off(disarm=False, reason="route laser is inactive")
+            return 0.0
+        if time.time() - self.last_valid_tag_time > 0.5:
+            self.laser_safe_off(disarm=True, reason="fresh ArUco localization was lost")
+            return 0.0
+        ox = self.laser_offset_x_mm / 1000.0
+        oy = self.laser_offset_y_mm / 1000.0
+        head_vx = float(forward) - float(omega) * oy
+        head_vy = float(strafe) + float(omega) * ox
+        speed = math.hypot(head_vx, head_vy)
+        if speed < self.laser_min_motion_speed_mps:
+            self.laser_safe_off(disarm=False, reason="laser spot speed is below safety threshold")
+            return 0.0
+        ratio = max(0.0, speed / max(1e-6, self.laser_reference_speed_mps))
+        requested = self.laser_nominal_power_pct * (ratio ** self.laser_speed_gamma)
+        requested = min(self.laser_max_power_pct, max(self.laser_min_active_power_pct, requested))
+        self.laser_last_command_pct = requested
+        self.laser_fault = ""
+        return requested
+
     def set_motor_power(self, state: str) -> bool:
         """
         Управление питанием обмоток шаговых двигателей:
@@ -1275,7 +1448,8 @@ class LocalizationNode(Node):
             return True
         return False
 
-    def drive_robot(self, forward, strafe, w, source_mode=MotionAuthorityMode.MANUAL):
+    def drive_robot(self, forward, strafe, w, source_mode=MotionAuthorityMode.MANUAL,
+                    laser_power_pct=0.0):
         """
         Прямое аппаратное управление моторами через ESP32 API + публикация Twist в /cmd_vel.
         Проверяет полномочия через MotionAuthorityManager и соблюдает блокировки E-STOP и Stop-and-Reanchor.
@@ -1324,7 +1498,10 @@ class LocalizationNode(Node):
                 if not is_motion:
                     self.robot.stop()
                 else:
-                    self.robot.drive(vx=float(-strafe), vy=float(forward), omega=float(w))
+                    self.robot.drive(
+                        vx=float(-strafe), vy=float(forward), omega=float(w),
+                        laser_duty_percent=float(laser_power_pct),
+                    )
             except Exception as e:
                 self.get_logger().error(f"ESP32 motor drive error: {str(e)}")
 
@@ -1432,6 +1609,7 @@ class LocalizationNode(Node):
         if self.route_state == "running":
             self.route_state = "paused"
             self.autopilot_active = False
+            self.laser_safe_off(disarm=False, reason="route paused")
             self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
             self.motion_mgr.release_lease(MotionAuthorityMode.ROUTE)
             self.notify_ui_event()
@@ -1445,6 +1623,7 @@ class LocalizationNode(Node):
         """Полная остановка и сброс маршрута с автоматическим снятием тока"""
         self.route_state = "idle"
         self.autopilot_active = False
+        self.laser_safe_off(disarm=True, reason="route stopped")
         self.current_wp_idx = 0
         self.current_seg_idx = 0
         self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
@@ -1785,7 +1964,14 @@ class LocalizationNode(Node):
             smooth_w = smooth_w * (1.0 - alpha) + w * alpha
 
             # 11. Отправка команды движения
-            if not self.drive_robot(smooth_forward, smooth_strafe, smooth_w, source_mode=MotionAuthorityMode.ROUTE):
+            laser_power = self.laser_power_for_route_motion(
+                smooth_forward, smooth_strafe, smooth_w
+            )
+            if not self.drive_robot(
+                smooth_forward, smooth_strafe, smooth_w,
+                source_mode=MotionAuthorityMode.ROUTE,
+                laser_power_pct=laser_power,
+            ):
                 self.route_state = "blocked"
                 self.route_error = "Команда движения отклонена системой безопасности"
                 self.autopilot_active = False
@@ -1820,6 +2006,7 @@ class LocalizationNode(Node):
             elapsed = pytime.time() - t_loop_start
             pytime.sleep(max(0.01, 0.05 - elapsed))
 
+        self.laser_safe_off(disarm=True, reason=f"route ended: {self.route_state}")
         self.drive_robot(0.0, 0.0, 0.0, source_mode=MotionAuthorityMode.ROUTE)
         self.motion_mgr.release_lease(MotionAuthorityMode.ROUTE)
 
@@ -2543,9 +2730,29 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json(500, {"error": str(e)})
 
+        elif self.path.startswith('/api/laser/permit'):
+            try:
+                status = node.set_laser_permit(bool(payload.get('enabled', False)))
+                self._send_json(200, {"status": "ok", "laser": status})
+            except (TypeError, ValueError, RuntimeError) as e:
+                node.laser_safe_off(disarm=True, reason=str(e))
+                self._send_json(409, {"error": str(e), "laser": node.laser_status()})
+
+        elif self.path.startswith('/api/laser/heartbeat'):
+            try:
+                self._send_json(200, {"status": "ok", "laser": node.laser_heartbeat()})
+            except RuntimeError as e:
+                self._send_json(409, {"error": str(e), "laser": node.laser_status()})
+
+        elif self.path.startswith('/api/laser/off'):
+            node.laser_safe_off(disarm=True, reason="operator switched laser off")
+            self._send_json(200, {"status": "ok", "laser": node.laser_status()})
+
         elif self.path.startswith('/api/extrinsics'):
             # Save extrinsics to file
             try:
+                node.stop_route()
+                node.laser_safe_off(disarm=True, reason="camera geometry changed")
                 status = payload.get('status')
                 if status not in ('verified', 'unverified'):
                     raise ValueError("status must be explicitly set to verified or unverified")
@@ -2858,6 +3065,9 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"status": "ok", "settings": settings_data}).encode('utf-8'))
 
+        elif self.path.startswith('/api/laser/status'):
+            self._send_json(200, {"status": "ok", "laser": self.server.node.laser_status()})
+
         elif self.path.startswith('/api/anchor/wizard_status'):
             node = self.server.node
             reg = getattr(node, 'tag_registry', None)
@@ -3004,6 +3214,7 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 },
                 "is_nav_locked": is_nav_locked,
                 "visual_jump_pending": getattr(node, 'visual_jump_pending', False)
+                ,"laser": node.laser_status()
                 ,"fusion_diagnostics": getattr(node, 'last_fusion_diagnostics', {})
             }
             self.send_response(200)
@@ -3081,9 +3292,11 @@ class WebServerHandler(SimpleHTTPRequestHandler):
 
         elif self.path.startswith('/api/extrinsics'):
             node = self.server.node
+            ex, ey, ez, eroll, epitch, eyaw = matrix_to_pose(node.T_base_cam)
             resp = {
                 "status": getattr(node, 'camera_extrinsics_status', 'unverified'),
                 "matrix": node.T_base_cam.tolist()
+                ,"pose": {"x": ex, "y": ey, "z": ez, "roll": eroll, "pitch": epitch, "yaw": eyaw}
                 ,"localization_model": 'ceiling_planar' if getattr(node, 'ceiling_planar', False) else 'general_3d'
                 ,"vertical_target_px": vertical_target_pixel(node.camera_matrix, node.dist_coeffs, node.T_base_cam, node.ceiling_height_m).tolist() if getattr(node, 'ceiling_planar', False) else None
                 ,"image_size": [node.camera_image_width, node.camera_image_height]
@@ -3657,6 +3870,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="tab-btn active" data-settings-tab="camera">Камера</button>
             <button class="tab-btn" data-settings-tab="autopilot">Автодвижение</button>
             <button class="tab-btn" data-settings-tab="tags">Метки</button>
+            <button class="tab-btn" data-settings-tab="laser">Лазер</button>
             <button class="tab-btn" data-settings-tab="system">Робот</button>
         </div>
         
@@ -3704,6 +3918,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <button class="btn" id="camera-calibration-apply" disabled style="margin:0; background:#2ecc71; border-color:#2ecc71;">Применить</button>
             </div>
             <div id="camera-calibration-result" style="font-size:11px; color:#8b9bb4; line-height:1.4;"></div>
+        </div>
+
+        <div class="section-title settings-only settings-camera settings-active">Положение камеры относительно центра</div>
+        <div class="calib-container settings-only settings-camera settings-active">
+            <div class="guide-box">Система base_link: X вперёд, Y влево, Z вверх. Изменение этих значений сбрасывает проверенный статус геометрии камеры.</div>
+            <div class="calib-row"><span class="stat-label">X (мм):</span><input type="number" id="camera-ext-x" class="calib-input" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Y (мм):</span><input type="number" id="camera-ext-y" class="calib-input" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Z (мм):</span><input type="number" id="camera-ext-z" class="calib-input" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Roll (град):</span><input type="number" id="camera-ext-roll" class="calib-input" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Pitch (град):</span><input type="number" id="camera-ext-pitch" class="calib-input" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Yaw (град):</span><input type="number" id="camera-ext-yaw" class="calib-input" step="0.1"></div>
+            <button class="btn btn-secondary" id="camera-extrinsics-save">Сохранить как непроверенную геометрию</button>
+        </div>
+
+        <div class="section-title settings-only settings-laser">Безопасность лазера</div>
+        <div class="calib-container settings-only settings-laser">
+            <div class="guide-box">PWM GPIO25, индикатор GPIO2, аппаратная блокировка GPIO26. Разрешение после перезапуска всегда выключено.</div>
+            <div class="calib-row"><span class="stat-label">Режим:</span><select id="input-laser-mode" class="calib-input"><option value="OFF">Выключен</option><option value="ROUTE_SPEED">Маршрут с компенсацией скорости</option></select></div>
+            <div class="calib-row"><span class="stat-label">PWM (Гц):</span><input type="number" id="input-laser-pwm-hz" class="calib-input" min="20" max="20000" step="1"></div>
+            <div class="calib-row"><span class="stat-label">Watchdog (мс):</span><input type="number" id="input-laser-watchdog" class="calib-input" min="100" max="2000" step="10"></div>
+            <div class="calib-row"><span class="stat-label">Максимальная мощность (%):</span><input type="number" id="input-laser-max-power" class="calib-input" min="0" max="100" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Номинальная мощность (%):</span><input type="number" id="input-laser-nominal-power" class="calib-input" min="0" max="100" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Минимальная активная (%):</span><input type="number" id="input-laser-min-power" class="calib-input" min="0" max="100" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Рабочая скорость (м/с):</span><input type="number" id="input-laser-reference-speed" class="calib-input" min="0.005" max="0.5" step="0.005"></div>
+            <div class="calib-row"><span class="stat-label">Порог движения (м/с):</span><input type="number" id="input-laser-min-speed" class="calib-input" min="0.001" max="0.1" step="0.001"></div>
+            <div class="calib-row"><span class="stat-label">Степень компенсации:</span><input type="number" id="input-laser-speed-gamma" class="calib-input" min="0.1" max="3" step="0.1"></div>
+        </div>
+
+        <div class="section-title settings-only settings-laser">Смещение лазерной головки</div>
+        <div class="calib-container settings-only settings-laser">
+            <div class="guide-box">От центра base_link до лазерного пятна: X вперёд, Y влево, Z вверх.</div>
+            <div class="calib-row"><span class="stat-label">X (мм):</span><input type="number" id="input-laser-offset-x" class="calib-input" min="-1000" max="1000" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Y (мм):</span><input type="number" id="input-laser-offset-y" class="calib-input" min="-1000" max="1000" step="0.1"></div>
+            <div class="calib-row"><span class="stat-label">Z (мм):</span><input type="number" id="input-laser-offset-z" class="calib-input" min="-1000" max="2000" step="0.1"></div>
+            <button class="btn" id="btn-save-laser-settings">Сохранить настройки лазера</button>
         </div>
 
         <div class="section-title remote-only">Текущие Координаты</div>
@@ -3836,6 +4085,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div style="font-size: 11px; color: #8b9bb4; line-height: 1.3;">
                 Ток снимается автоматически через 2 секунды после последней команды или при финише маршрута.
             </div>
+        </div>
+
+        <div class="section-title remote-only" style="margin-top: 15px;">Лазерная головка</div>
+        <div class="calib-container remote-only" style="display:flex; flex-direction:column; gap:8px; margin-bottom:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; font-size:12px;">
+                <span style="color:#8b9bb4;">Состояние:</span><span id="laser-status-badge" style="font-weight:600; color:#8b9bb4;">ЗАПРЕЩЁН</span>
+            </div>
+            <button class="btn btn-secondary" id="btn-laser-permit" style="margin:0; border-color:#e74c3c;">Разрешить работу лазера</button>
+            <div id="laser-status-details" style="font-size:10px; color:#8b9bb4; line-height:1.4;">Ожидание телеметрии ESP32…</div>
         </div>
 
         <div class="section-title remote-only" style="margin-top: 15px;">Автопилот (Маршруты)</div>
@@ -4995,6 +5253,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         let currentTagMapRevision = 0;
         let wizardActive = false;
         let physicalSettings = {wheel_diameter_mm: 70, drive_linear_scale: 1, drive_angular_scale: 1, default_marker_size_mm: 100, ceiling_height_m: 2.5};
+        let laserPermitRequested = false;
 
         async function fetchPhysicalSettings() {
             try {
@@ -5009,6 +5268,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     document.getElementById('input-ceiling-height').value = physicalSettings.ceiling_height_m;
                     if (!document.getElementById('input-new-tag-size').value) document.getElementById('input-new-tag-size').value = physicalSettings.default_marker_size_mm;
                     if (!document.getElementById('input-wizard-tag-size').value) document.getElementById('input-wizard-tag-size').value = physicalSettings.default_marker_size_mm;
+                    const laserInputs = {
+                        laser_mode: 'input-laser-mode', laser_pwm_hz: 'input-laser-pwm-hz',
+                        laser_watchdog_ms: 'input-laser-watchdog', laser_max_power_pct: 'input-laser-max-power',
+                        laser_nominal_power_pct: 'input-laser-nominal-power', laser_min_active_power_pct: 'input-laser-min-power',
+                        laser_reference_speed_mps: 'input-laser-reference-speed', laser_min_motion_speed_mps: 'input-laser-min-speed',
+                        laser_speed_gamma: 'input-laser-speed-gamma', laser_offset_x_mm: 'input-laser-offset-x',
+                        laser_offset_y_mm: 'input-laser-offset-y', laser_offset_z_mm: 'input-laser-offset-z'
+                    };
+                    Object.entries(laserInputs).forEach(([key, id]) => {
+                        const input = document.getElementById(id);
+                        if (input && physicalSettings[key] !== undefined) input.value = physicalSettings[key];
+                    });
                     const settingInputs = {
                         ap_cruise_speed: 'input-ap-cruise', ap_max_lin: 'input-ap-max-lin',
                         ap_min_lin: 'input-ap-min-lin', ap_goal_tol: 'input-ap-goal-tol',
@@ -5035,6 +5306,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         target.style.display = 'block';
                     } else if (target) {
                         target.style.display = 'none';
+                    }
+                    if (ext.pose) {
+                        document.getElementById('camera-ext-x').value = (Number(ext.pose.x) * 1000).toFixed(1);
+                        document.getElementById('camera-ext-y').value = (Number(ext.pose.y) * 1000).toFixed(1);
+                        document.getElementById('camera-ext-z').value = (Number(ext.pose.z) * 1000).toFixed(1);
+                        document.getElementById('camera-ext-roll').value = (Number(ext.pose.roll) * 180 / Math.PI).toFixed(2);
+                        document.getElementById('camera-ext-pitch').value = (Number(ext.pose.pitch) * 180 / Math.PI).toFixed(2);
+                        document.getElementById('camera-ext-yaw').value = (Number(ext.pose.yaw) * 180 / Math.PI).toFixed(2);
                     }
                 }
             } catch (e) { console.error('settings fetch failed', e); }
@@ -5095,6 +5374,94 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 physicalSettings = Object.assign(physicalSettings, data.settings || {});
                 addLog('Параметры автоматического движения сохранены');
             } catch (e) { addLog(`Ошибка параметров автодвижения: ${e.message}`); }
+        }
+
+        async function saveLaserSettings() {
+            const value = id => parseFloat(document.getElementById(id).value);
+            const settings = {
+                laser_mode: document.getElementById('input-laser-mode').value,
+                laser_pwm_hz: value('input-laser-pwm-hz'),
+                laser_watchdog_ms: value('input-laser-watchdog'),
+                laser_max_power_pct: value('input-laser-max-power'),
+                laser_nominal_power_pct: value('input-laser-nominal-power'),
+                laser_min_active_power_pct: value('input-laser-min-power'),
+                laser_reference_speed_mps: value('input-laser-reference-speed'),
+                laser_min_motion_speed_mps: value('input-laser-min-speed'),
+                laser_speed_gamma: value('input-laser-speed-gamma'),
+                laser_offset_x_mm: value('input-laser-offset-x'),
+                laser_offset_y_mm: value('input-laser-offset-y'),
+                laser_offset_z_mm: value('input-laser-offset-z')
+            };
+            try {
+                const res = await fetch('/api/settings', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({settings})});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                physicalSettings = Object.assign(physicalSettings, data.settings || {});
+                laserPermitRequested = false;
+                addLog('Настройки лазера сохранены; разрешение сброшено');
+                fetchLaserStatus();
+            } catch (e) { addLog(`Ошибка настроек лазера: ${e.message}`); }
+        }
+
+        async function saveCameraExtrinsics() {
+            const rad = degrees => degrees * Math.PI / 180;
+            const body = {
+                status: 'unverified', localization_model: 'ceiling_planar',
+                x: parseFloat(document.getElementById('camera-ext-x').value) / 1000,
+                y: parseFloat(document.getElementById('camera-ext-y').value) / 1000,
+                z: parseFloat(document.getElementById('camera-ext-z').value) / 1000,
+                roll: rad(parseFloat(document.getElementById('camera-ext-roll').value)),
+                pitch: rad(parseFloat(document.getElementById('camera-ext-pitch').value)),
+                yaw: rad(parseFloat(document.getElementById('camera-ext-yaw').value))
+            };
+            try {
+                const res = await fetch('/api/extrinsics', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                addLog('Геометрия камеры сохранена как непроверенная; навигация требует повторной проверки');
+                fetchPhysicalSettings();
+            } catch (e) { addLog(`Ошибка геометрии камеры: ${e.message}`); }
+        }
+
+        async function fetchLaserStatus() {
+            try {
+                const res = await fetch('/api/laser/status');
+                const data = await res.json();
+                const laser = data.laser || {};
+                const badge = document.getElementById('laser-status-badge');
+                const button = document.getElementById('btn-laser-permit');
+                const details = document.getElementById('laser-status-details');
+                laserPermitRequested = Boolean(laser.permit);
+                if (laser.applied_power_pct > 0) {
+                    badge.textContent = `ИЗЛУЧЕНИЕ ${laser.applied_power_pct.toFixed(1)}%`;
+                    badge.style.color = '#ff3b30';
+                } else if (laser.permit) {
+                    badge.textContent = laser.interlock_closed ? 'РАЗРЕШЁН, PWM=0' : 'БЛОКИРОВКА РАЗОМКНУТА';
+                    badge.style.color = '#f39c12';
+                } else {
+                    badge.textContent = 'ЗАПРЕЩЁН';
+                    badge.style.color = '#8b9bb4';
+                }
+                button.textContent = laser.permit ? 'Запретить работу лазера' : 'Разрешить работу лазера';
+                button.style.borderColor = laser.permit ? '#2ecc71' : '#e74c3c';
+                details.textContent = `ESP32: ${laser.supported ? 'готов' : 'нет laser firmware'}; блокировка: ${laser.interlock_closed ? 'замкнута' : 'разомкнута'}; PWM ${laser.pwm_hz || 100} Гц; ${laser.fault || 'ошибок нет'}`;
+            } catch (e) {}
+        }
+
+        async function toggleLaserPermit() {
+            const enabled = !laserPermitRequested;
+            try {
+                const res = await fetch('/api/laser/permit', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({enabled})});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                laserPermitRequested = enabled;
+                addLog(enabled ? 'Работа лазера разрешена; излучение остаётся выключенным до движения по маршруту' : 'Работа лазера запрещена');
+                fetchLaserStatus();
+            } catch (e) {
+                laserPermitRequested = false;
+                addLog(`Лазер не разрешён: ${e.message}`);
+                fetchLaserStatus();
+            }
         }
 
         async function cameraCalibrationAction(action, body = {}) {
@@ -5442,6 +5809,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (btnSaveTagDefaults) btnSaveTagDefaults.addEventListener('click', saveDefaultTagSize);
         const btnSaveAutopilot = document.getElementById('btn-save-autopilot-settings');
         if (btnSaveAutopilot) btnSaveAutopilot.addEventListener('click', saveAutopilotSettings);
+        document.getElementById('btn-save-laser-settings').addEventListener('click', saveLaserSettings);
+        document.getElementById('camera-extrinsics-save').addEventListener('click', saveCameraExtrinsics);
+        document.getElementById('btn-laser-permit').addEventListener('click', toggleLaserPermit);
 
         document.getElementById('camera-calibration-start').addEventListener('click', startCameraCalibration);
         document.getElementById('camera-calibration-cancel').addEventListener('click', async () => {
@@ -5475,6 +5845,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         pollCameraCalibration();
         setInterval(fetchTagRegistry, 2000);
         setInterval(pollWizardStatus, 400);
+        setInterval(() => {
+            if (laserPermitRequested) {
+                fetch('/api/laser/heartbeat', {method:'POST'}).catch(() => { laserPermitRequested = false; });
+            }
+        }, 300);
+        setInterval(fetchLaserStatus, 500);
         setInterval(fetchBatteryStatus, 5000);
         setInterval(pollCameraCalibration, 500);
 
