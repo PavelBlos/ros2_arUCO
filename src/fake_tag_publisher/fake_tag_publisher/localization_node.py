@@ -5057,7 +5057,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             return contours;
         }
         function parseDxfContours(text) {
-            const lines = text.replace(/\r/g, '').split('\n');
+            const lines = text.replace(/\\r/g, '').split('\\n');
             const pairs = [];
             for (let i = 0; i + 1 < lines.length; i += 2) pairs.push([Number(lines[i].trim()), lines[i + 1].trim()]);
             const contours = [];
