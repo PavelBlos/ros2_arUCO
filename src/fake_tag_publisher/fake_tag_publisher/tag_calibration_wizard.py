@@ -4,7 +4,7 @@ tag_calibration_wizard.py - Finite State Machine (FSM) for guided auto-centering
 Features:
   - Motion authority mutex (IDLE, MANUAL, ROUTE, TEST, CALIBRATION).
   - Safety leases with REST heartbeat timeout (0.5s period, 1.0s timeout).
-  - Target loss watchdog (< 0.25s during active servoing).
+  - Target loss watchdog with an immediate motion hold and a 1.0s recovery window.
   - Visual servoing to the geometric image centre (+x forward, +y left).
   - Mechanical oscillation settling delay (>= 0.8s) and stationary verification (|v_i| < 0.005 m/s).
   - Multi-frame stationary pose accumulation (>= 30 frames over >= 1.0s) with outlier rejection.
@@ -145,7 +145,7 @@ class TagCalibrationWizard:
                  cx: float = 320.0,
                  cy: float = 240.0,
                  centering_tol_px: float = 6.0,
-                 target_loss_timeout_sec: float = 0.45,
+                 target_loss_timeout_sec: float = 1.0,
                  heartbeat_timeout_sec: float = 1.0,
                  settling_delay_sec: float = 0.8,
                  min_stationary_frames: int = 30,

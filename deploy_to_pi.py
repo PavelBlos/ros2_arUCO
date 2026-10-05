@@ -335,6 +335,13 @@ def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False
         print(f"\n🔗 Атомарное переключение симлинка: current -> {release_tag}")
         ssh.exec_command(f"ln -sfn {target_rel_dir} {current_symlink}")
 
+        # Remove the obsolete launcher from the release root. Keeping two
+        # different start scripts there makes it too easy to run stale code;
+        # start_system.sh is the only stable entry point and follows current.
+        obsolete_launcher = f"{base_dir}/start_termit.sh"
+        ssh.exec_command(f"rm -f {obsolete_launcher}")
+        print("✅ Удалён устаревший запускатель /home/%s/arUco_termit/start_termit.sh" % user)
+
         # 7. Контрольная проверка SHA-256
         print("\n🔒 Проверка SHA256 контрольных сумм...")
         stdin, stdout, stderr = ssh.exec_command(f"sha256sum {current_symlink}/*.py {current_symlink}/*.sh 2>/dev/null")

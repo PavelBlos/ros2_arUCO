@@ -73,6 +73,27 @@ def test_wizard_target_loss_watchdog():
     assert "lost" in msg.lower()
     assert cmd == (0.0, 0.0, 0.0)
 
+
+def test_default_target_loss_window_holds_then_aborts():
+    """A short camera dropout must stop motion without cancelling calibration."""
+    wizard = TagCalibrationWizard(heartbeat_timeout_sec=3.0)
+    wizard.start(target_tag_id=42, now=100.0)
+    wizard.update([], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.05)
+
+    state, cmd, msg = wizard.update(
+        [], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=100.80
+    )
+    assert state == WizardState.FINE_CENTERING
+    assert cmd == (0.0, 0.0, 0.0)
+    assert "holding" in msg.lower()
+
+    state, cmd, msg = wizard.update(
+        [], False, (0, 0, 0), np.eye(3), np.zeros(5), np.eye(4), now=101.06
+    )
+    assert state == WizardState.ABORTED
+    assert "lost" in msg.lower()
+    assert cmd == (0.0, 0.0, 0.0)
+
 def test_visual_servoing_coordinate_signs():
     wizard = TagCalibrationWizard(cx=320.0, cy=240.0, centering_tol_px=10.0)
     wizard.start(target_tag_id=42, now=100.0)

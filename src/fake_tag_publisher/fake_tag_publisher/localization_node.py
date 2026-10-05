@@ -3749,6 +3749,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title settings-only settings-tags" style="margin-top: 15px;">Карта меток ArUco (Schema v2)</div>
         <div class="calib-container settings-only settings-tags settings-flex" style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+            <div class="calib-row" style="margin-bottom: 0;">
+                <span class="stat-label">Размер новых меток (мм):</span>
+                <input type="number" id="input-default-tag-size" class="calib-input" min="20" max="1000" step="1">
+            </div>
+            <div style="font-size: 10px; color: #8b9bb4; line-height: 1.35;">
+                Используется для ещё не добавленных меток. Уже сохранённые метки сохраняют свой индивидуальный размер.
+            </div>
+            <button class="btn" id="btn-save-tag-defaults" style="font-size: 11px; padding: 7px 8px; margin: 0;">Сохранить размер новых меток</button>
             <div style="display: flex; justify-content: space-between; align-items: center;">
                 <span style="font-size: 12px; color: #8b9bb4;">Метки в реестре:</span>
                 <button class="btn btn-secondary" id="btn-refresh-tags" style="font-size: 11px; padding: 4px 8px; margin: 0;">Обновить</button>
@@ -3772,6 +3780,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <input type="number" id="wizard-target-tag" class="calib-input" value="17" min="0" max="99" style="width:50px; text-align:center;">
                 <span id="wizard-status-badge" style="font-weight:600; color:#45a29e; font-size:11px;">IDLE</span>
             </div>
+            <div class="calib-row" style="margin-bottom: 0;">
+                <span class="stat-label">Размер этой метки (мм):</span>
+                <input type="number" id="input-wizard-tag-size" class="calib-input" min="20" max="1000" step="1">
+            </div>
             <div class="wizard-controls">
                 <button class="btn" id="btn-wizard-start" style="flex: 1; font-size: 11px; padding: 8px 4px; background-color: #2ecc71; border-color: #2ecc71; margin: 0;">Центрировать & Обучить</button>
                 <button class="btn btn-secondary" id="btn-wizard-confirm" style="display:none; flex: 1; font-size: 11px; padding: 8px 4px; background-color: #3498db; border-color: #3498db; color: white; margin: 0;">✅ Подтвердить</button>
@@ -3787,7 +3799,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="calib-row"><span class="stat-label">Диаметр колеса (мм):</span><input type="number" id="input-wheel-diameter" class="calib-input" min="20" max="300" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Масштаб перемещения:</span><input type="number" id="input-drive-linear-scale" class="calib-input" min="0.2" max="2" step="0.001"></div>
             <div class="calib-row"><span class="stat-label">Масштаб поворота:</span><input type="number" id="input-drive-angular-scale" class="calib-input" min="0.2" max="2" step="0.001"></div>
-            <div class="calib-row"><span class="stat-label">Сторона метки (мм):</span><input type="number" id="input-default-tag-size" class="calib-input" min="20" max="1000" step="1"></div>
             <div class="calib-row"><span class="stat-label">Высота потолка (м):</span><input type="number" id="input-ceiling-height" class="calib-input" min="0.2" max="20" step="0.01"></div>
             <button class="btn" id="btn-save-physical" style="margin: 4px 0 0;">Сохранить параметры</button>
         </div>
@@ -4997,6 +5008,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     document.getElementById('input-default-tag-size').value = physicalSettings.default_marker_size_mm;
                     document.getElementById('input-ceiling-height').value = physicalSettings.ceiling_height_m;
                     if (!document.getElementById('input-new-tag-size').value) document.getElementById('input-new-tag-size').value = physicalSettings.default_marker_size_mm;
+                    if (!document.getElementById('input-wizard-tag-size').value) document.getElementById('input-wizard-tag-size').value = physicalSettings.default_marker_size_mm;
                     const settingInputs = {
                         ap_cruise_speed: 'input-ap-cruise', ap_max_lin: 'input-ap-max-lin',
                         ap_min_lin: 'input-ap-min-lin', ap_goal_tol: 'input-ap-goal-tol',
@@ -5033,7 +5045,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 wheel_diameter_mm: parseFloat(document.getElementById('input-wheel-diameter').value),
                 drive_linear_scale: parseFloat(document.getElementById('input-drive-linear-scale').value),
                 drive_angular_scale: parseFloat(document.getElementById('input-drive-angular-scale').value),
-                default_marker_size_mm: parseFloat(document.getElementById('input-default-tag-size').value),
                 ceiling_height_m: parseFloat(document.getElementById('input-ceiling-height').value)
             };
             try {
@@ -5041,9 +5052,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
                 physicalSettings = data.settings;
-                document.getElementById('input-new-tag-size').value = physicalSettings.default_marker_size_mm;
                 addLog('Физические параметры сохранены');
             } catch (e) { addLog(`Ошибка параметров: ${e.message}`); }
+        }
+
+        async function saveDefaultTagSize() {
+            const sizeMm = parseFloat(document.getElementById('input-default-tag-size').value);
+            if (!Number.isFinite(sizeMm) || sizeMm < 20 || sizeMm > 1000) {
+                addLog('Размер новой метки должен быть от 20 до 1000 мм');
+                return;
+            }
+            try {
+                const res = await fetch('/api/settings', {
+                    method: 'POST', headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({settings: {default_marker_size_mm: sizeMm}})
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                physicalSettings = Object.assign(physicalSettings, data.settings || {});
+                document.getElementById('input-new-tag-size').value = sizeMm;
+                document.getElementById('input-wizard-tag-size').value = sizeMm;
+                addLog(`Размер новых меток сохранён: ${sizeMm} мм`);
+            } catch (e) { addLog(`Ошибка сохранения размера метки: ${e.message}`); }
         }
 
         async function saveAutopilotSettings() {
@@ -5195,7 +5225,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const container = document.getElementById('tag-registry-table-container');
                 if (container && data.tags) {
                     let html = '<table style="width:100%; border-collapse:collapse; text-align:left;">';
-                    html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.1); color:#66fcf1;"><th>ID</th><th>X</th><th>Y</th><th>Статус</th><th>Действия</th></tr>';
+                    html += '<tr style="border-bottom:1px solid rgba(255,255,255,0.1); color:#66fcf1;"><th>ID</th><th>X</th><th>Y</th><th>мм</th><th>Статус</th><th>Действия</th></tr>';
                     for (const [tid, info] of Object.entries(data.tags)) {
                         const p = info.pose || {x: 0, y: 0};
                         const stateColor = info.state === 'confirmed' ? '#2ecc71' : (info.state === 'provisional' ? '#f39c12' : '#888');
@@ -5204,6 +5234,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <td><b>${tid}</b> ${isAnchor ? '⚓' : ''}</td>
                             <td>${p.x.toFixed(2)}</td>
                             <td>${p.y.toFixed(2)}</td>
+                            <td>${Number(info.size_mm || physicalSettings.default_marker_size_mm).toFixed(0)}</td>
                             <td style="color:${stateColor}">${info.state || 'unconfirmed'}</td>
                             <td>
                                 <button onclick="setAnchorTag(${tid})" style="background:none; border:none; color:#66fcf1; cursor:pointer; font-size:10px;">⚓</button>
@@ -5307,8 +5338,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         async function startWizard() {
             const tid = parseInt(document.getElementById('wizard-target-tag').value);
-            const markerSizeM = parseFloat(document.getElementById('input-new-tag-size').value || physicalSettings.default_marker_size_mm) / 1000.0;
-            if (isNaN(tid)) return;
+            const sizeMm = parseFloat(document.getElementById('input-wizard-tag-size').value || physicalSettings.default_marker_size_mm);
+            const markerSizeM = sizeMm / 1000.0;
+            if (isNaN(tid) || !Number.isFinite(sizeMm) || sizeMm < 20 || sizeMm > 1000) {
+                addLog('Укажите корректные ID и размер метки от 20 до 1000 мм');
+                return;
+            }
             try {
                 const res = await fetch('/api/calibration/start', {
                     method: 'POST',
@@ -5318,7 +5353,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const data = await res.json();
                 if (res.ok) {
                     wizardActive = true;
-                    addLog(`Wizard started for tag ${tid}`);
+                    addLog(`Wizard started for tag ${tid}, размер ${sizeMm} мм`);
                 } else {
                     addLog(`Failed to start wizard: ${data.error}`);
                 }
@@ -5403,6 +5438,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (btnWizAbort) btnWizAbort.addEventListener('click', abortWizard);
         const btnSavePhysical = document.getElementById('btn-save-physical');
         if (btnSavePhysical) btnSavePhysical.addEventListener('click', savePhysicalSettings);
+        const btnSaveTagDefaults = document.getElementById('btn-save-tag-defaults');
+        if (btnSaveTagDefaults) btnSaveTagDefaults.addEventListener('click', saveDefaultTagSize);
         const btnSaveAutopilot = document.getElementById('btn-save-autopilot-settings');
         if (btnSaveAutopilot) btnSaveAutopilot.addEventListener('click', saveAutopilotSettings);
 
