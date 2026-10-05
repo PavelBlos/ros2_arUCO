@@ -105,7 +105,7 @@ def collect_deployment_files(base_dir=PROJECT_DIR):
                         files[pyf] = os.path.join(py_dir, pyf)
 
     # 3. Root helper scripts and configuration
-    for root_f in ['start_termit.sh', 'start_system.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml', 'runtime_settings.yaml']:
+    for root_f in ['start_system.sh', 'migrate_tag_config.py', 'camera_extrinsics.yaml', 'test_cam.py', 'tags_config.yaml', 'runtime_settings.yaml']:
         rp = os.path.join(base_dir, root_f)
         if os.path.exists(rp):
             files[root_f] = rp
@@ -370,7 +370,7 @@ def deploy(target_host=None, target_user=None, target_pass=None, wait_loop=False
         print("\n" + "=" * 65)
         print(f"🎉 ИЗОЛИРОВАННЫЙ РЕЛИЗ {release_tag} УСПЕШНО АКТИВИРОВАН!")
         print(f"Активный каталог: {current_symlink}")
-        print(f"Запуск: python pi_exec.py 'nohup bash {current_symlink}/start_termit.sh > /tmp/termit_start.log 2>&1 < /dev/null &'")
+        print(f"Запуск: python pi_exec.py 'nohup {base_dir}/start_system.sh > /tmp/termit_start.log 2>&1 < /dev/null &'")
         print("=" * 65)
         return True
 

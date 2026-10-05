@@ -30,7 +30,8 @@ def test_collect_deployment_files():
     assert 'src/fake_tag_publisher/fake_tag_publisher/geometry_transforms.py' in files
 
     # Must include root helpers
-    assert 'start_termit.sh' in files
+    assert 'start_system.sh' in files
+    assert 'start_termit.sh' not in files
     assert 'migrate_tag_config.py' in files
     assert 'camera_extrinsics.yaml' in files
 

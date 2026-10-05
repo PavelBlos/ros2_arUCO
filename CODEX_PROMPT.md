@@ -31,7 +31,7 @@
 - termit_api.py — промышленный Python API модуль связи с ESP32, кинематика Omni, одометрия, watchdog.
 - localization_node.py (и localization_node_remote.py) — главный ROS 2 узел навигации, слияния данных меток и колес, алгоритм Lookahead Pure Pursuit, веб-сервер (порт 8080) с 2-секундным таймером авто-снятия тока с обмоток.
 - video_tag_detector_remote.py — ROS 2 узел детекции ArUco через камеру Raspberry Pi (libcamerify).
-- start_termit.sh — скрипт запуска всей системы на Raspberry Pi в фоновом режиме.
+- start_system.sh — единый скрипт запуска всей системы на Raspberry Pi.
 - deploy_to_pi.py — скрипт синхронизации файлов с ПК на Raspberry Pi по SSH/SFTP.
 
 ### 3. ТЕКУЩИЙ СТАТУС СИСТЕМЫ
@@ -79,7 +79,7 @@
 2. 	ermit_api.py — Python API класс TermitRobotAPI.
 3. localization_node.py — ROS 2 нода навигации и веб-сервер с автопилотом Pure Pursuit.
 4. 	ags_config.yaml — конфигурация координат потолочных меток ArUco.
-5. start_termit.sh — скрипт автозапуска на Raspberry Pi.
+5. start_system.sh — единый стабильный скрипт запуска на Raspberry Pi.
 6. deploy_to_pi.py — скрипт деплоя на Малину по SSH/SFTP.
 7. pi_exec.py — утилита удаленного выполнения команд по SSH.
 8. PROJECT_PASSPORT.md — полный технический паспорт проекта.
