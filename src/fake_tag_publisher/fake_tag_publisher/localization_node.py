@@ -4201,7 +4201,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title remote-only" style="margin-top:15px;">Файл для гравировки или резки</div>
         <div class="calib-container remote-only" style="display:flex; flex-direction:column; gap:8px;">
-            <div class="guide-box">SVG и DXF переводятся в контуры. PNG переводится в построчную змейку с мощностью по яркости пикселей: белый фон выключает лазер, более тёмный участок повышает PWM. Насыщенность фиолетовой линии показывает мощность, серый пунктир — переезд с выключенным лазером. Маршрут сначала только подготавливается; запуск выполняется отдельной кнопкой «Старт».</div>
+            <div class="guide-box">SVG и DXF переводятся в контуры. PNG переводится в построчную змейку с мощностью по яркости пикселей: белый фон выключает лазер, более тёмный участок повышает PWM. Насыщенность фиолетовой линии показывает мощность, серый пунктир — переезд с выключенным лазером. Для очень больших изображений шаг автоматически увеличивается до безопасного значения и показывается под предпросмотром. Маршрут сначала только подготавливается; запуск выполняется отдельной кнопкой «Старт».</div>
             <input type="file" id="artwork-file" accept=".svg,.png,.dxf,image/png,image/svg+xml" class="calib-input" style="width:100%;">
             <div class="artwork-grid">
                 <div class="artwork-field"><label>Режим</label><select id="artwork-mode" class="calib-input" style="width:100%;"><option value="auto">Автоматически</option><option value="vector">Контуры</option><option value="raster">Растр-змейка</option></select></div>
@@ -4537,18 +4537,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
             // Отрисовка нарисованного маршрута автопилота
             if (plannedPath.length > 0) {
-                ctx.lineWidth = 3;
-                for (let i = 1; i < plannedPath.length; i++) {
-                    const laserFactor = Math.max(0, Math.min(1, Number(plannedPath[i].laser ?? 1)));
-                    const activeLaser = laserFactor > 0;
-                    ctx.strokeStyle = activeLaser ? `rgba(168, 85, 247, ${(.2 + .8 * laserFactor).toFixed(3)})` : 'rgba(148, 163, 184, 0.55)';
-                    ctx.setLineDash(activeLaser ? [] : [5, 5]);
-                    ctx.beginPath();
-                    ctx.moveTo(panX + plannedPath[i - 1].x * zoom, panY - plannedPath[i - 1].y * zoom);
-                    ctx.lineTo(panX + plannedPath[i].x * zoom, panY - plannedPath[i].y * zoom);
-                    ctx.stroke();
+                if (!plannedPathRenderCache || plannedPathRenderCache.source !== plannedPath || plannedPathRenderCache.length !== plannedPath.length) {
+                    const buckets = new Map();
+                    for (let i = 1; i < plannedPath.length; i++) {
+                        const factor = Math.max(0, Math.min(1, Number(plannedPath[i].laser ?? 1)));
+                        const bucket = factor > 0 ? Math.max(1, Math.round(factor * 31)) : 0;
+                        if (!buckets.has(bucket)) buckets.set(bucket, new Path2D());
+                        const path = buckets.get(bucket);
+                        path.moveTo(plannedPath[i - 1].x, plannedPath[i - 1].y);
+                        path.lineTo(plannedPath[i].x, plannedPath[i].y);
+                    }
+                    plannedPathRenderCache = {source: plannedPath, length: plannedPath.length, buckets};
                 }
-                ctx.setLineDash([]);
+                ctx.save();
+                ctx.setTransform(zoom, 0, 0, -zoom, panX, panY);
+                ctx.lineWidth = 3 / zoom;
+                for (const [bucket, path] of plannedPathRenderCache.buckets.entries()) {
+                    const factor = bucket / 31;
+                    ctx.strokeStyle = bucket > 0 ? `rgba(168, 85, 247, ${(.2 + .8 * factor).toFixed(3)})` : 'rgba(148, 163, 184, 0.55)';
+                    ctx.setLineDash(bucket > 0 ? [] : [5 / zoom, 5 / zoom]);
+                    ctx.stroke(path);
+                }
+                ctx.restore();
                 
                 const markerStride = Math.max(1, Math.ceil(plannedPath.length / 200));
                 for (let i = 0; i < plannedPath.length; i += markerStride) {
@@ -4984,6 +4994,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         // Переменные автопилота
         let drawMode = false;
         let plannedPath = [];
+        let plannedPathRenderCache = null;
         let dragStartX = 0;
         let dragStartY = 0;
         
@@ -5010,6 +5021,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         // Offline artwork import: no cloud/CDN is needed, which also makes it
         // work when the Raspberry Pi is serving its fallback access point.
         let importedArtwork = null;
+        let lastRasterBuild = null;
+        const MAX_RASTER_CELLS = 4500;
         const artworkPreview = document.getElementById('artwork-preview');
         const artworkPreviewCtx = artworkPreview.getContext('2d');
         const artworkSummary = document.getElementById('artwork-summary');
@@ -5201,26 +5214,52 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             const off = document.createElement('canvas'); off.width=w; off.height=h;
             const oc = off.getContext('2d', {willReadFrequently:true}); oc.drawImage(img,sx,sy,sw,sh,0,0,w,h);
             const pixels = oc.getImageData(0,0,w,h).data;
-            const widthM=artworkValue('artwork-width',200)/1000, heightM=artworkValue('artwork-height',200)/1000;
+            const widthMm=artworkValue('artwork-width',200),heightMm=artworkValue('artwork-height',200);
+            if(widthMm<5||widthMm>5000||heightMm<5||heightMm>5000) throw new Error('размер PNG должен быть от 5 до 5000 мм');
+            const widthM=widthMm/1000, heightM=heightMm/1000;
             const cx=artworkValue('artwork-center-x'), cy=artworkValue('artwork-center-y');
-            const rowStep=Math.max(1,Math.round((artworkValue('artwork-raster-step',5)/1000)/heightM*h));
-            const columns=Math.max(1,Math.ceil(widthM/Math.max(.001,artworkValue('artwork-raster-pixel-step',5)/1000)));
+            const requestedRowStepMm=Math.max(1,artworkValue('artwork-raster-step',5));
+            const requestedColumnStepMm=Math.max(1,artworkValue('artwork-raster-pixel-step',5));
+            const requestedRows=Math.max(1,Math.ceil(heightMm/requestedRowStepMm));
+            const requestedColumns=Math.max(1,Math.ceil(widthMm/requestedColumnStepMm));
+            let rows=requestedRows,columns=requestedColumns;
+            if(rows*columns>MAX_RASTER_CELLS){
+                const reduction=Math.sqrt((rows*columns)/MAX_RASTER_CELLS);
+                rows=Math.max(1,Math.floor(rows/reduction));
+                columns=Math.max(1,Math.floor(columns/reduction));
+                if(rows*columns>MAX_RASTER_CELLS){
+                    if(rows<=columns) columns=Math.max(1,Math.floor(MAX_RASTER_CELLS/rows));
+                    else rows=Math.max(1,Math.floor(MAX_RASTER_CELLS/columns));
+                }
+            }
+            const effectiveRowStepMm=heightMm/rows,effectiveColumnStepMm=widthMm/columns;
+            lastRasterBuild={
+                requestedCells:requestedRows*requestedColumns,
+                cells:rows*columns,
+                rows,columns,
+                rowStepMm:effectiveRowStepMm,
+                columnStepMm:effectiveColumnStepMm,
+                adjusted:rows!==requestedRows||columns!==requestedColumns,
+            };
             const threshold=artworkValue('artwork-threshold',160), invert=document.getElementById('artwork-invert').checked;
             const levels=Math.max(2,Math.min(32,Math.round(artworkValue('artwork-power-levels',8))));
             const powerGamma=Math.max(.2,Math.min(3,artworkValue('artwork-power-gamma',1)));
             const route=[];
-            for (let y=0,row=0; y<h; y+=rowStep,row++) {
+            for (let row=0;row<rows;row++) {
+                const y0=Math.floor(row*h/rows),y1=Math.max(y0+1,Math.ceil((row+1)*h/rows));
                 const reverse=Boolean(row%2), spans=[];
                 let activePower=0, startEdge=reverse?columns:0;
                 const powerAt=column=>{
                     const x0=Math.floor(column*w/columns),x1=Math.max(x0+1,Math.ceil((column+1)*w/columns));
-                    let weightedLum=0,alphaSum=0;
-                    for(let x=x0;x<Math.min(w,x1);x++){
-                        const n=(y*w+x)*4,alpha=pixels[n+3]/255;
-                        weightedLum+=(.2126*pixels[n]+.7152*pixels[n+1]+.0722*pixels[n+2])*alpha;
-                        alphaSum+=alpha;
+                    let weightedLum=0,alphaSum=0,sampleCount=0;
+                    for(let py=y0;py<Math.min(h,y1);py++){
+                        for(let x=x0;x<Math.min(w,x1);x++){
+                            const n=(py*w+x)*4,alpha=pixels[n+3]/255;
+                            weightedLum+=(.2126*pixels[n]+.7152*pixels[n+1]+.0722*pixels[n+2])*alpha;
+                            alphaSum+=alpha;sampleCount++;
+                        }
                     }
-                    const alpha=alphaSum/Math.max(1,x1-x0),lum=alphaSum>1e-9?weightedLum/alphaSum:255;
+                    const alpha=alphaSum/Math.max(1,sampleCount),lum=alphaSum>1e-9?weightedLum/alphaSum:255;
                     const active=alpha>.125 && (invert ? lum>threshold : lum<threshold);
                     if(!active) return 0;
                     const opticalDensity=(invert?lum:255-lum)/255*alpha;
@@ -5237,7 +5276,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     }
                 }
                 if(activePower>0) spans.push([startEdge,reverse?0:columns,activePower]);
-                const point=(xv,laser)=>({x:cx+(xv/Math.max(1,columns)-.5)*widthM, y:cy-(y/(Math.max(1,h-1))-.5)*heightM, laser});
+                const point=(xv,laser)=>({x:cx+(xv/Math.max(1,columns)-.5)*widthM, y:cy-((row+.5)/rows-.5)*heightM, laser});
                 let previousEdge=null;
                 for (const [start,end,power] of spans) {
                     if(previousEdge===null||Math.abs(previousEdge-start)>1e-9) route.push(point(start,0));
@@ -5258,7 +5297,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 }
                 return;
             }
-            const minX=Math.min(...route.map(p=>p.x)),maxX=Math.max(...route.map(p=>p.x)),minY=Math.min(...route.map(p=>p.y)),maxY=Math.max(...route.map(p=>p.y));
+            let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+            for(const p of route){minX=Math.min(minX,p.x);maxX=Math.max(maxX,p.x);minY=Math.min(minY,p.y);maxY=Math.max(maxY,p.y);}
             const scale=.9*Math.min(w/Math.max(1e-9,maxX-minX),h/Math.max(1e-9,maxY-minY));
             const px=x=>(x-(minX+maxX)/2)*scale+w/2, py=y=>h/2-(y-(minY+maxY)/2)*scale;
             artworkPreviewCtx.lineWidth=Math.max(1,devicePixelRatio);
@@ -5285,6 +5325,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         document.getElementById('artwork-center-robot').addEventListener('click',()=>{ document.getElementById('artwork-center-x').value=robotPos.x.toFixed(3); document.getElementById('artwork-center-y').value=robotPos.y.toFixed(3); });
         document.getElementById('artwork-build-route').addEventListener('click',async()=>{
             if(!importedArtwork){ artworkSummary.textContent='Сначала выберите файл.'; return; }
+            const buildButton=document.getElementById('artwork-build-route');
+            buildButton.disabled=true;artworkSummary.textContent='Подготовка маршрута…';
+            await new Promise(resolve=>setTimeout(resolve,0));
             try{
                 const requested=document.getElementById('artwork-mode').value;
                 const raster=requested==='raster'||(requested==='auto'&&importedArtwork.type==='png');
@@ -5293,9 +5336,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 plannedPath=route; const result=await uploadPlannedPath(); renderArtworkPreview(route);
                 const active=result.laser_segments, widthM=artworkValue('artwork-width')/1000, heightM=artworkValue('artwork-height')/1000;
                 const cx=artworkValue('artwork-center-x'),cy=artworkValue('artwork-center-y'); autoCenter=false; zoom=Math.max(15,Math.min(3000,.75*Math.min(canvas.width/Math.max(.02,widthM),canvas.height/Math.max(.02,heightM)))); panX=canvas.width/2-cx*zoom; panY=canvas.height/2+cy*zoom;
-                artworkSummary.textContent=`Маршрут готов: ${route.length} точек, рабочих сегментов ${active}. Проверьте карту и нажмите «Старт».`;
+                const resolutionNote=raster&&lastRasterBuild?.adjusted?` Разрешение автоматически ограничено для стабильной работы: X ${lastRasterBuild.columnStepMm.toFixed(1)} мм, строки ${lastRasterBuild.rowStepMm.toFixed(1)} мм (${lastRasterBuild.cells} ячеек вместо ${lastRasterBuild.requestedCells}).`:'';
+                artworkSummary.textContent=`Маршрут готов: ${route.length} точек, рабочих сегментов ${active}.${resolutionNote} Проверьте карту и нажмите «Старт».`;
                 addLog(`Файл ${importedArtwork.name}: подготовлено ${route.length} точек, лазер включён на ${active} сегментах.`); draw();
             }catch(e){ artworkSummary.textContent=`Ошибка: ${e.message}`; addLog(`Ошибка импорта: ${e.message}`); }
+            finally{buildButton.disabled=false;}
         });
         
         btnDrawMode.addEventListener('click', () => {
