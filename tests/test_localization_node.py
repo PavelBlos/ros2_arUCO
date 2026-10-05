@@ -139,6 +139,8 @@ def test_dynamic_api_health(mock_node):
     assert payload["anchor_confirmed"] is False
     assert payload["is_nav_locked"] is False
     assert payload["laser"]["permit"] is False
+    assert payload["camera_frame_fresh"] is False
+    assert payload["camera_frame_age_s"] is None
 
 
 def test_laser_speed_compensation_and_stationary_cutoff(mock_node):

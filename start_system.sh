@@ -75,8 +75,32 @@ echo "[+] Using localization_node:  ${LOC_PY}"
 echo "[+] Using video_tag_detector: ${VID_PY}"
 echo "[+] Dynamic Camera TF (base_link -> camera_link) is broadcast by localization_node from camera_extrinsics.yaml"
 
-echo "[+] Starting Video Tag Detector (CSI Camera via libcamerify)..."
-/usr/local/bin/libcamerify python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &
+start_video_detector() {
+    echo "[+] Starting Video Tag Detector (CSI Camera via libcamerify)..."
+    /usr/local/bin/libcamerify python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &
+    PID_VID=$!
+}
+
+stop_video_detector() {
+    if [[ -n "${PID_VID:-}" ]] && kill -0 "${PID_VID}" 2>/dev/null; then
+        kill -15 "${PID_VID}" 2>/dev/null || true
+        for _ in {1..10}; do
+            kill -0 "${PID_VID}" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "${PID_VID}" 2>/dev/null || true
+        wait "${PID_VID}" 2>/dev/null || true
+    fi
+}
+
+restart_video_detector() {
+    echo "[!] Camera watchdog: no new JPEG frames; restarting detector..."
+    stop_video_detector
+    sleep 0.5
+    start_video_detector
+}
+
+start_video_detector
 
 echo "[+] Starting Localization & Autopilot Web Server (port 8080)..."
 python3 "${LOC_PY}" > /tmp/localization_node.log 2>&1 &
@@ -93,6 +117,34 @@ echo "Video Stream:  http://${PRIMARY_IP}:8080/video_feed"
 echo "All available IPs: ${IP_LIST}"
 echo "============================================================="
 
+STALE_CAMERA_POLLS=0
 while kill -0 "${PID_LOC}" 2>/dev/null; do
-    sleep 1
+    sleep 2
+    if ! kill -0 "${PID_VID}" 2>/dev/null; then
+        restart_video_detector
+        STALE_CAMERA_POLLS=0
+        continue
+    fi
+
+    CAMERA_STATE="$(curl -s -m 1 http://localhost:8080/api/health 2>/dev/null | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    age = data.get("camera_frame_age_s")
+    print("stale" if age is None or float(age) > 4.0 else "fresh")
+except Exception:
+    print("unknown")
+' 2>/dev/null || true)"
+    if [[ "${CAMERA_STATE}" == "stale" ]]; then
+        STALE_CAMERA_POLLS=$((STALE_CAMERA_POLLS + 1))
+    else
+        STALE_CAMERA_POLLS=0
+    fi
+    if (( STALE_CAMERA_POLLS >= 2 )); then
+        restart_video_detector
+        STALE_CAMERA_POLLS=0
+    fi
 done
+
+stop_video_detector
+wait "${PID_LOC}" 2>/dev/null || true

@@ -263,6 +263,7 @@ class LocalizationNode(Node):
         # Буфер и подписка на сжатое видео с камеры
         self.latest_jpeg_frame = None
         self.latest_frame_seq = 0
+        self.latest_frame_time = 0.0
         self.camera_calibration_last_seq = -1
         self.latest_frame_lock = threading.Lock()
         self.image_sub = self.create_subscription(
@@ -1046,6 +1047,7 @@ class LocalizationNode(Node):
         with self.latest_frame_lock:
             self.latest_jpeg_frame = bytes(msg.data)
             self.latest_frame_seq += 1
+            self.latest_frame_time = time.time()
 
     def tag_callback(self, msg):
         try:
@@ -3288,6 +3290,8 @@ class WebServerHandler(SimpleHTTPRequestHandler):
             esp_odom_fresh = (now_t - node.last_esp32_odom_time < 0.5) if node.last_esp32_odom_time > 0 else False
             pose_fresh = (now_t - node.last_pose_publish_time < 0.5) if node.last_pose_publish_time > 0 else False
             tag_fresh = (now_t - node.last_valid_tag_time < 1.0) if node.last_valid_tag_time > 0 else False
+            frame_time = float(getattr(node, 'latest_frame_time', 0.0))
+            camera_frame_fresh = (now_t - frame_time < 2.0) if frame_time > 0 else False
 
             reg = getattr(node, 'tag_registry', None)
             anchor_confirmed = reg.anchor_confirmed if reg else False
@@ -3367,6 +3371,8 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 "pose_age_s": round(now_t - node.last_pose_publish_time, 3) if node.last_pose_publish_time > 0 else None,
                 "tag_fresh": tag_fresh,
                 "tag_age_s": round(now_t - node.last_valid_tag_time, 3) if node.last_valid_tag_time > 0 else None,
+                "camera_frame_fresh": camera_frame_fresh,
+                "camera_frame_age_s": round(now_t - frame_time, 3) if frame_time > 0 else None,
                 "active_run_id": node.active_run_id,
                 "motor_power": node.motor_power_state,
                 "tracking_mode": node.tracking_mode,
