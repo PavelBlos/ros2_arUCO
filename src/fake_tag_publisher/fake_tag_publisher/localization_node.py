@@ -27,6 +27,7 @@ try:
     from .tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
     from .covisibility_graph import CovisibilityGraph
     from .camera_calibration_session import CameraCalibrationSession, make_a4_chessboard_svg
+    from .camera_extrinsics_calibration import estimate_base_camera
 except ImportError:
     from geometry_transforms import (
         normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
@@ -38,6 +39,7 @@ except ImportError:
     from tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
     from covisibility_graph import CovisibilityGraph
     from camera_calibration_session import CameraCalibrationSession, make_a4_chessboard_svg
+    from camera_extrinsics_calibration import estimate_base_camera
 from sensor_msgs.msg import CompressedImage
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
@@ -53,6 +55,7 @@ from scipy.spatial.transform import Rotation as R, Slerp
 import threading
 import json
 import queue
+from collections import deque
 try:
     from .ceiling_geometry import vertical_target_pixel
 except ImportError:
@@ -81,7 +84,8 @@ def waypoint_capture_tolerance(is_first_connector, goal_tolerance, waypoint_tole
 
 
 def curvature_limited_speed(speed_limit, min_speed, brake_accel, turn_factor,
-                            turn_angle, incoming_length, outgoing_length):
+                            turn_angle, incoming_length, outgoing_length,
+                            lateral_accel=None):
     """Return a corner speed that also handles many small turns on tight curves."""
     speed_limit = max(0.0, float(speed_limit))
     min_speed = max(0.0, min(float(min_speed), speed_limit))
@@ -94,7 +98,9 @@ def curvature_limited_speed(speed_limit, min_speed, brake_accel, turn_factor,
     # The available lateral acceleration is intentionally below longitudinal
     # braking acceleration, scaled by the user's existing turn factor.
     curvature = turn_angle / mean_span
-    lateral_accel = max(0.005, float(brake_accel) * max(0.10, float(turn_factor)))
+    if lateral_accel is None:
+        lateral_accel = float(brake_accel) * max(0.10, float(turn_factor))
+    lateral_accel = max(0.001, float(lateral_accel))
     curve_speed = math.sqrt(lateral_accel / max(curvature, 1e-9))
 
     # Preserve the established strong slowdown for visibly sharp vertices.
@@ -106,11 +112,15 @@ def curvature_limited_speed(speed_limit, min_speed, brake_accel, turn_factor,
     return float(np.clip(curve_speed, min_speed, speed_limit))
 
 
-def cross_track_limited_speed(speed_limit, min_speed, cross_error, waypoint_tolerance):
+def cross_track_limited_speed(speed_limit, min_speed, cross_error, waypoint_tolerance,
+                              slowdown_width=None):
     """Slow forward progress while the lateral controller recovers the path."""
     speed_limit = max(0.0, float(speed_limit))
     min_speed = max(0.0, min(float(min_speed), speed_limit))
-    recovery_width = max(0.008, 2.0 * float(waypoint_tolerance))
+    recovery_width = max(
+        0.004,
+        float(slowdown_width) if slowdown_width is not None else 2.0 * float(waypoint_tolerance),
+    )
     ratio = abs(float(cross_error)) / recovery_width
     scale = 1.0 / (1.0 + ratio * ratio)
     return float(np.clip(speed_limit * scale, min_speed, speed_limit))
@@ -127,6 +137,28 @@ def segment_curve_speed_limit(corner_speeds, segment_index, speed_limit,
     start = int(np.clip(segment_index, 0, last_index))
     end = min(start + 1, last_index)
     return float(min(corner_speeds[start], corner_speeds[end], speed_limit))
+
+
+def slew_vector(previous, target, accel_limit, brake_limit, dt):
+    """Rate-limit a 2-D velocity command without adding an EMA phase delay."""
+    previous = np.asarray(previous, dtype=float)
+    target = np.asarray(target, dtype=float)
+    delta = target - previous
+    delta_norm = float(np.linalg.norm(delta))
+    if delta_norm <= 1e-12:
+        return target.copy()
+    prev_norm = float(np.linalg.norm(previous))
+    target_norm = float(np.linalg.norm(target))
+    accelerating = target_norm > prev_norm and float(np.dot(previous, target)) >= -1e-9
+    limit = float(accel_limit if accelerating else brake_limit) * max(0.0, float(dt))
+    if delta_norm <= limit or limit <= 0.0:
+        return target.copy() if limit > 0.0 else previous.copy()
+    return previous + delta * (limit / delta_norm)
+
+
+def slew_scalar(previous, target, rate_limit, dt):
+    step = max(0.0, float(rate_limit)) * max(0.0, float(dt))
+    return float(previous + np.clip(float(target) - float(previous), -step, step))
 
 
 def _rdp_indices(points, tolerance):
@@ -227,6 +259,7 @@ class LocalizationNode(Node):
         # Detections caching and rate limits
         self.latest_detections = []
         self.latest_detections_stamp = 0.0
+        self.recent_detection_frames = deque(maxlen=120)
         self._last_conflict_warn_time = 0.0
         self.last_fusion_diagnostics = {"status": "not_started"}
         self.fusion_conflict_since = None
@@ -379,6 +412,14 @@ class LocalizationNode(Node):
         self.ap_v_cross_max = 0.045       # Максимальная скорость боковой коррекции (м/с)
         self.ap_brake_accel = 0.08        # Тормозное кинематическое замедление (м/с^2)
         self.ap_turn_factor = 0.25        # Множитель скорости прохождения углов
+        self.ap_approach_speed = 0.09     # Скорость служебного подъезда к старту
+        self.ap_precision_radius = 0.04   # Радиус плавного точного подхода (м)
+        self.ap_precision_speed = 0.025   # Предельная скорость точного подхода (м/с)
+        self.ap_accel_limit = 0.06        # Разрешённый разгон команды (м/с^2)
+        self.ap_lateral_accel = 0.02      # Боковое ускорение для кривых (м/с^2)
+        self.ap_corner_stop_angle_deg = 55.0
+        self.ap_cross_slowdown_m = 0.025
+        self.ap_angular_accel = 1.5
         self.ap_max_ang = 0.60            # Предельная угловая скорость вращения (рад/с)
         self.ap_kp_ang = 1.80             # Пропорциональный коэффициент ориентации
         self.ap_yaw_mode = "HOLD_INITIAL" # FREE, HOLD_INITIAL, PATH_TANGENT, FINAL_YAW
@@ -622,6 +663,12 @@ class LocalizationNode(Node):
                 if "ap_v_cross_max" in cfg: self.ap_v_cross_max = float(cfg["ap_v_cross_max"])
                 if "ap_brake_accel" in cfg: self.ap_brake_accel = float(cfg["ap_brake_accel"])
                 if "ap_turn_factor" in cfg: self.ap_turn_factor = float(cfg["ap_turn_factor"])
+                for key in (
+                    'ap_approach_speed', 'ap_precision_radius', 'ap_precision_speed',
+                    'ap_accel_limit', 'ap_lateral_accel', 'ap_corner_stop_angle_deg',
+                    'ap_cross_slowdown_m', 'ap_angular_accel',
+                ):
+                    if key in cfg: setattr(self, key, float(cfg[key]))
                 if "ap_max_ang" in cfg: self.ap_max_ang = float(cfg["ap_max_ang"])
                 if "ap_kp_ang" in cfg: self.ap_kp_ang = float(cfg["ap_kp_ang"])
                 if "ap_yaw_mode" in cfg: self.ap_yaw_mode = str(cfg["ap_yaw_mode"])
@@ -676,6 +723,14 @@ class LocalizationNode(Node):
             "ap_v_cross_max": float(getattr(self, 'ap_v_cross_max', 0.045)),
             "ap_brake_accel": float(getattr(self, 'ap_brake_accel', 0.08)),
             "ap_turn_factor": float(getattr(self, 'ap_turn_factor', 0.65)),
+            "ap_approach_speed": float(getattr(self, 'ap_approach_speed', 0.09)),
+            "ap_precision_radius": float(getattr(self, 'ap_precision_radius', 0.04)),
+            "ap_precision_speed": float(getattr(self, 'ap_precision_speed', 0.025)),
+            "ap_accel_limit": float(getattr(self, 'ap_accel_limit', 0.06)),
+            "ap_lateral_accel": float(getattr(self, 'ap_lateral_accel', 0.02)),
+            "ap_corner_stop_angle_deg": float(getattr(self, 'ap_corner_stop_angle_deg', 55.0)),
+            "ap_cross_slowdown_m": float(getattr(self, 'ap_cross_slowdown_m', 0.025)),
+            "ap_angular_accel": float(getattr(self, 'ap_angular_accel', 1.5)),
             "ap_max_ang": float(getattr(self, 'ap_max_ang', 0.60)),
             "ap_kp_ang": float(getattr(self, 'ap_kp_ang', 1.80)),
             "ap_yaw_mode": str(getattr(self, 'ap_yaw_mode', 'HOLD_INITIAL')),
@@ -709,6 +764,9 @@ class LocalizationNode(Node):
             'filter_alpha', 'ap_cruise_speed', 'ap_max_lin', 'ap_min_lin',
             'ap_goal_tol', 'ap_wp_tol', 'ap_kp_cross', 'ap_v_cross_max',
             'ap_brake_accel', 'ap_turn_factor', 'ap_max_ang', 'ap_kp_ang',
+            'ap_approach_speed', 'ap_precision_radius', 'ap_precision_speed',
+            'ap_accel_limit', 'ap_lateral_accel', 'ap_corner_stop_angle_deg',
+            'ap_cross_slowdown_m', 'ap_angular_accel',
             'ap_final_yaw', 'wheel_diameter_mm',
             'default_marker_size_mm', 'ceiling_height_m', 'drive_linear_scale', 'drive_angular_scale',
             'laser_pwm_hz', 'laser_watchdog_ms', 'laser_max_power_pct',
@@ -740,6 +798,14 @@ class LocalizationNode(Node):
                     'ap_v_cross_max': (0.0, 1.0),
                     'ap_brake_accel': (0.01, 5.0),
                     'ap_turn_factor': (0.0, 1.0),
+                    'ap_approach_speed': (0.005, 1.0),
+                    'ap_precision_radius': (0.01, 0.5),
+                    'ap_precision_speed': (0.002, 0.3),
+                    'ap_accel_limit': (0.005, 2.0),
+                    'ap_lateral_accel': (0.001, 2.0),
+                    'ap_corner_stop_angle_deg': (5.0, 175.0),
+                    'ap_cross_slowdown_m': (0.003, 0.5),
+                    'ap_angular_accel': (0.05, 20.0),
                     'ap_max_ang': (0.0, 5.0),
                     'ap_kp_ang': (0.0, 10.0),
                     'ap_final_yaw': (-math.pi, math.pi),
@@ -770,6 +836,12 @@ class LocalizationNode(Node):
         effective_max = validated.get('ap_max_lin', self.ap_max_lin)
         if not effective_min <= effective_cruise <= effective_max:
             raise ValueError('speeds must satisfy ap_min_lin <= ap_cruise_speed <= ap_max_lin')
+        effective_approach = validated.get('ap_approach_speed', self.ap_approach_speed)
+        effective_precision = validated.get('ap_precision_speed', self.ap_precision_speed)
+        if effective_approach > effective_max:
+            raise ValueError('ap_approach_speed must not exceed ap_max_lin')
+        if effective_precision > effective_cruise:
+            raise ValueError('ap_precision_speed must not exceed ap_cruise_speed')
         laser_min = validated.get('laser_min_active_power_pct', self.laser_min_active_power_pct)
         laser_nom = validated.get('laser_nominal_power_pct', self.laser_nominal_power_pct)
         laser_max = validated.get('laser_max_power_pct', self.laser_max_power_pct)
@@ -1121,6 +1193,10 @@ class LocalizationNode(Node):
             # Cache latest detections for 25 Hz Calibration Wizard timer
             self.latest_detections = det_dicts
             self.latest_detections_stamp = time.monotonic()
+            self.recent_detection_frames.append({
+                "time": time.time(),
+                "detections": det_dicts,
+            })
 
             # Check robot motion state
             is_moving = self.autopilot_active or self.test_drive_active
@@ -1686,6 +1762,7 @@ class LocalizationNode(Node):
                 self.path_corner_speeds[i] = curvature_limited_speed(
                     speed_limit, self.ap_min_lin, self.ap_brake_accel,
                     self.ap_turn_factor, turn_angle, l_in, l_out,
+                    lateral_accel=self.ap_lateral_accel,
                 )
 
         self.publish_plan(self.route_waypoints)
@@ -1898,6 +1975,7 @@ class LocalizationNode(Node):
                 control_corner_speeds[i] = curvature_limited_speed(
                     speed_limit, self.ap_min_lin, self.ap_brake_accel,
                     self.ap_turn_factor, turn_angle, len_in, len_out,
+                    lateral_accel=self.ap_lateral_accel,
                 )
 
         total_path_len = control_path_s[-1]
@@ -1909,13 +1987,14 @@ class LocalizationNode(Node):
         smooth_forward = 0.0
         smooth_strafe = 0.0
         smooth_w = 0.0
-        # The ESP32 already applies an acceleration ramp. A responsive command
-        # filter avoids adding another large phase delay to lateral correction.
-        alpha = 0.70
+        last_control_time = pytime.monotonic()
         self.get_logger().info(f"▶ Старт векторного контроллера: длина пути {total_path_len:.2f}м, режим курса: {self.ap_yaw_mode}")
 
         while self.autopilot_active and self.route_state == "running":
             t_loop_start = pytime.time()
+            now_control = pytime.monotonic()
+            control_dt = float(np.clip(now_control - last_control_time, 0.02, 0.15))
+            last_control_time = now_control
             self.last_motion_cmd_time = t_loop_start
 
             geometry_error = self.navigation_geometry_error()
@@ -1953,7 +2032,9 @@ class LocalizationNode(Node):
                 dist_to_next_wp = float(np.hypot(p_b[0] - rx, p_b[1] - ry))
                 is_first_connector = route_index_offset == 1 and seg_idx == 0
                 target_corner_angle = control_corner_angles[seg_idx + 1]
-                is_precision_corner = target_corner_angle >= np.radians(25.0)
+                is_precision_corner = target_corner_angle >= np.radians(
+                    self.ap_corner_stop_angle_deg
+                )
                 capture_tolerance = waypoint_capture_tolerance(
                     is_first_connector, self.ap_goal_tol, self.ap_wp_tol
                 )
@@ -2028,7 +2109,14 @@ class LocalizationNode(Node):
             if dist_to_finish <= self.ap_goal_tol:
                 v_finish = self.ap_min_lin
             else:
-                v_finish = np.sqrt(max(0.0, 2.0 * self.ap_brake_accel * max(0.0, dist_to_finish - self.ap_goal_tol))) + self.ap_min_lin
+                # Braking envelope with a non-zero terminal speed. Adding the
+                # minimum speed after sqrt created an artificial speed bump
+                # while approaching every point governed by this envelope.
+                v_finish = np.sqrt(
+                    self.ap_min_lin ** 2
+                    + 2.0 * self.ap_brake_accel
+                    * max(0.0, dist_to_finish - self.ap_goal_tol)
+                )
 
             v_corners = []
             for i in range(seg_idx + 1, total_wps - 1):
@@ -2038,12 +2126,19 @@ class LocalizationNode(Node):
                     v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
                     v_corners.append(v_brake_c)
 
-            local_curve_limit = segment_curve_speed_limit(
-                control_corner_speeds, seg_idx, speed_limit,
-                is_first_connector=is_first_connector,
+            # Upcoming vertices already contribute distance-aware braking
+            # envelopes through v_corners. Capping an entire segment by its
+            # endpoint corner speed made long, large-scale routes crawl.
+            local_curve_limit = (
+                min(speed_limit, self.ap_approach_speed)
+                if is_first_connector else speed_limit
             )
-            cross_error_limit = cross_track_limited_speed(
-                speed_limit, self.ap_min_lin, e_cross, self.ap_wp_tol
+            # The connector is only a transfer to the drawing start. Driving
+            # directly to that point is more useful than slowing down for a
+            # cross-track error relative to an artificial connector line.
+            cross_error_limit = speed_limit if is_first_connector else cross_track_limited_speed(
+                speed_limit, self.ap_min_lin, e_cross, self.ap_wp_tol,
+                slowdown_width=self.ap_cross_slowdown_m,
             )
             v_along_target = min(
                 [speed_limit, v_finish, local_curve_limit, cross_error_limit] + v_corners
@@ -2056,11 +2151,11 @@ class LocalizationNode(Node):
             # 7. Результирующий вектор скорости в СК карты
             v_map = v_along_target * tangent + v_cross_cmd * normal
             vector_speed_limit = speed_limit
-            terminal_radius = max(0.08, 2.0 * self.ap_wp_tol)
+            terminal_radius = max(self.ap_precision_radius, 2.0 * self.ap_wp_tol)
             precision_corner_capture = (
                 seg_idx < total_wps - 2
                 and (is_first_connector or is_precision_corner)
-                and dist_to_next_wp <= 0.07
+                and dist_to_next_wp <= self.ap_precision_radius
             )
             if precision_corner_capture:
                 # A sharp polyline vertex cannot be followed accurately while
@@ -2069,9 +2164,11 @@ class LocalizationNode(Node):
                 v_map, _ = point_target_velocity(
                     np.array([rx, ry], dtype=float),
                     p_b,
-                    kp=1.0,
-                    max_speed=min(speed_limit, 0.035),
-                    min_speed=min(self.ap_min_lin, 0.008),
+                    kp=max(0.2, self.ap_precision_speed / max(
+                        0.005, self.ap_precision_radius - capture_tolerance
+                    )),
+                    max_speed=min(speed_limit, self.ap_precision_speed),
+                    min_speed=self.ap_min_lin,
                     stop_radius=capture_tolerance,
                 )
             elif seg_idx >= total_wps - 2 and finish_euclid <= terminal_radius:
@@ -2081,9 +2178,11 @@ class LocalizationNode(Node):
                 v_map, _ = point_target_velocity(
                     np.array([rx, ry], dtype=float),
                     np.array([fx, fy], dtype=float),
-                    kp=1.2,
-                    max_speed=min(speed_limit, 0.04),
-                    min_speed=min(self.ap_min_lin, 0.008),
+                    kp=max(0.2, self.ap_precision_speed / max(
+                        0.005, terminal_radius - self.ap_goal_tol
+                    )),
+                    max_speed=min(speed_limit, self.ap_precision_speed),
+                    min_speed=self.ap_min_lin,
                     stop_radius=self.ap_goal_tol,
                 )
             elif t_param >= 1.0:
@@ -2120,10 +2219,14 @@ class LocalizationNode(Node):
             else:
                 w = float(np.clip(self.ap_kp_ang * yaw_err, -self.ap_max_ang, self.ap_max_ang))
 
-            # 10. Плавная фильтрация скоростей (EMA)
-            smooth_forward = smooth_forward * (1.0 - alpha) + v_forward * alpha
-            smooth_strafe = smooth_strafe * (1.0 - alpha) + v_strafe_left * alpha
-            smooth_w = smooth_w * (1.0 - alpha) + w * alpha
+            # 10. Explicit acceleration limits. Unlike EMA, this has a known
+            # physical unit and cannot create a hidden late acceleration bump.
+            limited_linear = slew_vector(
+                [smooth_forward, smooth_strafe], [v_forward, v_strafe_left],
+                self.ap_accel_limit, self.ap_brake_accel, control_dt,
+            )
+            smooth_forward, smooth_strafe = map(float, limited_linear)
+            smooth_w = slew_scalar(smooth_w, w, self.ap_angular_accel, control_dt)
 
             # 11. Отправка команды движения
             laser_power = self.laser_power_for_route_motion(
@@ -2934,6 +3037,51 @@ class WebServerHandler(SimpleHTTPRequestHandler):
         elif self.path.startswith('/api/laser/off'):
             node.laser_safe_off(disarm=True, reason="operator switched laser off")
             self._send_json(200, {"status": "ok", "laser": node.laser_status()})
+
+        elif self.path.startswith('/api/extrinsics/calibrate'):
+            try:
+                node.stop_route()
+                tag_id = int(payload.get('tag_id'))
+                tag = node.tag_registry.get_tag(tag_id) if node.tag_registry else None
+                if not tag or tag.get('state') != 'confirmed' or not tag.get('enabled', True):
+                    raise ValueError('Выберите подтверждённую включённую метку')
+                pose = tag.get('pose', {})
+                base_x = float(payload.get('robot_x', pose.get('x', 0.0)))
+                base_y = float(payload.get('robot_y', pose.get('y', 0.0)))
+                base_yaw = math.radians(float(payload.get('robot_yaw_deg', 0.0)))
+                if not all(math.isfinite(v) for v in (base_x, base_y, base_yaw)):
+                    raise ValueError('Положение робота должно быть конечным')
+                now_t = time.time()
+                samples = []
+                for frame in list(getattr(node, 'recent_detection_frames', [])):
+                    if now_t - float(frame.get('time', 0.0)) > 3.0:
+                        continue
+                    for detection in frame.get('detections', []):
+                        if (int(detection.get('tag_id', -1)) == tag_id
+                                and detection.get('pose_valid', False)):
+                            samples.append(detection['T_cameraRos_tag'])
+                T_map_base = pose_to_matrix(base_x, base_y, 0.0, 0.0, 0.0, base_yaw)
+                T_map_tag = pose_to_matrix(
+                    float(pose.get('x', 0.0)), float(pose.get('y', 0.0)),
+                    float(pose.get('z', node.ceiling_height_m)),
+                    float(pose.get('roll', math.pi)), float(pose.get('pitch', 0.0)),
+                    float(pose.get('yaw', 0.0)),
+                )
+                candidate, diagnostics = estimate_base_camera(samples, T_map_base, T_map_tag)
+                ex, ey, ez, eroll, epitch, eyaw = matrix_to_pose(candidate)
+                if max(abs(ex), abs(ey), abs(ez)) > 1.5:
+                    raise ValueError('Получено неправдоподобное смещение больше 1,5 м')
+                self._send_json(200, {
+                    'status': 'candidate',
+                    'pose': {'x': ex, 'y': ey, 'z': ez,
+                             'roll': eroll, 'pitch': epitch, 'yaw': eyaw},
+                    'diagnostics': diagnostics,
+                    'message': 'Расчёт готов. Проверьте значения и примените результат.',
+                })
+            except (TypeError, ValueError, KeyError) as e:
+                self._send_json(409, {'error': str(e)})
+            except Exception as e:
+                self._send_json(500, {'error': str(e)})
 
         elif self.path.startswith('/api/extrinsics'):
             # Save extrinsics to file
@@ -4132,14 +4280,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title settings-only settings-camera settings-active">Положение камеры относительно центра</div>
         <div class="calib-container settings-only settings-camera settings-active">
-            <div class="guide-box">Система base_link: X вперёд, Y влево, Z вверх. Изменение этих значений сбрасывает проверенный статус геометрии камеры.</div>
+            <div class="guide-box">Система base_link: X вперёд, Y влево, Z вверх. Значения можно измерить и ввести вручную. «Применить как проверенные» разрешает навигацию с этими параметрами.</div>
             <div class="calib-row"><span class="stat-label">X (мм):</span><input type="number" id="camera-ext-x" class="calib-input" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Y (мм):</span><input type="number" id="camera-ext-y" class="calib-input" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Z (мм):</span><input type="number" id="camera-ext-z" class="calib-input" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Roll (град):</span><input type="number" id="camera-ext-roll" class="calib-input" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Pitch (град):</span><input type="number" id="camera-ext-pitch" class="calib-input" step="0.1"></div>
             <div class="calib-row"><span class="stat-label">Yaw (град):</span><input type="number" id="camera-ext-yaw" class="calib-input" step="0.1"></div>
-            <button class="btn btn-secondary" id="camera-extrinsics-save">Сохранить как непроверенную геометрию</button>
+            <div class="wizard-controls">
+                <button class="btn btn-secondary" id="camera-extrinsics-save" style="margin:0;">Сохранить черновик</button>
+                <button class="btn" id="camera-extrinsics-apply" style="margin:0;">Применить как проверенные</button>
+            </div>
+        </div>
+
+        <div class="section-title settings-only settings-camera settings-active">Мастер положения камеры</div>
+        <div class="calib-container settings-only settings-camera settings-active">
+            <div class="guide-box">1. Поставьте геометрический центр робота точно под центром подтверждённой метки. 2. Направьте перед робота вдоль +X карты либо укажите фактический yaw. 3. Не двигайте робот 3 секунды. 4. Нажмите «Рассчитать». Мастер использует серию последних кадров, покажет разброс и заполнит поля выше.</div>
+            <div class="calib-row"><span class="stat-label">ID метки над центром:</span><input type="number" id="camera-ext-cal-tag" class="calib-input" value="18" min="0" max="999"></div>
+            <div class="calib-row"><span class="stat-label">X центра робота (м):</span><input type="number" id="camera-ext-cal-x" class="calib-input" placeholder="координата метки" step="0.001"></div>
+            <div class="calib-row"><span class="stat-label">Y центра робота (м):</span><input type="number" id="camera-ext-cal-y" class="calib-input" placeholder="координата метки" step="0.001"></div>
+            <div class="calib-row"><span class="stat-label">Yaw робота на карте (°):</span><input type="number" id="camera-ext-cal-yaw" class="calib-input" value="0" step="0.1"></div>
+            <button class="btn" id="camera-extrinsics-calibrate">Рассчитать по последним кадрам</button>
+            <div id="camera-extrinsics-cal-result" style="font-size:11px;color:#8b9bb4;line-height:1.4;"></div>
         </div>
 
         <div class="section-title settings-only settings-laser">Безопасность лазера</div>
@@ -4377,17 +4539,25 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title settings-only settings-autopilot">Все параметры автоматического движения</div>
         <div class="calib-container settings-only settings-autopilot">
-            <div class="guide-box">Эти параметры управляют текущим векторным автопилотом и сохраняются после перезапуска.</div>
+            <div class="guide-box">Скорость задаётся в м/с, ускорение — в м/с². Подъезд относится только к перемещению от текущего положения до первой точки. На рисунке скорость автоматически ограничивается кривизной и поперечной ошибкой.</div>
             <div class="calib-row"><span class="stat-label">Крейсерская скорость (м/с):</span><input type="number" id="input-ap-cruise" class="calib-input" step="0.01" min="0.01" max="1"></div>
             <div class="calib-row"><span class="stat-label">Ограничение скорости (м/с):</span><input type="number" id="input-ap-max-lin" class="calib-input" step="0.01" min="0.01" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Скорость подъезда к старту:</span><input type="number" id="input-ap-approach-speed" class="calib-input" step="0.005" min="0.005" max="1"></div>
             <div class="calib-row"><span class="stat-label">Минимальная скорость (м/с):</span><input type="number" id="input-ap-min-lin" class="calib-input" step="0.005" min="0" max="0.5"></div>
+            <div class="calib-row"><span class="stat-label">Ускорение (м/с²):</span><input type="number" id="input-ap-accel-limit" class="calib-input" step="0.01" min="0.005" max="2"></div>
+            <div class="calib-row"><span class="stat-label">Торможение (м/с²):</span><input type="number" id="input-ap-brake" class="calib-input" step="0.01" min="0.01" max="5"></div>
             <div class="calib-row"><span class="stat-label">Допуск финиша (м):</span><input type="number" id="input-ap-goal-tol" class="calib-input" step="0.005" min="0.005" max="1"></div>
             <div class="calib-row"><span class="stat-label">Допуск точки (м):</span><input type="number" id="input-ap-wp-tol" class="calib-input" step="0.005" min="0.005" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Радиус точного подхода (м):</span><input type="number" id="input-ap-precision-radius" class="calib-input" step="0.005" min="0.01" max="0.5"></div>
+            <div class="calib-row"><span class="stat-label">Скорость точного подхода:</span><input type="number" id="input-ap-precision-speed" class="calib-input" step="0.005" min="0.002" max="0.3"></div>
             <div class="calib-row"><span class="stat-label">Kp боковой ошибки:</span><input type="number" id="input-ap-kp-cross" class="calib-input" step="0.05" min="0" max="10"></div>
             <div class="calib-row"><span class="stat-label">Макс. боковая скорость:</span><input type="number" id="input-ap-cross-max" class="calib-input" step="0.01" min="0" max="1"></div>
-            <div class="calib-row"><span class="stat-label">Замедление (м/с²):</span><input type="number" id="input-ap-brake" class="calib-input" step="0.01" min="0.01" max="5"></div>
+            <div class="calib-row"><span class="stat-label">Ошибка начала замедления (м):</span><input type="number" id="input-ap-cross-slowdown" class="calib-input" step="0.001" min="0.003" max="0.5"></div>
+            <div class="calib-row"><span class="stat-label">Боковое ускорение на кривых:</span><input type="number" id="input-ap-lateral-accel" class="calib-input" step="0.005" min="0.001" max="2"></div>
             <div class="calib-row"><span class="stat-label">Скорость в поворотах:</span><input type="number" id="input-ap-turn-factor" class="calib-input" step="0.05" min="0" max="1"></div>
+            <div class="calib-row"><span class="stat-label">Остановка в углах от (°):</span><input type="number" id="input-ap-corner-stop-angle" class="calib-input" step="1" min="5" max="175"></div>
             <div class="calib-row"><span class="stat-label">Макс. вращение (рад/с):</span><input type="number" id="input-ap-max-ang" class="calib-input" step="0.05" min="0" max="5"></div>
+            <div class="calib-row"><span class="stat-label">Ускорение вращения (рад/с²):</span><input type="number" id="input-ap-angular-accel" class="calib-input" step="0.1" min="0.05" max="20"></div>
             <div class="calib-row"><span class="stat-label">Kp ориентации:</span><input type="number" id="input-ap-kp-ang" class="calib-input" step="0.1" min="0" max="10"></div>
             <div class="calib-row"><span class="stat-label">Сглаживание позиции:</span><input type="number" id="input-filter-alpha" class="calib-input" step="0.01" min="0.01" max="1"></div>
             <div class="calib-row"><span class="stat-label">Курс робота:</span><select id="input-ap-yaw-mode" class="calib-input"><option value="FREE">Свободный</option><option value="HOLD_INITIAL">Держать начальный</option><option value="PATH_TANGENT">По касательной пути</option><option value="FINAL_YAW">Заданный на финише</option></select></div>
@@ -6031,6 +6201,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         ap_wp_tol: 'input-ap-wp-tol', ap_kp_cross: 'input-ap-kp-cross',
                         ap_v_cross_max: 'input-ap-cross-max', ap_brake_accel: 'input-ap-brake',
                         ap_turn_factor: 'input-ap-turn-factor', ap_max_ang: 'input-ap-max-ang',
+                        ap_approach_speed: 'input-ap-approach-speed', ap_precision_radius: 'input-ap-precision-radius',
+                        ap_precision_speed: 'input-ap-precision-speed', ap_accel_limit: 'input-ap-accel-limit',
+                        ap_lateral_accel: 'input-ap-lateral-accel', ap_corner_stop_angle_deg: 'input-ap-corner-stop-angle',
+                        ap_cross_slowdown_m: 'input-ap-cross-slowdown', ap_angular_accel: 'input-ap-angular-accel',
                         ap_kp_ang: 'input-ap-kp-ang', filter_alpha: 'input-filter-alpha',
                         ap_yaw_mode: 'input-ap-yaw-mode', ap_final_yaw: 'input-ap-final-yaw'
                     };
@@ -6108,6 +6282,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 ap_wp_tol: value('input-ap-wp-tol'), ap_kp_cross: value('input-ap-kp-cross'),
                 ap_v_cross_max: value('input-ap-cross-max'), ap_brake_accel: value('input-ap-brake'),
                 ap_turn_factor: value('input-ap-turn-factor'), ap_max_ang: value('input-ap-max-ang'),
+                ap_approach_speed: value('input-ap-approach-speed'), ap_precision_radius: value('input-ap-precision-radius'),
+                ap_precision_speed: value('input-ap-precision-speed'), ap_accel_limit: value('input-ap-accel-limit'),
+                ap_lateral_accel: value('input-ap-lateral-accel'), ap_corner_stop_angle_deg: value('input-ap-corner-stop-angle'),
+                ap_cross_slowdown_m: value('input-ap-cross-slowdown'), ap_angular_accel: value('input-ap-angular-accel'),
                 ap_kp_ang: value('input-ap-kp-ang'), filter_alpha: value('input-filter-alpha'),
                 ap_yaw_mode: document.getElementById('input-ap-yaw-mode').value,
                 ap_final_yaw: value('input-ap-final-yaw')
@@ -6148,10 +6326,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch (e) { addLog(`Ошибка настроек лазера: ${e.message}`); }
         }
 
-        async function saveCameraExtrinsics() {
+        async function saveCameraExtrinsics(status='unverified') {
             const rad = degrees => degrees * Math.PI / 180;
             const body = {
-                status: 'unverified', localization_model: 'ceiling_planar',
+                status, localization_model: 'ceiling_planar',
                 x: parseFloat(document.getElementById('camera-ext-x').value) / 1000,
                 y: parseFloat(document.getElementById('camera-ext-y').value) / 1000,
                 z: parseFloat(document.getElementById('camera-ext-z').value) / 1000,
@@ -6163,9 +6341,44 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const res = await fetch('/api/extrinsics', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
                 const data = await res.json();
                 if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
-                addLog('Геометрия камеры сохранена как непроверенная; навигация требует повторной проверки');
+                addLog(status === 'verified'
+                    ? 'Положение камеры сохранено и применено как проверенное'
+                    : 'Черновик положения камеры сохранён; навигация требует применения');
                 fetchPhysicalSettings();
             } catch (e) { addLog(`Ошибка геометрии камеры: ${e.message}`); }
+        }
+
+        async function calibrateCameraExtrinsics() {
+            const result = document.getElementById('camera-extrinsics-cal-result');
+            const body = {
+                tag_id: parseInt(document.getElementById('camera-ext-cal-tag').value),
+                robot_yaw_deg: parseFloat(document.getElementById('camera-ext-cal-yaw').value || '0')
+            };
+            const x = parseFloat(document.getElementById('camera-ext-cal-x').value);
+            const y = parseFloat(document.getElementById('camera-ext-cal-y').value);
+            if(Number.isFinite(x)) body.robot_x = x;
+            if(Number.isFinite(y)) body.robot_y = y;
+            result.textContent = 'Расчёт по серии кадров…';
+            try {
+                const res = await fetch('/api/extrinsics/calibrate', {
+                    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)
+                });
+                const data = await res.json();
+                if(!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                const p=data.pose, deg=r=>r*180/Math.PI;
+                document.getElementById('camera-ext-x').value=(p.x*1000).toFixed(1);
+                document.getElementById('camera-ext-y').value=(p.y*1000).toFixed(1);
+                document.getElementById('camera-ext-z').value=(p.z*1000).toFixed(1);
+                document.getElementById('camera-ext-roll').value=deg(p.roll).toFixed(2);
+                document.getElementById('camera-ext-pitch').value=deg(p.pitch).toFixed(2);
+                document.getElementById('camera-ext-yaw').value=deg(p.yaw).toFixed(2);
+                const d=data.diagnostics;
+                result.textContent=`Готово: ${d.inliers}/${d.samples} кадров; разброс положения ${d.translation_spread_mm} мм, угла ${d.rotation_spread_deg}°. Проверьте поля выше и нажмите «Применить как проверенные».`;
+                addLog('Мастер рассчитал положение камеры; результат ещё не применён');
+            } catch(e) {
+                result.textContent=`Ошибка: ${e.message}`;
+                addLog(`Калибровка положения камеры: ${e.message}`);
+            }
         }
 
         async function fetchLaserStatus() {
@@ -6555,7 +6768,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const btnSaveAutopilot = document.getElementById('btn-save-autopilot-settings');
         if (btnSaveAutopilot) btnSaveAutopilot.addEventListener('click', saveAutopilotSettings);
         document.getElementById('btn-save-laser-settings').addEventListener('click', saveLaserSettings);
-        document.getElementById('camera-extrinsics-save').addEventListener('click', saveCameraExtrinsics);
+        document.getElementById('camera-extrinsics-save').addEventListener('click', () => saveCameraExtrinsics('unverified'));
+        document.getElementById('camera-extrinsics-apply').addEventListener('click', () => saveCameraExtrinsics('verified'));
+        document.getElementById('camera-extrinsics-calibrate').addEventListener('click', calibrateCameraExtrinsics);
         document.getElementById('btn-laser-permit').addEventListener('click', toggleLaserPermit);
 
         document.getElementById('camera-calibration-start').addEventListener('click', startCameraCalibration);

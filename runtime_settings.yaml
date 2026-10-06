@@ -8,6 +8,14 @@ ap_max_ang: 0.6
 ap_max_lin: 0.11
 ap_min_lin: 0.004
 ap_turn_factor: 0.25
+ap_approach_speed: 0.09
+ap_precision_radius: 0.04
+ap_precision_speed: 0.025
+ap_accel_limit: 0.06
+ap_lateral_accel: 0.02
+ap_corner_stop_angle_deg: 55.0
+ap_cross_slowdown_m: 0.025
+ap_angular_accel: 1.5
 ap_v_cross_max: 0.045
 ap_wp_tol: 0.006
 ap_yaw_mode: HOLD_INITIAL

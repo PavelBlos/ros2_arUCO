@@ -65,7 +65,8 @@ import rclpy
 from localization_node import (
     LocalizationNode, WebServerHandler, cross_track_limited_speed,
     curvature_limited_speed, point_target_velocity, simplify_route_with_factors,
-    segment_curve_speed_limit, waypoint_capture_tolerance,
+    segment_curve_speed_limit, slew_scalar, slew_vector,
+    waypoint_capture_tolerance,
 )
 
 @pytest.fixture
@@ -234,6 +235,33 @@ def test_cross_track_error_reduces_forward_speed_without_stalling():
     assert on_path == pytest.approx(0.09)
     assert 0.004 < six_mm_off < on_path
     assert far_off == pytest.approx(0.004)
+
+
+def test_linear_command_slew_uses_physical_acceleration_limits():
+    accelerating = slew_vector([0.0, 0.0], [0.10, 0.0], 0.06, 0.08, 0.05)
+    braking = slew_vector([0.10, 0.0], [0.0, 0.0], 0.06, 0.08, 0.05)
+
+    assert accelerating == pytest.approx([0.003, 0.0])
+    assert braking == pytest.approx([0.096, 0.0])
+    assert slew_scalar(0.0, 1.0, 1.5, 0.05) == pytest.approx(0.075)
+
+
+def test_autopilot_runtime_settings_include_transition_controls(mock_node):
+    settings = mock_node.update_runtime_settings({
+        "ap_approach_speed": 0.08,
+        "ap_accel_limit": 0.05,
+        "ap_precision_radius": 0.05,
+        "ap_precision_speed": 0.02,
+        "ap_cross_slowdown_m": 0.015,
+        "ap_lateral_accel": 0.018,
+        "ap_corner_stop_angle_deg": 50,
+        "ap_angular_accel": 1.2,
+    })
+
+    assert settings["ap_approach_speed"] == pytest.approx(0.08)
+    assert settings["ap_accel_limit"] == pytest.approx(0.05)
+    assert settings["ap_precision_radius"] == pytest.approx(0.05)
+    assert settings["ap_corner_stop_angle_deg"] == pytest.approx(50.0)
 
 
 def test_private_start_connector_ignores_artwork_corner_speed():

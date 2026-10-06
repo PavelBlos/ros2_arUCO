@@ -87,7 +87,10 @@ start_video_detector() {
 stop_video_detector() {
     if [[ -n "${PID_VID:-}" ]] && kill -0 "${PID_VID}" 2>/dev/null; then
         kill -15 "${PID_VID}" 2>/dev/null || true
-        for _ in {1..10}; do
+        # Let libcamera release the CSI device before escalating to SIGKILL.
+        # A rushed hard kill can leave the pipeline wedged until both robot
+        # processes are restarted.
+        for _ in {1..30}; do
             kill -0 "${PID_VID}" 2>/dev/null || break
             sleep 0.1
         done
@@ -102,6 +105,38 @@ restart_video_detector() {
     sleep 0.5
     start_video_detector
 }
+
+shutdown_children() {
+    trap - TERM INT
+    set +e
+    curl -s -m 1 http://localhost:8080/test_drive?type=stop >/dev/null 2>&1 || true
+    stop_video_detector
+    if [[ -n "${PID_LOC:-}" ]] && kill -0 "${PID_LOC}" 2>/dev/null; then
+        kill -15 "${PID_LOC}" 2>/dev/null || true
+        for _ in {1..30}; do
+            kill -0 "${PID_LOC}" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -9 "${PID_LOC}" 2>/dev/null || true
+        wait "${PID_LOC}" 2>/dev/null || true
+    fi
+}
+
+handle_shutdown() {
+    echo "[+] Stopping TERMiT processes cleanly..."
+    shutdown_children
+    exit 0
+}
+
+request_full_restart() {
+    echo "[!] Camera watchdog: detector restarts did not recover frames; restarting the complete service..."
+    shutdown_children
+    # termit.service uses Restart=on-failure. Leaving with an error recreates
+    # both the camera pipeline and localization node from a clean state.
+    exit 1
+}
+
+trap handle_shutdown TERM INT
 
 start_video_detector
 
@@ -121,10 +156,12 @@ echo "All available IPs: ${IP_LIST}"
 echo "============================================================="
 
 STALE_CAMERA_POLLS=0
+CAMERA_RECOVERY_ATTEMPTS=0
 while kill -0 "${PID_LOC}" 2>/dev/null; do
     sleep 2
     if ! kill -0 "${PID_VID}" 2>/dev/null; then
         restart_video_detector
+        CAMERA_RECOVERY_ATTEMPTS=$((CAMERA_RECOVERY_ATTEMPTS + 1))
         STALE_CAMERA_POLLS=0
         continue
     fi
@@ -144,14 +181,19 @@ except Exception:
 ' 2>/dev/null || true)"
     if [[ "${CAMERA_STATE}" == "stale" ]]; then
         STALE_CAMERA_POLLS=$((STALE_CAMERA_POLLS + 1))
-    else
+    elif [[ "${CAMERA_STATE}" == "fresh" ]]; then
         STALE_CAMERA_POLLS=0
+        CAMERA_RECOVERY_ATTEMPTS=0
     fi
     if (( STALE_CAMERA_POLLS >= 2 )); then
+        CAMERA_RECOVERY_ATTEMPTS=$((CAMERA_RECOVERY_ATTEMPTS + 1))
+        if (( CAMERA_RECOVERY_ATTEMPTS >= 3 )); then
+            request_full_restart
+        fi
         restart_video_detector
         STALE_CAMERA_POLLS=0
     fi
 done
 
-stop_video_detector
+shutdown_children
 wait "${PID_LOC}" 2>/dev/null || true
