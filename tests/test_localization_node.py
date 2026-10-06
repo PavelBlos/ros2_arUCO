@@ -65,7 +65,7 @@ import rclpy
 from localization_node import (
     LocalizationNode, WebServerHandler, cross_track_limited_speed,
     curvature_limited_speed, point_target_velocity, simplify_route_with_factors,
-    waypoint_capture_tolerance,
+    segment_curve_speed_limit, waypoint_capture_tolerance,
 )
 
 @pytest.fixture
@@ -234,6 +234,17 @@ def test_cross_track_error_reduces_forward_speed_without_stalling():
     assert on_path == pytest.approx(0.09)
     assert 0.004 < six_mm_off < on_path
     assert far_off == pytest.approx(0.004)
+
+
+def test_private_start_connector_ignores_artwork_corner_speed():
+    corner_speeds = [0.09, 0.012, 0.04]
+
+    assert segment_curve_speed_limit(
+        corner_speeds, 0, 0.09, is_first_connector=True
+    ) == pytest.approx(0.09)
+    assert segment_curve_speed_limit(
+        corner_speeds, 0, 0.09, is_first_connector=False
+    ) == pytest.approx(0.012)
 
 
 def test_laser_runtime_settings_validation(mock_node):

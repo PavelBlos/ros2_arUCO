@@ -116,6 +116,19 @@ def cross_track_limited_speed(speed_limit, min_speed, cross_error, waypoint_tole
     return float(np.clip(speed_limit * scale, min_speed, speed_limit))
 
 
+def segment_curve_speed_limit(corner_speeds, segment_index, speed_limit,
+                              is_first_connector=False):
+    """Do not apply artwork curvature to the private approach segment."""
+    if is_first_connector:
+        return float(speed_limit)
+    if not corner_speeds:
+        return float(speed_limit)
+    last_index = len(corner_speeds) - 1
+    start = int(np.clip(segment_index, 0, last_index))
+    end = min(start + 1, last_index)
+    return float(min(corner_speeds[start], corner_speeds[end], speed_limit))
+
+
 def _rdp_indices(points, tolerance):
     """Return indices retained by iterative Ramer-Douglas-Peucker simplification."""
     pts = np.asarray(points, dtype=float)
@@ -2025,9 +2038,9 @@ class LocalizationNode(Node):
                     v_brake_c = np.sqrt(v_max_c**2 + 2.0 * self.ap_brake_accel * d_to_corner)
                     v_corners.append(v_brake_c)
 
-            local_curve_limit = min(
-                control_corner_speeds[max(0, seg_idx)],
-                control_corner_speeds[min(seg_idx + 1, total_wps - 1)],
+            local_curve_limit = segment_curve_speed_limit(
+                control_corner_speeds, seg_idx, speed_limit,
+                is_first_connector=is_first_connector,
             )
             cross_error_limit = cross_track_limited_speed(
                 speed_limit, self.ap_min_lin, e_cross, self.ap_wp_tol
