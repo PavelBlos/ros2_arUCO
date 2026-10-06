@@ -24,6 +24,16 @@ except ImportError:
     from tag_registry import TagRegistry
     from geometry_transforms import compute_midpoint_stamp, compute_latency_ms
 
+
+def libcamera_gstreamer_pipeline(width=640, height=480, fps=30):
+    """Build a low-latency CSI pipeline without the unstable V4L2 shim."""
+    return (
+        "libcamerasrc ! "
+        f"video/x-raw,format=RGB,width={int(width)},height={int(height)},framerate={int(fps)}/1 ! "
+        "videoconvert ! video/x-raw,format=BGR ! "
+        "appsink drop=true max-buffers=1 sync=false"
+    )
+
 class VideoTagDetector(Node):
     def __init__(self):
         super().__init__('video_tag_detector')
@@ -253,14 +263,26 @@ class VideoTagDetector(Node):
         if is_cam:
             cam_idx = int(self.video_path) if str(self.video_path).isdigit() else (int(match_dev.group(1)) if match_dev else 0)
             self.get_logger().info(f"Opening camera index {cam_idx}...")
-            self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
-            if not self.cap.isOpened():
-                self.cap = cv2.VideoCapture(cam_idx)
+            # Raspberry Pi CSI cameras are exposed to OpenCV through
+            # libcamerify's V4L2 compatibility shim on this system. That shim
+            # repeatedly stopped returning frames while keeping the process
+            # alive. Open the native libcamera GStreamer source first.
+            pipeline = libcamera_gstreamer_pipeline(640, 480, 30)
+            self.cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
             if self.cap.isOpened():
-                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                self.cap.set(cv2.CAP_PROP_FPS, 30)
-                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.get_logger().info("Using native libcamera GStreamer capture")
+            if not self.cap.isOpened():
+                self.get_logger().warn("Native libcamera pipeline unavailable; trying V4L2 fallback")
+                self.cap.release()
+                self.cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
+            if self.cap.isOpened():
+                # Do not reconfigure a working GStreamer pipeline through
+                # CAP_PROP_*; every property write reconfigured the CSI stack.
+                if self.cap.getBackendName() != 'GSTREAMER':
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                    self.cap.set(cv2.CAP_PROP_FPS, 30)
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 for _ in range(10):
                     ret, f = self.cap.read()
                     if ret and f is not None:

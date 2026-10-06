@@ -12,6 +12,9 @@ if [[ -x "${CURRENT_LAUNCHER}" ]] && [[ "$(readlink -f "${CURRENT_LAUNCHER}")" !
 fi
 
 export PYTHONPATH="${SCRIPT_DIR}:${SCRIPT_DIR}/src/fake_tag_publisher/fake_tag_publisher:${PYTHONPATH:-}"
+# Prefer the locally built libcamera 0.7 GStreamer plugin. Ubuntu's packaged
+# 0.2 plugin cannot drive the Raspberry Pi 5 camera stack installed here.
+export GST_PLUGIN_PATH="/usr/local/lib/aarch64-linux-gnu/gstreamer-1.0:${GST_PLUGIN_PATH:-}"
 if [[ -f "${SCRIPT_DIR}/manifest.json" ]]; then
     export ROBOT_RELEASE_COMMIT="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("git_commit", "unknown"))' "${SCRIPT_DIR}/manifest.json")"
 fi
@@ -76,8 +79,8 @@ echo "[+] Using video_tag_detector: ${VID_PY}"
 echo "[+] Dynamic Camera TF (base_link -> camera_link) is broadcast by localization_node from camera_extrinsics.yaml"
 
 start_video_detector() {
-    echo "[+] Starting Video Tag Detector (CSI Camera via libcamerify)..."
-    /usr/local/bin/libcamerify python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &
+    echo "[+] Starting Video Tag Detector (native libcamera GStreamer)..."
+    python3 "${VID_PY}" --ros-args -p video_path:=0 -p aruco_dictionary:=DICT_4X4_100 > /tmp/video_tag_detector.log 2>&1 &
     PID_VID=$!
     # Camera initialization and DDS discovery can take several seconds. Do not
     # mistake that startup interval for another frozen stream.

@@ -62,6 +62,7 @@ class MockNode:
 
 sys.modules['rclpy.node'].Node = MockNode
 import rclpy
+from video_tag_detector import libcamera_gstreamer_pipeline
 from localization_node import (
     LocalizationNode, WebServerHandler, cross_track_limited_speed,
     curvature_limited_speed, point_target_velocity, simplify_route_with_factors,
@@ -142,6 +143,15 @@ def test_dynamic_api_health(mock_node):
     assert payload["laser"]["permit"] is False
     assert payload["camera_frame_fresh"] is False
     assert payload["camera_frame_age_s"] is None
+
+
+def test_libcamera_pipeline_is_explicit_and_low_latency():
+    pipeline = libcamera_gstreamer_pipeline(640, 480, 30)
+
+    assert pipeline.startswith("libcamerasrc !")
+    assert "format=RGB,width=640,height=480,framerate=30/1" in pipeline
+    assert "format=BGR" in pipeline
+    assert "drop=true max-buffers=1 sync=false" in pipeline
 
 
 def test_laser_speed_compensation_and_stationary_cutoff(mock_node):
