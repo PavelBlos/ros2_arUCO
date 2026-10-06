@@ -4,6 +4,7 @@ import math
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as Rotation
+from scipy.optimize import least_squares
 
 try:
     from .geometry_transforms import (
@@ -213,6 +214,102 @@ def estimate_base_camera_from_frames(frames, tags, T_map_base, camera_matrix,
         'translation_spread_mm': round(float(np.sqrt(np.mean(t_error ** 2))) * 1000.0, 2),
         'rotation_spread_deg': round(math.degrees(float(np.sqrt(np.mean(r_error ** 2)))), 2),
         'reprojection_rms_px': round(float(np.sqrt(np.mean(reproj ** 2))), 2),
+        **mount,
+    }
+    return result, diagnostics
+
+
+def estimate_centered_camera_from_frames(frames, tags, T_map_base, camera_matrix,
+                                         dist_coeffs, fixed_x=0.0, fixed_y=0.0,
+                                         prior_base_camera=None, min_frames=8,
+                                         min_tags=2):
+    """Fit camera height/orientation while keeping measured mount XY fixed.
+
+    At ceiling distance, small planar tags cannot independently distinguish
+    camera tilt from lateral translation. Fixing the mount XY supplied by the
+    operator removes that ill-conditioned degree of freedom.
+    """
+    samples_by_tag = {}
+    tags_per_frame = []
+    for frame in frames:
+        visible = set()
+        for detection in frame.get('detections', []):
+            tag_id = str(detection.get('tag_id'))
+            corners = np.asarray(detection.get('corners_px', []), dtype=float)
+            tag = tags.get(tag_id)
+            if (tag and tag.get('state') == 'confirmed' and tag.get('enabled', True)
+                    and detection.get('pose_valid', False) and corners.size == 8):
+                samples_by_tag.setdefault(tag_id, []).append(corners.reshape(4, 2))
+                visible.add(tag_id)
+        tags_per_frame.append(visible)
+    usable = {
+        tag_id: np.asarray(values, dtype=float)
+        for tag_id, values in samples_by_tag.items() if len(values) >= int(min_frames)
+    }
+    if len(usable) < int(min_tags):
+        raise ValueError(
+            f'Need {int(min_tags)} confirmed tags visible for at least '
+            f'{int(min_frames)} frames; found {len(usable)}.'
+        )
+    object_points = np.vstack([_mapped_tag_corners(tags[tag_id]) for tag_id in sorted(usable)])
+    image_points = np.vstack([np.median(usable[tag_id], axis=0) for tag_id in sorted(usable)])
+    K = np.asarray(camera_matrix, dtype=float)
+    distortion = np.asarray(dist_coeffs, dtype=float)
+    T_map_base = np.asarray(T_map_base, dtype=float)
+    if prior_base_camera is None:
+        initial_rotation = Rotation.from_euler('xyz', [0.0, -math.pi / 2.0, 0.0])
+        initial_z = 0.1
+    else:
+        prior = np.asarray(prior_base_camera, dtype=float)
+        initial_rotation = Rotation.from_matrix(prior[:3, :3])
+        initial_z = float(np.clip(prior[2, 3], -0.04, 0.95))
+
+    def project(parameters):
+        T_base_cam = np.eye(4, dtype=float)
+        T_base_cam[:3, :3] = Rotation.from_rotvec(parameters[1:4]).as_matrix()
+        T_base_cam[:3, 3] = [float(fixed_x), float(fixed_y), float(parameters[0])]
+        T_map_cam_ros = T_map_base @ T_base_cam
+        T_map_cam_opt = T_map_cam_ros @ optical_to_ros_matrix()
+        T_cam_opt_map = invert_transform(T_map_cam_opt)
+        rvec, _ = cv2.Rodrigues(T_cam_opt_map[:3, :3])
+        pixels, _ = cv2.projectPoints(
+            object_points, rvec, T_cam_opt_map[:3, 3], K, distortion
+        )
+        return pixels.reshape(-1, 2), T_base_cam
+
+    def residual(parameters):
+        try:
+            pixels, _ = project(parameters)
+            return (pixels - image_points).reshape(-1)
+        except (cv2.error, ValueError, np.linalg.LinAlgError):
+            return np.full(image_points.size, 1e4)
+
+    initial = np.r_[initial_z, initial_rotation.as_rotvec()]
+    solved = least_squares(
+        residual, initial,
+        bounds=(np.r_[-0.05, [-2*math.pi]*3], np.r_[1.0, [2*math.pi]*3]),
+        loss='soft_l1', f_scale=1.0, max_nfev=300,
+    )
+    if not solved.success:
+        raise ValueError(f'Camera fit did not converge: {solved.message}')
+    projected, result = project(solved.x)
+    reproj = float(np.sqrt(np.mean(np.sum((projected - image_points) ** 2, axis=1))))
+    if reproj > 5.0:
+        raise ValueError(f'Camera fit residual is too large: {reproj:.2f} px')
+    mount = validate_camera_mount(result)
+    all_jitter = []
+    for values in usable.values():
+        median = np.median(values, axis=0)
+        all_jitter.extend(np.linalg.norm(values - median, axis=2).reshape(-1))
+    diagnostics = {
+        'samples': min(len(v) for v in usable.values()),
+        'inliers': min(len(v) for v in usable.values()),
+        'tags_used': sorted(usable),
+        'translation_spread_mm': 0.0,
+        'rotation_spread_deg': 0.0,
+        'pixel_jitter_px': round(float(np.sqrt(np.mean(np.square(all_jitter)))), 2),
+        'reprojection_rms_px': round(reproj, 2),
+        'xy_fixed': True,
         **mount,
     }
     return result, diagnostics

@@ -10,7 +10,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(
 )))
 
 from camera_extrinsics_calibration import (
-    estimate_base_camera, estimate_base_camera_from_frames, validate_camera_mount,
+    estimate_base_camera, estimate_base_camera_from_frames,
+    estimate_centered_camera_from_frames, validate_camera_mount,
 )
 from geometry_transforms import invert_transform, optical_to_ros_matrix, pose_to_matrix
 from single_tag_pnp import get_marker_object_points
@@ -85,3 +86,11 @@ def test_joint_mapped_tags_recover_camera_mount_without_single_tag_rotation():
     assert solved == pytest.approx(expected, abs=1e-5)
     assert diagnostics['tags_used'] == ['18', '19']
     assert diagnostics['reprojection_rms_px'] == pytest.approx(0.0, abs=1e-4)
+
+    constrained, constrained_diagnostics = estimate_centered_camera_from_frames(
+        frames, tags, map_base, K, distortion,
+        fixed_x=expected[0, 3], fixed_y=expected[1, 3],
+        prior_base_camera=expected,
+    )
+    assert constrained == pytest.approx(expected, abs=1e-5)
+    assert constrained_diagnostics['xy_fixed'] is True
