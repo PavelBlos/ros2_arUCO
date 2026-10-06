@@ -27,7 +27,7 @@ try:
     from .tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
     from .covisibility_graph import CovisibilityGraph
     from .camera_calibration_session import CameraCalibrationSession, make_a4_chessboard_svg
-    from .camera_extrinsics_calibration import estimate_base_camera
+    from .camera_extrinsics_calibration import estimate_base_camera_from_frames
 except ImportError:
     from geometry_transforms import (
         normalize_angle, invert_transform, pose_to_matrix, matrix_to_pose,
@@ -39,7 +39,7 @@ except ImportError:
     from tag_calibration_wizard import TagCalibrationWizard, MotionAuthorityManager, MotionAuthorityMode, WizardState
     from covisibility_graph import CovisibilityGraph
     from camera_calibration_session import CameraCalibrationSession, make_a4_chessboard_svg
-    from camera_extrinsics_calibration import estimate_base_camera
+    from camera_extrinsics_calibration import estimate_base_camera_from_frames
 from sensor_msgs.msg import CompressedImage
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 from rcl_interfaces.srv import SetParameters
@@ -3052,25 +3052,24 @@ class WebServerHandler(SimpleHTTPRequestHandler):
                 if not all(math.isfinite(v) for v in (base_x, base_y, base_yaw)):
                     raise ValueError('Положение робота должно быть конечным')
                 now_t = time.time()
-                samples = []
-                for frame in list(getattr(node, 'recent_detection_frames', [])):
-                    if now_t - float(frame.get('time', 0.0)) > 3.0:
-                        continue
-                    for detection in frame.get('detections', []):
-                        if (int(detection.get('tag_id', -1)) == tag_id
-                                and detection.get('pose_valid', False)):
-                            samples.append(detection['T_cameraRos_tag'])
-                T_map_base = pose_to_matrix(base_x, base_y, 0.0, 0.0, 0.0, base_yaw)
-                T_map_tag = pose_to_matrix(
-                    float(pose.get('x', 0.0)), float(pose.get('y', 0.0)),
-                    float(pose.get('z', node.ceiling_height_m)),
-                    float(pose.get('roll', math.pi)), float(pose.get('pitch', 0.0)),
-                    float(pose.get('yaw', 0.0)),
+                frames = [
+                    frame for frame in list(getattr(node, 'recent_detection_frames', []))
+                    if now_t - float(frame.get('time', 0.0)) <= 3.0
+                ]
+                target_samples = sum(
+                    1 for frame in frames for detection in frame.get('detections', [])
+                    if int(detection.get('tag_id', -1)) == tag_id
+                    and detection.get('pose_valid', False)
                 )
-                candidate, diagnostics = estimate_base_camera(samples, T_map_base, T_map_tag)
+                if target_samples < 8:
+                    raise ValueError('Selected tag is not steadily visible; check its ID and keep it in frame')
+                T_map_base = pose_to_matrix(base_x, base_y, 0.0, 0.0, 0.0, base_yaw)
+                candidate, diagnostics = estimate_base_camera_from_frames(
+                    frames, node.tag_registry.get_active_confirmed_tags(), T_map_base,
+                    node.camera_matrix, node.dist_coeffs,
+                    prior_base_camera=node.T_base_cam,
+                )
                 ex, ey, ez, eroll, epitch, eyaw = matrix_to_pose(candidate)
-                if max(abs(ex), abs(ey), abs(ez)) > 1.5:
-                    raise ValueError('Получено неправдоподобное смещение больше 1,5 м')
                 self._send_json(200, {
                     'status': 'candidate',
                     'pose': {'x': ex, 'y': ey, 'z': ez,
@@ -4295,10 +4294,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <div class="section-title settings-only settings-camera settings-active">Мастер положения камеры</div>
         <div class="calib-container settings-only settings-camera settings-active">
-            <div class="guide-box">1. Поставьте геометрический центр робота точно под центром подтверждённой метки. 2. Направьте перед робота вдоль +X карты либо укажите фактический yaw. 3. Не двигайте робот 3 секунды. 4. Нажмите «Рассчитать». Мастер использует серию последних кадров, покажет разброс и заполнит поля выше.</div>
-            <div class="calib-row"><span class="stat-label">ID метки над центром:</span><input type="number" id="camera-ext-cal-tag" class="calib-input" value="18" min="0" max="999"></div>
-            <div class="calib-row"><span class="stat-label">X центра робота (м):</span><input type="number" id="camera-ext-cal-x" class="calib-input" placeholder="координата метки" step="0.001"></div>
-            <div class="calib-row"><span class="stat-label">Y центра робота (м):</span><input type="number" id="camera-ext-cal-y" class="calib-input" placeholder="координата метки" step="0.001"></div>
+            <div class="guide-box">Нужны минимум две подтверждённые метки в кадре. 1. Поставьте геометрический центр робота точно под центром выбранной метки. 2. Направьте перед робота вдоль +X карты и укажите 0°, либо введите фактический yaw. 3. Проверьте ID метки прямо над роботом и не двигайте его 3 секунды. Мастер использует общую геометрию всех видимых меток и отклонит метровое ложное решение.</div>
+            <div class="calib-row"><span class="stat-label">ID метки точно над центром:</span><input type="number" id="camera-ext-cal-tag" class="calib-input" placeholder="обязательно" min="0" max="999"></div>
             <div class="calib-row"><span class="stat-label">Yaw робота на карте (°):</span><input type="number" id="camera-ext-cal-yaw" class="calib-input" value="0" step="0.1"></div>
             <button class="btn" id="camera-extrinsics-calibrate">Рассчитать по последним кадрам</button>
             <div id="camera-extrinsics-cal-result" style="font-size:11px;color:#8b9bb4;line-height:1.4;"></div>
@@ -6354,10 +6351,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 tag_id: parseInt(document.getElementById('camera-ext-cal-tag').value),
                 robot_yaw_deg: parseFloat(document.getElementById('camera-ext-cal-yaw').value || '0')
             };
-            const x = parseFloat(document.getElementById('camera-ext-cal-x').value);
-            const y = parseFloat(document.getElementById('camera-ext-cal-y').value);
-            if(Number.isFinite(x)) body.robot_x = x;
-            if(Number.isFinite(y)) body.robot_y = y;
+            if(!Number.isInteger(body.tag_id)) {
+                result.textContent='Ошибка: укажите ID метки точно над центром робота';
+                return;
+            }
             result.textContent = 'Расчёт по серии кадров…';
             try {
                 const res = await fetch('/api/extrinsics/calibrate', {
@@ -6373,7 +6370,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 document.getElementById('camera-ext-pitch').value=deg(p.pitch).toFixed(2);
                 document.getElementById('camera-ext-yaw').value=deg(p.yaw).toFixed(2);
                 const d=data.diagnostics;
-                result.textContent=`Готово: ${d.inliers}/${d.samples} кадров; разброс положения ${d.translation_spread_mm} мм, угла ${d.rotation_spread_deg}°. Проверьте поля выше и нажмите «Применить как проверенные».`;
+                result.textContent=`Готово: метки ${d.tags_used.join(', ')}; ${d.inliers}/${d.samples} кадров; смещение от центра ${Math.round(d.horizontal_offset_m*1000)} мм; высота ${Math.round(d.camera_height_m*1000)} мм; разброс ${d.translation_spread_mm} мм / ${d.rotation_spread_deg}°, ошибка изображения ${d.reprojection_rms_px} px. Проверьте поля выше и нажмите «Применить как проверенные».`;
                 addLog('Мастер рассчитал положение камеры; результат ещё не применён');
             } catch(e) {
                 result.textContent=`Ошибка: ${e.message}`;
